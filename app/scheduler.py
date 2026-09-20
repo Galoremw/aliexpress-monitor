@@ -22,7 +22,7 @@ def run_scheduled_collection() -> None:
     session = get_session_factory()()
     try:
         for store in session.scalars(select(Store).where(Store.status == "active")):
-            discover_store_products(session, store, store_collector, limit=100)
+            discover_store_products(session, store, store_collector, limit=20)
         summary = run_collection_cycle(session, collector)
         logger.info("Scheduled collection completed: %s", summary.to_dict())
     except Exception:

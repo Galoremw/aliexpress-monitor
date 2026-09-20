@@ -41,7 +41,7 @@ def discover_store_products(
     db: Session,
     store: Store,
     collector: StoreDiscoveryCollector,
-    limit: int = 100,
+    limit: int = 20,
 ) -> StoreDiscoverySummary:
     try:
         result = collector.discover(store.url)
@@ -160,4 +160,3 @@ def store_top_products(
             .limit(limit)
         ).all()
     )
-

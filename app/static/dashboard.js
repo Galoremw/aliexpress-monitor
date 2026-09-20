@@ -23,7 +23,7 @@ document.querySelector("#store-form")?.addEventListener("submit", async (event) 
   try {
     const store = await jsonRequest("/api/stores", { method: "POST", body: JSON.stringify({ name: data.get("name"), url: data.get("url") }) });
     notify("店铺已添加，正在发现公开商品…");
-    const discovery = await jsonRequest(`/api/stores/${store.id}/discover?limit=100`, { method: "POST" });
+    const discovery = await jsonRequest(`/api/stores/${store.id}/discover?limit=20`, { method: "POST" });
     if (discovery.parse_status === "failed") {
       notify(`店铺已保存，但商品发现失败：${discovery.error_message || discovery.error_type}`, true);
     } else {
@@ -111,7 +111,7 @@ document.querySelectorAll(".discover-store").forEach((button) => {
     const oldText = button.textContent;
     button.textContent = "发现中…";
     try {
-      const result = await jsonRequest(`/api/stores/${button.dataset.storeId}/discover?limit=100`, { method: "POST" });
+      const result = await jsonRequest(`/api/stores/${button.dataset.storeId}/discover?limit=20`, { method: "POST" });
       if (result.parse_status === "failed") throw new Error(result.error_message || result.error_type);
       notify(`发现 ${result.discovered_count} 个商品，新增 ${result.added_count} 个`);
       window.location.reload();

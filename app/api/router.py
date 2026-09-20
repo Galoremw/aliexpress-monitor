@@ -284,7 +284,7 @@ def deactivate_store(store_id: int, db: Session = Depends(get_db)) -> Store:
 )
 def discover_store(
     store_id: int,
-    limit: int = Query(default=100, ge=1, le=500),
+    limit: int = Query(default=20, ge=1, le=500),
     db: Session = Depends(get_db),
     collector: StoreDiscoveryCollector = Depends(get_store_discovery_collector),
 ) -> dict:

@@ -206,6 +206,22 @@ def test_store_discovery_adds_products_and_returns_first_twenty_links(client, db
     assert snapshot.raw_payload == {"fixture": True}
 
 
+def test_store_discovery_default_monitors_top_twenty(client):
+    store = create_store(client)
+    client.app.dependency_overrides[get_store_discovery_collector] = lambda: StubStoreCollector()
+
+    response = client.post(f"/api/stores/{store['id']}/discover")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["discovered_count"] == 25
+    assert body["added_count"] == 20
+    products = client.get(f"/api/products?store_id={store['id']}").json()
+    assert len(products) == 20
+    assert products[0]["discovery_rank"] == 1
+    assert products[-1]["discovery_rank"] == 20
+
+
 def test_yesterday_top_products_returns_only_best_twenty(client, db_session):
     store = create_store(client)
     for index, candidate in enumerate(candidates(), start=1):
