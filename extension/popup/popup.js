@@ -23,7 +23,7 @@ function isAliExpressStoreUrl(url) {
   try {
     const parsed = new URL(url);
     return /(?:^|\.)aliexpress\.[a-z.]+$/i.test(parsed.hostname)
-      && /\/store\/\d+/i.test(parsed.pathname);
+      && (/\/store\/\d+/i.test(parsed.pathname) || /(?:storeId|sellerId)=\d+/i.test(parsed.search));
   } catch {
     return false;
   }
@@ -41,7 +41,7 @@ async function collectVisibleStoreProducts() {
   await new Promise((resolve) => setTimeout(resolve, 1200));
   const clean = (value) => value?.replace(/\s+/g, " ").trim() || null;
   const url = location.href;
-  const idMatch = location.pathname.match(/\/store\/(\d+)/i);
+  const idMatch = `${location.pathname}${location.search}`.match(/(?:\/store\/|storeId=|sellerId=)(\d+)/i);
   const byId = new Map();
   const save = (id, href, node) => {
     if (!id) return;
@@ -56,7 +56,16 @@ async function collectVisibleStoreProducts() {
       public_cumulative_sold: sold ?? existing?.public_cumulative_sold ?? null,
     });
   };
-  for (const node of document.querySelectorAll('a[href*="/item/"], [data-product-id], [data-item-id], [data-product-url], [data-item-url]')) {
+  const nodes = [];
+  const collectNodes = (root) => {
+    const selector = 'a[href*="/item/"], [data-product-id], [data-item-id], [data-product-url], [data-item-url]';
+    for (const node of root.querySelectorAll(selector)) nodes.push(node);
+    for (const element of root.querySelectorAll("*")) {
+      if (element.shadowRoot) collectNodes(element.shadowRoot);
+    }
+  };
+  collectNodes(document);
+  for (const node of nodes) {
     const href = node.href || node.getAttribute("href") || node.getAttribute("data-product-url") || node.getAttribute("data-item-url") || "";
     const match = `${href} ${node.getAttribute("data-product-id") || ""} ${node.getAttribute("data-item-id") || ""}`.match(/(?:\/item\/|^)(\d{8,})(?:\.html)?/i);
     if (match) save(match[1], href, node);
@@ -138,8 +147,18 @@ collectButton.addEventListener("click", async () => {
   try {
     const active = await loadActiveTab();
     if (!active) return;
-    const [execution] = await chrome.scripting.executeScript({ target: { tabId: active.tab.id }, func: active.storePage ? collectVisibleStoreProducts : collectVisibleProduct });
-    const payload = execution.result;
+    const executions = await chrome.scripting.executeScript({
+      target: { tabId: active.tab.id, allFrames: active.storePage },
+      func: active.storePage ? collectVisibleStoreProducts : collectVisibleProduct,
+    });
+    const payload = active.storePage
+      ? {
+          platform_store_id: executions.map((item) => item.result?.platform_store_id).find(Boolean),
+          url: executions.map((item) => item.result?.url).find(Boolean) || active.tab.url,
+          products: [...new Map(executions.flatMap((item) => item.result?.products || []).map((item) => [item.platform_product_id, item])).values()].slice(0, 20),
+          raw_data: { extractor_version: "extension-store-0.2.0", frame_count: executions.length },
+        }
+      : executions[0]?.result;
     if (active.storePage) {
       if (!payload?.platform_store_id || !payload.products?.length) throw new Error("当前店铺页未读取到公开商品链接");
     } else if (!payload?.platform_product_id) {
