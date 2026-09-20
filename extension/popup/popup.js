@@ -43,19 +43,26 @@ async function collectVisibleStoreProducts() {
   const url = location.href;
   const idMatch = location.pathname.match(/\/store\/(\d+)/i);
   const byId = new Map();
-  for (const anchor of document.querySelectorAll('a[href*="/item/"]')) {
-    const href = anchor.href || anchor.getAttribute("href") || "";
-    const match = href.match(/\/item\/(\d+)(?:\.html)?/i);
-    if (!match || byId.has(match[1])) continue;
-    const text = clean(anchor.innerText || anchor.textContent) || "";
-    const soldMatch = text.match(/([\d,.]+\s*[KM]?)\s*(?:sold|orders?|已售)/i);
-    byId.set(match[1], {
-      platform_product_id: match[1],
-      url: href,
-      title: clean(anchor.getAttribute("title") || anchor.getAttribute("aria-label") || text),
-      public_cumulative_sold: soldMatch ? parseCount(soldMatch[1]) : null,
+  const save = (id, href, node) => {
+    if (!id) return;
+    const text = clean(node?.innerText || node?.textContent || "") || "";
+    const soldMatch = text.match(/([\d,.]+\s*[KM]?)\s*(?:sold|orders?|已售|销量)/i);
+    const existing = byId.get(id);
+    const sold = soldMatch ? parseCount(soldMatch[1]) : null;
+    byId.set(id, {
+      platform_product_id: id,
+      url: href || existing?.url || `https://www.aliexpress.com/item/${id}.html`,
+      title: clean(node?.getAttribute?.("title") || node?.getAttribute?.("aria-label") || text) || existing?.title || null,
+      public_cumulative_sold: sold ?? existing?.public_cumulative_sold ?? null,
     });
+  };
+  for (const node of document.querySelectorAll('a[href*="/item/"], [data-product-id], [data-item-id], [data-product-url], [data-item-url]')) {
+    const href = node.href || node.getAttribute("href") || node.getAttribute("data-product-url") || node.getAttribute("data-item-url") || "";
+    const match = `${href} ${node.getAttribute("data-product-id") || ""} ${node.getAttribute("data-item-id") || ""}`.match(/(?:\/item\/|^)(\d{8,})(?:\.html)?/i);
+    if (match) save(match[1], href, node);
   }
+  const htmlMatches = document.documentElement.outerHTML.matchAll(/(?:\/item\/|itemId["':= ]+)(\d{8,})(?:\.html)?/gi);
+  for (const match of htmlMatches) save(match[1], `https://www.aliexpress.com/item/${match[1]}.html`, null);
   const products = [...byId.values()]
     .sort((a, b) => (b.public_cumulative_sold ?? -1) - (a.public_cumulative_sold ?? -1))
     .slice(0, 20);
