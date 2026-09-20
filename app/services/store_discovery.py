@@ -18,6 +18,7 @@ class StoreDiscoverySummary:
     discovered_count: int
     added_count: int
     product_links: list[str]
+    deactivated_count: int = 0
     error_type: str | None = None
     error_message: str | None = None
 
@@ -71,6 +72,7 @@ def discover_store_products(
         )
     )
     added_count = 0
+    deactivated_count = 0
     product_links: list[str] = []
     for rank, candidate in enumerate(candidates, start=1):
         product_links.append(candidate.url)
@@ -100,6 +102,21 @@ def discover_store_products(
         )
         existing_ids.add(candidate.product_id)
         added_count += 1
+    if result.parse_status == "success" and candidates:
+        current_ids = {candidate.product_id for candidate in candidates}
+        pool_products = list(
+            db.scalars(
+                select(Product).where(
+                    Product.store_id == store.id,
+                    Product.discovery_source.in_(("store_page", "chrome_extension_store")),
+                    Product.status == "active",
+                )
+            )
+        )
+        for product in pool_products:
+            if product.aliexpress_product_id not in current_ids:
+                product.status = "inactive"
+                deactivated_count += 1
     try:
         db.commit()
     except IntegrityError:
@@ -124,6 +141,7 @@ def discover_store_products(
             parse_status="failed",
             discovered_count=len(result.candidates),
             added_count=0,
+            deactivated_count=0,
             product_links=product_links[:20],
             error_type=snapshot.error_type,
             error_message=snapshot.error_message,
@@ -134,6 +152,7 @@ def discover_store_products(
         parse_status=result.parse_status,
         discovered_count=len(result.candidates),
         added_count=added_count,
+        deactivated_count=deactivated_count,
         product_links=product_links[:20],
         error_type=result.error_type,
         error_message=result.error_message,

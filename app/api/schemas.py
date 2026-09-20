@@ -123,6 +123,7 @@ class BrowserStoreDiscoveryRead(BaseModel):
     discovered_count: int
     added_count: int
     existing_count: int
+    deactivated_count: int
     skipped_count: int
     product_links: list[str]
     status: str
@@ -220,6 +221,7 @@ class StoreDiscoverySummaryRead(BaseModel):
     parse_status: str
     discovered_count: int
     added_count: int
+    deactivated_count: int = 0
     product_links: list[str]
     error_type: str | None = None
     error_message: str | None = None

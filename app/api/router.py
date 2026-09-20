@@ -179,6 +179,7 @@ def discover_store_from_browser_extension(
     links: list[str] = []
     added_count = 0
     existing_count = 0
+    deactivated_count = 0
     skipped_count = 0
     for rank, candidate in enumerate(payload.products, start=1):
         normalized_url = normalize_aliexpress_url(candidate.url, "product")
@@ -217,6 +218,22 @@ def discover_store_from_browser_extension(
         )
         added_count += 1
 
+    current_ids = {extract_product_id(link) for link in links}
+    if current_ids:
+        pool_products = list(
+            db.scalars(
+                select(Product).where(
+                    Product.store_id == store.id,
+                    Product.discovery_source.in_(("store_page", "chrome_extension_store")),
+                    Product.status == "active",
+                )
+            )
+        )
+        for product in pool_products:
+            if product.aliexpress_product_id not in current_ids:
+                product.status = "inactive"
+                deactivated_count += 1
+
     snapshot = StoreSnapshot(
         store_id=store.id,
         collected_at=captured_at,
@@ -240,6 +257,7 @@ def discover_store_from_browser_extension(
         "discovered_count": len(payload.products),
         "added_count": added_count,
         "existing_count": existing_count,
+        "deactivated_count": deactivated_count,
         "skipped_count": skipped_count,
         "product_links": links,
         "status": "success" if links else "failed",

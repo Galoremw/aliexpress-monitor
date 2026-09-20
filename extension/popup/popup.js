@@ -36,7 +36,9 @@ function parseCount(value) {
   return Math.round(Number(match[1]) * multiplier);
 }
 
-function collectVisibleStoreProducts() {
+async function collectVisibleStoreProducts() {
+  window.scrollTo({ top: document.body.scrollHeight, behavior: "instant" });
+  await new Promise((resolve) => setTimeout(resolve, 1200));
   const clean = (value) => value?.replace(/\s+/g, " ").trim() || null;
   const url = location.href;
   const idMatch = location.pathname.match(/\/store\/(\d+)/i);
