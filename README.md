@@ -28,13 +28,13 @@
 
 ## GitHub Pages Deployment
 
-GitHub Pages 部署的是 `frontend/` 下的静态 Demo，不替代本地 FastAPI Dashboard，也不会部署数据库、Scheduler、Collector 或 Chrome Extension Backend。Demo 使用 Hash 路由，未配置生产 Backend 时显示 `DEMO / BACKEND_NOT_CONFIGURED`，不会伪造真实监控数据。
+GitHub Pages 部署的是 `frontend/` 下的静态前端，当前配置连接使用者本机的 `http://127.0.0.1:8000` Backend。使用 Pages 前，必须在本机启动 Docker/Backend；否则页面会显示 Backend 连接失败。GitHub Pages 本身不运行数据库、Scheduler、Collector 或 Chrome Extension Backend。前端使用 Hash 路由。
 
 GitHub Actions 文件为 `.github/workflows/deploy-pages.yml`，在 `main` 分支 push 或手动触发时执行 `npm ci`、`npm run build`、`npm test`，然后使用 GitHub Pages 官方 Actions 发布 `frontend/dist`。
 
 ### Environment Variables
 
-`VITE_API_BASE_URL` 只能填写公开 Backend URL，不能放 API key、数据库密码、Cookie、Token 或其他秘密。当前 Pages Demo 默认为空，因此处于 `BACKEND_NOT_CONFIGURED` 状态。生产 Backend 尚未部署时，不要伪造地址。
+`VITE_API_BASE_URL` 只能填写 API 地址，不能放 API key、数据库密码、Cookie、Token 或其他秘密。本次 Pages 构建使用 `http://127.0.0.1:8000`，它只对打开 Pages 的同一台电脑有效。生产 Backend 尚未部署时，不要把本地地址误认为公网 API。
 
 ### Backend Deployment
 

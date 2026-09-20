@@ -6,6 +6,8 @@ test("static demo source includes hash routes and backend-not-configured state",
   const html = await readFile(new URL("../src/index.html", import.meta.url), "utf8");
   const app = await readFile(new URL("../src/app.js", import.meta.url), "utf8");
   assert.match(html, /__PAGES_BASE__/);
-  assert.match(app, /BACKEND_NOT_CONFIGURED/);
+  assert.match(app, /Backend 尚未配置/);
+  assert.match(app, /api\/collection\/status\/today/);
+  assert.match(app, /api\/products\/\$\{id\}\/snapshots/);
   assert.match(app, /#\/stores/);
 });

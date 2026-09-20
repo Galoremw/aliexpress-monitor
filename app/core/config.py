@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     firecrawl_api_url: str = "https://api.firecrawl.dev"
     firecrawl_wait_for_ms: int = Field(default=2000, ge=0, le=15000)
     extension_allowed_origin_regex: str = r"chrome-extension://[a-z]{32}"
+    frontend_allowed_origins: str = (
+        "https://galoremw.github.io,http://127.0.0.1:3000,http://localhost:3000"
+    )
 
 
 @lru_cache
