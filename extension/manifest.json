@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "AliExpress 竞品监控采集助手",
+  "version": "0.1.0",
+  "description": "用户主动点击后，读取当前 AliExpress 商品页的公开可见信息并同步到本地监控台。",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": [
+    "https://www.aliexpress.com/*",
+    "https://*.aliexpress.com/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "action": {
+    "default_title": "采集当前商品",
+    "default_popup": "popup/popup.html"
+  }
+}

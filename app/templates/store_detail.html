@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}{{ store.name }} · 店铺监控{% endblock %}
+{% block content %}
+<section class="page-heading compact"><div><p class="eyebrow">STORE {{ store.aliexpress_store_id or store.id }}</p><h1>{{ store.name }}</h1><p>以下汇总仅覆盖 {{ products|selectattr("status", "equalto", "active")|list|length }} 个活跃监控商品。</p></div><div class="action-group"><form class="store-rename-form compact-rename" data-store-id="{{ store.id }}"><label>店铺名称<input name="name" value="{{ store.name }}" maxlength="255" required></label><button class="button" type="submit">保存名称</button></form><button class="button primary discover-store" data-store-id="{{ store.id }}">发现店铺商品</button><a class="button" href="{{ store.url }}" target="_blank" rel="noreferrer">查看公开店铺页</a></div></section>
+<section class="data-section">
+  <div class="section-heading"><h2>昨日估算销量 Top 20</h2><span>{{ yesterday }} · 公开数据推算</span></div>
+  <div class="table-wrap"><table><thead><tr><th>排名</th><th>商品</th><th>昨日估算销量</th><th>商品链接</th></tr></thead><tbody>
+  {% for metric, product in top_products %}<tr><td>{{ loop.index }}</td><td><a href="/dashboard/products/{{ product.id }}">{{ product.title or product.aliexpress_product_id }}</a></td><td class="number">{{ metric.estimated_sales }}</td><td><a href="{{ product.url }}" target="_blank" rel="noreferrer">打开商品页</a></td></tr>
+  {% else %}<tr><td colspan="4" class="empty">尚未形成昨日销量基线。发现商品并完成连续两天公开数据采集后，这里会按估算销量显示前 20。</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% if latest_discovery %}<p class="discovery-note">最近发现：<span class="status {{ latest_discovery.parse_status }}">{{ latest_discovery.parse_status }}</span> · 找到 {{ latest_discovery.candidate_count }} 个候选{% if latest_discovery.error_message %} · {{ latest_discovery.error_message }}{% endif %}</p>{% endif %}
+<section class="data-section"><div class="section-heading"><h2>店铺日销量估算</h2><span>已监控商品求和</span></div><div class="table-wrap"><table><thead><tr><th>日期</th><th>估算销量</th><th>可估算</th><th>不可估算</th></tr></thead><tbody>
+  {% for metric in metrics %}<tr><td>{{ metric.metric_date }}</td><td class="number">{{ metric.estimated_sales }}</td><td>{{ metric.estimable_products }} / {{ metric.product_scope_count }}</td><td>{{ metric.unavailable_products }}</td></tr>{% else %}<tr><td colspan="4" class="empty">暂无店铺估算数据。</td></tr>{% endfor %}
+  </tbody></table></div></section>
+<section class="data-section">
+  <div class="section-heading"><h2>监控商品</h2><span>{{ products|length }} 个 · 最近 7 个自然日</span></div>
+  <div class="table-wrap"><table class="monitor-table"><thead><tr><th>商品链接</th><th>最近估算日销</th><th>近 7 天合计</th><th>历史 7 天日销</th><th>采集状态</th><th></th></tr></thead><tbody>
+  {% for row in product_rows %}<tr>
+    <td class="product-cell"><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a><a class="external-link" href="{{ row.product.url }}" target="_blank" rel="noreferrer">打开商品页</a></td>
+    <td>{% if row.latest_metric and row.latest_metric.is_estimable %}<strong class="number">{{ row.latest_metric.estimated_sales }}</strong><small>{{ row.latest_metric.metric_date }}</small>{% else %}<span class="muted-value">待形成基线</span>{% endif %}</td>
+    <td>{% if row.seven_day_total is not none %}<strong class="number">{{ row.seven_day_total }}</strong><small>{{ row.coverage }} / 7 天可估算</small>{% else %}<span class="muted-value">—</span>{% endif %}</td>
+    <td><div class="sales-strip">{% for item in row.history %}<span title="{{ item.date }}"><small>{{ item.date.strftime("%m-%d") }}</small><b>{{ item.value if item.value is not none else "—" }}</b></span>{% endfor %}</div></td>
+    <td><span class="status {{ row.status_class }}">{{ row.status_label }}</span>{% if row.latest_snapshot %}<small>{{ row.latest_snapshot.collected_at.strftime("%m-%d %H:%M") }}</small>{% endif %}</td>
+    <td><button class="link-button collect-one" data-product-id="{{ row.product.id }}" {% if row.product.status != "active" %}disabled{% endif %}>采集</button></td>
+  </tr>{% else %}<tr><td colspan="6" class="empty">该店铺尚未添加商品。</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endblock %}

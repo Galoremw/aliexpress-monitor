@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}待人工补采 · AliExpress 竞品监控{% endblock %}
+{% block content %}
+<section class="page-heading compact"><div><p class="eyebrow">MANUAL FALLBACK</p><h1>待人工补采</h1><p>自动采集失败的商品会保留在这里，使用 Chrome Extension 主动采集后自动完成任务。</p></div></section>
+<section class="stats" aria-label="今日采集状态">
+  <article><span>Total Products</span><strong>{{ status.total_products }}</strong></article>
+  <article><span>Auto Success</span><strong>{{ status.auto_success }}</strong></article>
+  <article class="warning"><span>Auto Failed</span><strong>{{ status.auto_failed }}</strong></article>
+  <article><span>Manual Completed</span><strong>{{ status.manual_completed }}</strong></article>
+  <article><span>Pending Manual</span><strong>{{ status.pending_manual }}</strong></article>
+  <article><span>Success Rate</span><strong>{{ status.success_rate }}%</strong></article>
+</section>
+<section class="data-section"><div class="section-heading"><h2>自动采集失败商品</h2><span>日期 {{ status.date }}</span></div><div class="table-wrap"><table><thead><tr><th>商品</th><th>店铺</th><th>最后成功时间</th><th>失败原因</th><th>操作</th></tr></thead><tbody>
+{% for row in rows %}<tr><td><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a></td><td><a href="/dashboard/stores/{{ row.store.id }}">{{ row.store.name }}</a></td><td>{{ row.last_success_at.strftime("%Y-%m-%d %H:%M") if row.last_success_at else "从未成功" }}</td><td><span class="status failed">{{ row.task.reason }}</span></td><td><a class="button" href="{{ row.product.url }}" target="_blank" rel="noreferrer">打开商品</a></td></tr>
+{% else %}<tr><td colspan="5" class="empty">当前没有待人工补采商品。</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endblock %}

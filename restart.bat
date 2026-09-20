@@ -1,0 +1,6 @@
+@echo off
+setlocal
+cd /d "%~dp0"
+call stop.bat
+call start.bat
+endlocal

@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}{{ product.title or product.aliexpress_product_id }} · 商品监控{% endblock %}
+{% block content %}
+<section class="page-heading compact">
+  <div><p class="eyebrow">PRODUCT {{ product.aliexpress_product_id }}</p><h1>{{ product.title or "未采集商品标题" }}</h1><p><a href="/dashboard/stores/{{ store.id }}">{{ store.name }}</a> · 公开数据快照与估算趋势</p></div>
+  <div class="action-group"><a class="button" href="{{ product.url }}" target="_blank" rel="noreferrer">在 Chrome 打开</a><button class="button primary collect-one" data-product-id="{{ product.id }}" {% if product.status != "active" %}disabled{% endif %}>立即采集</button></div>
+</section>
+<section class="trend-band">
+  <div class="section-heading"><h2>日销量估算趋势</h2><span>非真实后台订单量</span></div>
+  <div class="trend-list">
+    {% for metric in metrics|reverse %}
+      <div class="trend-row"><time>{{ metric.metric_date }}</time><div class="bar-track"><span style="width: {{ ((metric.estimated_sales or 0) / max_estimate * 100) if max_estimate else 0 }}%"></span></div><strong>{{ metric.estimated_sales if metric.is_estimable else "不可估算" }}</strong></div>
+    {% else %}<p class="empty">暂无趋势数据。</p>{% endfor %}
+  </div>
+</section>
+<section class="data-section">
+  <div class="section-heading"><h2>原始快照历史</h2><span>只追加，不覆盖</span></div>
+  <div class="table-wrap"><table><thead><tr><th>采集时间</th><th>来源</th><th>状态</th><th>累计 sold</th><th>价格</th><th>评价数</th><th>采集器</th><th>错误</th></tr></thead><tbody>
+  {% for snapshot in snapshots %}<tr><td>{{ (snapshot.captured_at or snapshot.collected_at).strftime("%Y-%m-%d %H:%M") }}</td><td>{{ snapshot.source or "AUTO" }}</td><td><span class="status {{ snapshot.status or snapshot.parse_status }}">{{ snapshot.status or snapshot.parse_status }}</span></td><td>{{ snapshot.sold_count if snapshot.sold_count is not none else snapshot.cumulative_sold if snapshot.cumulative_sold is not none else "—" }}</td><td>{% if snapshot.price is not none %}{{ snapshot.price }} {{ snapshot.price_currency or "" }}{% elif snapshot.price_amount is not none %}{{ snapshot.price_amount }} {{ snapshot.price_currency or "" }}{% else %}—{% endif %}</td><td>{{ snapshot.review_count if snapshot.review_count is not none else "—" }}</td><td>{{ snapshot.collector_name }} {{ snapshot.collector_version }}</td><td>{{ snapshot.error_message or snapshot.error_type or "—" }}</td></tr>
+  {% else %}<tr><td colspan="8" class="empty">尚未采集快照。</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endblock %}

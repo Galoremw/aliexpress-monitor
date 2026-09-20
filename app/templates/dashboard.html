@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}监控台 · AliExpress 竞品监控{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">PUBLIC DATA MONITOR</p>
+    <h1>竞品监控台</h1>
+    <p>数据来自公开页面快照；销量均为累计 sold/orders 差值估算。</p>
+  </div>
+  <button id="collect-all" class="button primary" type="button">立即采集全部</button>
+</section>
+
+<section class="stats" aria-label="监控概况">
+  <a class="stat-card" href="#active-stores"><span>活跃店铺</span><strong>{{ active_store_count }}</strong><small>查看店铺与商品</small></a>
+  <article><span>活跃商品</span><strong>{{ active_product_count }}</strong></article>
+  <article><span>最近快照</span><strong>{{ recent_snapshots|length }}</strong></article>
+  <article class="{% if failed_snapshot_count %}warning{% endif %}"><span>失败快照</span><strong>{{ failed_snapshot_count }}</strong></article>
+</section>
+
+<section class="data-section collection-status-band">
+  <div class="section-heading"><h2>今日采集状态</h2><span>{{ collection_status.date }} · AUTO FIRST / MANUAL FALLBACK</span></div>
+  <div class="status-grid">
+    <span><small>Total Products</small><b>{{ collection_status.total_products }}</b></span>
+    <span><small>Auto Success</small><b>{{ collection_status.auto_success }}</b></span>
+    <span><small>Auto Failed</small><b>{{ collection_status.auto_failed }}</b></span>
+    <span><small>Manual Completed</small><b>{{ collection_status.manual_completed }}</b></span>
+    <a href="/collection/pending"><small>Pending Manual</small><b>{{ collection_status.pending_manual }}</b></a>
+    <span><small>Success Rate</small><b>{{ collection_status.success_rate }}%</b></span>
+  </div>
+</section>
+
+<section id="active-stores" class="data-section anchor-section">
+  <div class="section-heading"><h2>活跃店铺</h2><span>展开店铺查看商品日销</span></div>
+  <div class="store-accordion">
+    {% for panel in store_panels %}
+    <details class="store-monitor" {% if loop.first %}open{% endif %}>
+      <summary>
+        <span><strong>{{ panel.store.name }}</strong><small>店铺 {{ panel.store.aliexpress_store_id or panel.store.id }}</small></span>
+        <span class="store-summary-metric"><b>{{ panel.rows|length }}</b><small>监控商品</small></span>
+        <span class="store-summary-metric"><b>{% if panel.latest_metric and panel.latest_metric.estimable_products %}{{ panel.latest_metric.estimated_sales }}{% else %}—{% endif %}</b><small>最近估算日销</small></span>
+      </summary>
+      <div class="table-wrap">
+        <table class="monitor-table">
+          <thead><tr><th>商品链接</th><th>最近估算日销</th><th>近 7 天合计</th><th>历史 7 天日销</th><th>采集状态</th><th></th></tr></thead>
+          <tbody>
+          {% for row in panel.rows %}
+            <tr>
+              <td class="product-cell"><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a><a class="external-link" href="{{ row.product.url }}" target="_blank" rel="noreferrer">打开商品页</a></td>
+              <td>{% if row.latest_metric and row.latest_metric.is_estimable %}<strong class="number">{{ row.latest_metric.estimated_sales }}</strong><small>{{ row.latest_metric.metric_date }}</small>{% else %}<span class="muted-value">待形成基线</span>{% endif %}</td>
+              <td>{% if row.seven_day_total is not none %}<strong class="number">{{ row.seven_day_total }}</strong><small>{{ row.coverage }} / 7 天可估算</small>{% else %}<span class="muted-value">—</span>{% endif %}</td>
+              <td><div class="sales-strip" aria-label="最近 7 天估算销量">{% for item in row.history %}<span title="{{ item.date }}"><small>{{ item.date.strftime("%m-%d") }}</small><b>{{ item.value if item.value is not none else "—" }}</b></span>{% endfor %}</div></td>
+              <td><span class="status {{ row.status_class }}">{{ row.status_label }}</span>{% if row.latest_snapshot %}<small>{{ row.latest_snapshot.collected_at.strftime("%m-%d %H:%M") }}</small>{% endif %}</td>
+              <td><button class="link-button collect-one" data-product-id="{{ row.product.id }}" {% if row.product.status != "active" %}disabled{% endif %}>采集</button></td>
+            </tr>
+          {% else %}<tr><td colspan="6" class="empty">该店铺还没有监控商品。</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="store-actions">
+        <form class="store-rename-form" data-store-id="{{ panel.store.id }}">
+          <label>店铺名称<input name="name" value="{{ panel.store.name }}" maxlength="255" required></label>
+          <button class="button" type="submit">保存名称</button>
+        </form>
+        <div class="store-links"><a href="/dashboard/stores/{{ panel.store.id }}">进入店铺详情</a><a href="{{ panel.store.url }}" target="_blank" rel="noreferrer">公开店铺页</a></div>
+      </div>
+    </details>
+    {% else %}<p class="empty">还没有活跃店铺。</p>{% endfor %}
+  </div>
+</section>
+
+<section class="workspace">
+  <div class="form-panel">
+    <h2>添加同行店铺</h2>
+    <form id="store-form">
+      <label>店铺名称（可选）<input name="name" maxlength="255" placeholder="留空则使用店铺 ID"></label>
+      <label>AliExpress 店铺链接<input name="url" type="url" required placeholder="https://www.aliexpress.com/store/..."></label>
+      <button class="button" type="submit">添加店铺</button>
+    </form>
+  </div>
+  <div class="form-panel">
+    <h2>添加监控商品</h2>
+    <form id="product-form">
+      <label>所属店铺
+        <select name="store_id" required>
+          <option value="">选择店铺</option>
+          {% for store in stores if store.status == "active" %}<option value="{{ store.id }}">{{ store.name }}</option>{% endfor %}
+        </select>
+      </label>
+      <label>商品链接或商品 ID<input name="target" required placeholder="商品 URL 或数字 ID"></label>
+      <button class="button" type="submit">添加商品</button>
+    </form>
+  </div>
+</section>
+
+<section class="data-section">
+  <div class="section-heading"><h2>店铺估算概况</h2><span>仅统计已监控商品</span></div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>店铺</th><th>日期</th><th>估算销量</th><th>可估算商品</th><th>不可估算</th></tr></thead>
+      <tbody>
+      {% for metric in latest_store_metrics %}
+        <tr>
+          <td><a href="/dashboard/stores/{{ metric.store_id }}">{{ store_by_id[metric.store_id].name }}</a></td>
+          <td>{{ metric.metric_date }}</td><td class="number">{{ metric.estimated_sales }}</td>
+          <td>{{ metric.estimable_products }} / {{ metric.product_scope_count }}</td><td>{{ metric.unavailable_products }}</td>
+        </tr>
+      {% else %}<tr><td colspan="5" class="empty">完成至少两天有效采集后，这里会显示估算结果。</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="data-grid">
+  <div class="data-section">
+    <div class="section-heading"><h2>商品增长趋势</h2><span>公开数据推算</span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>商品</th><th>日期</th><th>估算销量</th></tr></thead>
+        <tbody>
+        {% for metric, product in growth_metrics %}
+          <tr><td><a href="/dashboard/products/{{ product.id }}">{{ product.title or product.aliexpress_product_id }}</a></td><td>{{ metric.metric_date }}</td><td class="number">{{ metric.estimated_sales }}</td></tr>
+        {% else %}<tr><td colspan="3" class="empty">暂无可估算的商品趋势。</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="data-section">
+    <div class="section-heading"><h2>最近采集</h2><span>原始快照状态</span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>商品</th><th>状态</th><th>累计 sold</th><th>时间</th></tr></thead>
+        <tbody>
+        {% for row in recent_snapshot_rows %}
+          <tr><td><a href="/dashboard/products/{{ row.snapshot.product_id }}">{{ product_by_id[row.snapshot.product_id].title or product_by_id[row.snapshot.product_id].aliexpress_product_id }}</a></td><td><span class="status {{ row.status_class }}">{{ row.status_label }}</span></td><td>{{ row.snapshot.cumulative_sold if row.snapshot.cumulative_sold is not none else "—" }}</td><td>{{ row.snapshot.collected_at.strftime("%m-%d %H:%M") }}</td></tr>
+        {% else %}<tr><td colspan="4" class="empty">尚未采集快照。</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+{% endblock %}

@@ -1,0 +1,2 @@
+"""AliExpress competitor monitoring application."""
+
