@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.collectors.base import CollectorResult
 from app.collectors.dependencies import get_collector
-from app.db.models import CollectionAttempt, ManualCollectionTask, ProductSnapshot
+from app.db.models import CollectionAttempt, ManualCollectionTask, Product, ProductSnapshot
 
 
 def create_product(client, product_id="100500700"):
@@ -60,6 +60,35 @@ def test_browser_extension_rejects_unmonitored_product(client):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "该商品尚未加入监控"
+
+
+def test_browser_extension_store_discovery_adds_top_twenty_links(client, db_session):
+    store = client.post(
+        "/api/stores",
+        json={"name": "Store Page", "url": "https://www.aliexpress.com/store/770701"},
+    ).json()
+    payload = {
+        "platform_store_id": "770701",
+        "url": "https://www.aliexpress.com/store/770701",
+        "products": [
+            {
+                "platform_product_id": f"1005008{index:04d}",
+                "url": f"https://www.aliexpress.com/item/1005008{index:04d}.html",
+                "title": f"Store Product {index}",
+                "public_cumulative_sold": 1000 - index,
+            }
+            for index in range(20)
+        ],
+        "raw_data": {"extractor_version": "extension-store-test"},
+    }
+
+    response = client.post("/api/collection/browser-extension/store", json=payload)
+
+    assert response.status_code == 201
+    assert response.json()["added_count"] == 20
+    products = list(db_session.query(Product).filter_by(store_id=store["id"]))
+    assert len(products) == 20
+    assert products[0].discovery_source == "chrome_extension_store"
 
 
 def test_auto_failure_creates_attempt_and_manual_task(client, db_session):

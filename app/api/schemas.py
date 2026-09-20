@@ -104,6 +104,31 @@ class BrowserExtensionCollectionRequest(BaseModel):
     raw_data: dict[str, Any] = Field(default_factory=dict)
 
 
+class BrowserStoreProduct(BaseModel):
+    platform_product_id: str = Field(min_length=1, max_length=128)
+    url: str = Field(min_length=1, max_length=2048)
+    title: str | None = Field(default=None, max_length=1024)
+    public_cumulative_sold: int | None = Field(default=None, ge=0)
+
+
+class BrowserStoreDiscoveryRequest(BaseModel):
+    platform_store_id: str = Field(min_length=1, max_length=128)
+    url: str = Field(min_length=1, max_length=2048)
+    products: list[BrowserStoreProduct] = Field(min_length=1, max_length=20)
+    raw_data: dict[str, Any] = Field(default_factory=dict)
+
+
+class BrowserStoreDiscoveryRead(BaseModel):
+    store_id: int
+    discovered_count: int
+    added_count: int
+    existing_count: int
+    skipped_count: int
+    product_links: list[str]
+    status: str
+    error_message: str | None = None
+
+
 class ManualCollectionRequest(BrowserExtensionCollectionRequest):
     pass
 

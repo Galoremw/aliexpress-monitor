@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.api.schemas import (
     BrowserExtensionCollectionRequest,
+    BrowserStoreDiscoveryRead,
+    BrowserStoreDiscoveryRequest,
     CollectionAttemptRead,
     CollectionPendingRead,
     CollectionStatusRead,
@@ -153,6 +155,96 @@ def collect_from_browser_extension(
     db: Session = Depends(get_db),
 ) -> ProductSnapshot:
     return _save_channel_observation(db, payload, "CHROME_EXTENSION")
+
+
+@router.post(
+    "/collection/browser-extension/store",
+    response_model=BrowserStoreDiscoveryRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def discover_store_from_browser_extension(
+    payload: BrowserStoreDiscoveryRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    store = db.scalar(
+        select(Store).where(Store.aliexpress_store_id == payload.platform_store_id)
+    )
+    if store is None:
+        raise HTTPException(status_code=404, detail="该店铺尚未加入监控")
+    if store.status != "active":
+        raise HTTPException(status_code=409, detail="该店铺监控已停用")
+
+    captured_at = datetime.now(ZoneInfo(get_settings().timezone))
+    normalized_store_url = normalize_aliexpress_url(payload.url, "store")
+    links: list[str] = []
+    added_count = 0
+    existing_count = 0
+    skipped_count = 0
+    for rank, candidate in enumerate(payload.products, start=1):
+        normalized_url = normalize_aliexpress_url(candidate.url, "product")
+        if extract_product_id(normalized_url) != candidate.platform_product_id:
+            skipped_count += 1
+            continue
+        links.append(normalized_url)
+        product = db.scalar(
+            select(Product).where(
+                Product.store_id == store.id,
+                Product.aliexpress_product_id == candidate.platform_product_id,
+            )
+        )
+        if product is not None:
+            product.status = "active"
+            product.discovery_rank = rank
+            product.discovered_at = captured_at
+            if candidate.title and not product.title:
+                product.title = candidate.title
+            existing_count += 1
+            continue
+        conflicting = db.scalar(select(Product).where(Product.url == normalized_url))
+        if conflicting is not None:
+            skipped_count += 1
+            continue
+        db.add(
+            Product(
+                store_id=store.id,
+                aliexpress_product_id=candidate.platform_product_id,
+                url=normalized_url,
+                title=candidate.title,
+                discovery_source="chrome_extension_store",
+                discovery_rank=rank,
+                discovered_at=captured_at,
+            )
+        )
+        added_count += 1
+
+    snapshot = StoreSnapshot(
+        store_id=store.id,
+        collected_at=captured_at,
+        collector_name="chrome_extension_store",
+        collector_version=str(payload.raw_data.get("extractor_version", "1.0")),
+        parse_status="success" if links else "failed",
+        candidate_count=len(payload.products),
+        source_http_status=200,
+        raw_payload={
+            "store_url": normalized_store_url,
+            "products": [item.model_dump() for item in payload.products],
+            "raw_data": payload.raw_data,
+        },
+        error_type=None if links else "no_valid_product_links",
+        error_message=None if links else "没有读取到有效商品链接",
+    )
+    db.add(snapshot)
+    db.commit()
+    return {
+        "store_id": store.id,
+        "discovered_count": len(payload.products),
+        "added_count": added_count,
+        "existing_count": existing_count,
+        "skipped_count": skipped_count,
+        "product_links": links,
+        "status": "success" if links else "failed",
+        "error_message": None if links else "没有读取到有效商品链接",
+    }
 
 
 @router.post(

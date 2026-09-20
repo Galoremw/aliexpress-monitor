@@ -2,6 +2,7 @@ const API_BASE = "http://127.0.0.1:8000";
 const pageStatus = document.querySelector("#page-status");
 const result = document.querySelector("#result");
 const collectButton = document.querySelector("#collect");
+const heading = document.querySelector("#heading");
 
 function showResult(message, isError = false) {
   result.textContent = message;
@@ -16,6 +17,56 @@ function isAliExpressProductUrl(url) {
   } catch {
     return false;
   }
+}
+
+function isAliExpressStoreUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return /(?:^|\.)aliexpress\.[a-z.]+$/i.test(parsed.hostname)
+      && /\/store\/\d+/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function parseCount(value) {
+  const match = String(value || "").replace(/,/g, "").match(/(\d+(?:\.\d+)?)\s*([KM])?/i);
+  if (!match) return null;
+  const multiplier = match[2]?.toUpperCase() === "M" ? 1000000 : match[2]?.toUpperCase() === "K" ? 1000 : 1;
+  return Math.round(Number(match[1]) * multiplier);
+}
+
+function collectVisibleStoreProducts() {
+  const clean = (value) => value?.replace(/\s+/g, " ").trim() || null;
+  const url = location.href;
+  const idMatch = location.pathname.match(/\/store\/(\d+)/i);
+  const byId = new Map();
+  for (const anchor of document.querySelectorAll('a[href*="/item/"]')) {
+    const href = anchor.href || anchor.getAttribute("href") || "";
+    const match = href.match(/\/item\/(\d+)(?:\.html)?/i);
+    if (!match || byId.has(match[1])) continue;
+    const text = clean(anchor.innerText || anchor.textContent) || "";
+    const soldMatch = text.match(/([\d,.]+\s*[KM]?)\s*(?:sold|orders?|已售)/i);
+    byId.set(match[1], {
+      platform_product_id: match[1],
+      url: href,
+      title: clean(anchor.getAttribute("title") || anchor.getAttribute("aria-label") || text),
+      public_cumulative_sold: soldMatch ? parseCount(soldMatch[1]) : null,
+    });
+  }
+  const products = [...byId.values()]
+    .sort((a, b) => (b.public_cumulative_sold ?? -1) - (a.public_cumulative_sold ?? -1))
+    .slice(0, 20);
+  return {
+    platform_store_id: idMatch?.[1] || null,
+    url,
+    products,
+    raw_data: {
+      extractor_version: "extension-store-0.1.0",
+      page_title: clean(document.title),
+      visible_link_count: byId.size,
+    },
+  };
 }
 
 async function collectVisibleProduct() {
@@ -60,32 +111,40 @@ async function collectVisibleProduct() {
 
 async function loadActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.url || !isAliExpressProductUrl(tab.url)) {
-    pageStatus.textContent = "请先打开 AliExpress 商品页";
+  if (!tab?.url || (!isAliExpressProductUrl(tab.url) && !isAliExpressStoreUrl(tab.url))) {
+    pageStatus.textContent = "请先打开 AliExpress 商品页或店铺页";
     return null;
   }
-  pageStatus.textContent = "已定位商品页，可主动采集";
+  const storePage = isAliExpressStoreUrl(tab.url);
+  heading.textContent = storePage ? "采集店铺前 20 个商品" : "采集当前商品";
+  collectButton.textContent = storePage ? "采集店铺前 20 个商品" : "采集当前商品";
+  pageStatus.textContent = storePage ? "已定位店铺页，可读取公开商品链接" : "已定位商品页，可主动采集";
   collectButton.disabled = false;
-  return tab;
+  return { tab, storePage };
 }
 
 collectButton.addEventListener("click", async () => {
   collectButton.disabled = true;
   showResult("读取公开页面信息…");
   try {
-    const tab = await loadActiveTab();
-    if (!tab) return;
-    const [execution] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: collectVisibleProduct });
+    const active = await loadActiveTab();
+    if (!active) return;
+    const [execution] = await chrome.scripting.executeScript({ target: { tabId: active.tab.id }, func: active.storePage ? collectVisibleStoreProducts : collectVisibleProduct });
     const payload = execution.result;
-    if (!payload?.platform_product_id) throw new Error("当前页面不是可识别的商品页");
-    const response = await fetch(`${API_BASE}/api/collection/browser-extension`, {
+    if (active.storePage) {
+      if (!payload?.platform_store_id || !payload.products?.length) throw new Error("当前店铺页未读取到公开商品链接");
+    } else if (!payload?.platform_product_id) {
+      throw new Error("当前页面不是可识别的商品页");
+    }
+    const endpoint = active.storePage ? "/api/collection/browser-extension/store" : "/api/collection/browser-extension";
+    const response = await fetch(`${API_BASE}${endpoint}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.detail || `同步失败 (${response.status})`);
-    showResult("采集成功，已同步至监控系统");
+    showResult(active.storePage ? `店铺商品已同步，新增 ${body.added_count} 个监控商品` : "采集成功，已同步至监控系统");
   } catch (error) {
     showResult(error.message || "采集失败", true);
   } finally {
