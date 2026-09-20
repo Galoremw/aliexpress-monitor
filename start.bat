@@ -9,7 +9,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
-docker compose up -d --build
+docker compose -p aliexpress-monitor up -d --build
 if errorlevel 1 (
   echo Failed to start AliExpress Monitor.
   pause
@@ -19,7 +19,7 @@ if errorlevel 1 (
 echo Waiting for the frontend...
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline=(Get-Date).AddSeconds(90); do { try { Invoke-WebRequest -UseBasicParsing http://127.0.0.1:3000/health -TimeoutSec 3 | Out-Null; exit 0 } catch { Start-Sleep -Seconds 2 } } while ((Get-Date) -lt $deadline); exit 1"
 if errorlevel 1 (
-  echo Services started but frontend health check timed out. Run: docker compose ps
+  echo Services started but frontend health check timed out. Run: docker compose -p aliexpress-monitor ps
   pause
   exit /b 1
 )
