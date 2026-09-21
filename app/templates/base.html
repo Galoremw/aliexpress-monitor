@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}AliExpress 竞品监控{% endblock %}</title>
-    <link rel="stylesheet" href="/static/dashboard.css">
+    <link rel="stylesheet" href="/static/dashboard.css?v=1f9b5e9">
   </head>
   <body>
     <header class="topbar">
@@ -18,7 +18,7 @@
     </header>
     <main>{% block content %}{% endblock %}</main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/dashboard.js" defer></script>
+    <script src="/static/dashboard.js?v=1f9b5e9" defer></script>
     <script>
       document.querySelector("#logout")?.addEventListener("click", async () => {
         await fetch("/api/auth/logout", { method: "POST", credentials: "include" });

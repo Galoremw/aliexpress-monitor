@@ -1,5 +1,6 @@
 const config = window.MONITOR_CONFIG || { apiBaseUrl: "", mode: "demo" };
 const app = document.querySelector("#app");
+let dianxiaomiRefreshTimer = null;
 
 function api(path, options = {}) {
   if (!config.apiBaseUrl) return Promise.reject(new Error("Backend 尚未配置"));
@@ -51,6 +52,17 @@ async function dashboard() {
   ]);
   app.innerHTML = shell("监控台", `<section class="hero"><div><p class="eyebrow">HOSTED BACKEND</p><h1>AliExpress 竞品监控</h1><p class="lead">前端已连接托管 Backend，监控数据不依赖当前电脑上的本地服务。</p></div><span class="status-badge ok">BACKEND_CONNECTED</span></section>${metrics(status)}${browserCollectionPanel(browserRun)}${dianxiaomiPanel(dianxiaomi)}<section class="section"><div class="section-heading"><h2>活跃店铺</h2><a class="button" href="#/stores">查看全部</a></div><div class="list">${stores.map(storeRow).join("") || empty("暂无活跃店铺")}</div></section><section class="section"><div class="section-heading"><h2>快捷操作</h2></div><div class="action-row"><button class="button primary" data-action="collect-all">立即采集全部活跃商品</button><a class="button" href="#/manual">进入人工处理</a></div></section>`);
   bindActions();
+  if (!dianxiaomiRefreshTimer) {
+    dianxiaomiRefreshTimer = window.setInterval(async () => {
+      if (currentRoute() !== "/dashboard") return;
+      const panel = document.querySelector(".dianxiaomi-band");
+      if (!panel) return;
+      const status = await api("/api/integrations/dianxiaomi/status").catch(() => null);
+      if (!status) return;
+      panel.outerHTML = dianxiaomiPanel(status);
+      bindActions();
+    }, 5000);
+  }
   void products;
 }
 

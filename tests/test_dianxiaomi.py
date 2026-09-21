@@ -84,6 +84,7 @@ def test_dianxiaomi_handoff_status_and_summary(client, db_session):
     summary = client.get("/api/integrations/dianxiaomi/status")
     assert summary.status_code == 200
     assert summary.json()["processing"] == 1
+    assert summary.json()["items"][0]["store_name"] == "店小秘测试店"
 
 
 def test_dianxiaomi_only_accepts_active_monitored_products(client):
