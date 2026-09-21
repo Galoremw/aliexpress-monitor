@@ -66,7 +66,7 @@ function isDianxiaomiPage(url) {
 }
 
 async function api(path, options = {}, requestedBaseUrl = null) {
-  const stored = await chrome.storage.local.get(["apiAccessToken", "activeApiBase"]);
+  const stored = await chrome.storage.local.get(["apiAccessToken", "apiAccessTokens", "activeApiBase"]);
   const baseUrl = requestedBaseUrl || stored.activeApiBase || API_BASE;
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   const token = stored.apiAccessTokens?.[baseUrl] || stored.apiAccessToken;
@@ -356,45 +356,84 @@ async function sendDianxiaomiMessage(tabId, urls) {
   throw lastError || new Error("店小秘页面尚未准备好");
 }
 
+async function waitForDianxiaomiTab(tabId) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) throw new Error("店小秘后台页面已关闭");
+    if (tab.status === "complete") return tab;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return chrome.tabs.get(tabId);
+}
+
+async function ensureDianxiaomiTab() {
+  const stored = await chrome.storage.local.get("dianxiaomiWindowId");
+  let windowId = stored.dianxiaomiWindowId;
+  let window = windowId ? await chrome.windows.get(windowId).catch(() => null) : null;
+  if (!window) {
+    window = await chrome.windows.create({
+      url: DIANXIAOMI_URL,
+      focused: false,
+      state: "minimized",
+      type: "normal",
+    });
+    windowId = window.id;
+    await chrome.storage.local.set({ dianxiaomiWindowId: windowId });
+  }
+  const tabs = await chrome.tabs.query({
+    windowId,
+    url: ["https://www.dianxiaomi.com/*", "https://dianxiaomi.com/*"],
+  });
+  let tab = tabs.find((candidate) => isDianxiaomiPage(candidate.url));
+  if (!tab) tab = await chrome.tabs.create({ windowId, url: DIANXIAOMI_URL, active: true });
+  await waitForDianxiaomiTab(tab.id);
+  await chrome.windows.update(windowId, { state: "minimized", focused: false }).catch(() => undefined);
+  return { tab, windowId };
+}
+
+async function updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, result = null) {
+  await Promise.all(handoffs.map((handoff) => api(`/api/integrations/dianxiaomi/handoffs/${handoff.id}/status`, {
+    method: "POST",
+    body: JSON.stringify({
+      status,
+      worker_id: workerId,
+      error_type: status === "FAILED" ? "page_operation_failed" : status === "NEEDS_CONFIRMATION" ? "manual_confirmation_required" : null,
+      error_message: status === "COLLECTING" ? null : result?.message || null,
+    }),
+  }, baseUrl).catch(() => undefined)));
+}
+
 async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
   if (dianxiaomiBusy) return;
   dianxiaomiBusy = true;
   const workerId = `chrome-${chrome.runtime.id}`;
+  let baseUrl = requestedBaseUrl || (await chrome.storage.local.get("activeApiBase")).activeApiBase || API_BASE;
+  let handoffs = [];
   try {
     if (requestedBaseUrl) await chrome.storage.local.set({ activeApiBase: requestedBaseUrl });
-    const baseUrl = requestedBaseUrl || (await chrome.storage.local.get("activeApiBase")).activeApiBase || API_BASE;
-    const handoff = await api("/api/integrations/dianxiaomi/handoffs/claim-next", {
+    handoffs = await api("/api/integrations/dianxiaomi/handoffs/claim-batch", {
       method: "POST",
-      body: JSON.stringify({ worker_id: workerId }),
+      body: JSON.stringify({ worker_id: workerId, limit: 20 }),
     }, baseUrl);
-    if (!handoff) return;
-    let tabs = await chrome.tabs.query({ url: ["https://www.dianxiaomi.com/*", "https://dianxiaomi.com/*"] });
-    let tab = tabs.find((candidate) => isDianxiaomiPage(candidate.url));
-    if (!tab) tab = await chrome.tabs.create({ url: DIANXIAOMI_URL, active: true });
-    await api(`/api/integrations/dianxiaomi/handoffs/${handoff.id}/status`, {
-      method: "POST",
-      body: JSON.stringify({ status: "OPENED", worker_id: workerId }),
-    }, baseUrl);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const result = await sendDianxiaomiMessage(tab.id, [handoff.target_url]);
+    if (!handoffs?.length) return;
+    const { tab } = await ensureDianxiaomiTab();
+    await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, "OPENED");
+    const result = await sendDianxiaomiMessage(tab.id, handoffs.map((handoff) => handoff.target_url));
     const status = result?.state === "submitted"
       ? "COLLECTING"
       : result?.state === "needs_confirmation" ? "NEEDS_CONFIRMATION" : "FAILED";
-    await api(`/api/integrations/dianxiaomi/handoffs/${handoff.id}/status`, {
-      method: "POST",
-      body: JSON.stringify({
-        status,
-        worker_id: workerId,
-        error_type: status === "FAILED" ? "page_operation_failed" : status === "NEEDS_CONFIRMATION" ? "manual_confirmation_required" : null,
-        error_message: status === "COLLECTING" ? null : result?.message || null,
-      }),
-    }, baseUrl);
+    await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, result);
     if (result?.state === "needs_confirmation") {
       await chrome.windows.update(tab.windowId, { focused: true, state: "normal" }).catch(() => undefined);
       await chrome.tabs.update(tab.id, { active: true }).catch(() => undefined);
     }
-  } catch {
-    // The dashboard may be offline. The claimed item can be reclaimed after its lease expires.
+  } catch (error) {
+    if (handoffs.length) {
+      await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, "FAILED", {
+        message: error.message || "店小秘后台窗口操作失败",
+      });
+    }
+    // The dashboard may be offline; claimed tasks are also protected by a lease on the backend.
   } finally {
     dianxiaomiBusy = false;
   }

@@ -46,6 +46,17 @@ h2 { margin: 0; font-size: 22px; }
 .store-name-line { display: inline-flex; align-items: center; gap: 8px; }
 .icon-button { display: inline-grid; place-items: center; width: 25px; height: 25px; padding: 0; border: 1px solid #cad8cc; border-radius: 50%; color: #285a43; background: #fff; cursor: pointer; }
 .dianxiaomi-band { border-left: 3px solid #d7a133; padding-left: 16px; }
+.dianxiaomi-items { display: grid; gap: 8px; margin-top: 14px; }
+.dianxiaomi-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 11px 12px; border: 1px solid #e5ece6; background: #fffdf7; }
+.dianxiaomi-item-main { min-width: 0; display: grid; gap: 4px; }
+.dianxiaomi-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dianxiaomi-item-meta { color: #647269; font-size: 12px; overflow-wrap: anywhere; }
+.dianxiaomi-item-meta a { color: inherit; }
+.dianxiaomi-item-side { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.dianxiaomi-status { color: #8b6510; font-size: 12px; white-space: nowrap; }
+.dianxiaomi-status.success { color: #267b5b; }
+.dianxiaomi-status.error { color: #b63f34; }
+.dianxiaomi-item-actions { display: flex; gap: 6px; }
 .row span { color: #647269; font-size: 13px; }
 .row b { color: #875b12; }
 .row a { color: #285a43; text-decoration: none; }
@@ -58,4 +69,4 @@ th { color: #647269; font-weight: 700; }
 .error-page { width: min(680px, 100%); margin: auto; }
 .error-page p:not(.eyebrow) { color: #647269; line-height: 1.7; }
 code { padding: 3px 6px; background: #e7eee8; }
-@media (max-width: 720px) { .topbar, .hero, .page-heading, .section-heading { align-items: flex-start; flex-direction: column; } .metric-grid { grid-template-columns: repeat(2, 1fr); } .browser-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } nav { flex-wrap: wrap; } }
+@media (max-width: 720px) { .topbar, .hero, .page-heading, .section-heading { align-items: flex-start; flex-direction: column; } .metric-grid { grid-template-columns: repeat(2, 1fr); } .browser-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } nav { flex-wrap: wrap; } .dianxiaomi-item { grid-template-columns: 1fr; } .dianxiaomi-item-side { justify-content: flex-start; flex-wrap: wrap; } .dianxiaomi-item-title { white-space: normal; } }

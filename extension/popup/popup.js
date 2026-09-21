@@ -131,15 +131,12 @@ collectButton.addEventListener("click", async () => {
     const endpoint = active.storePage
       ? "/api/collection/browser-extension/store"
       : "/api/collection/browser-extension";
-    const response = await fetch(`${API_BASE}${endpoint}`, {
+    const response = await monitorApi(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(collected.payload),
     });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.detail || `同步失败 (${response.status})`);
     showResult(active.storePage
-      ? `店铺商品已同步，新增 ${body.added_count} 个监控商品`
+      ? `店铺商品已同步，新增 ${response.added_count} 个监控商品`
       : "采集成功，已同步至监控系统");
   } catch (error) {
     showResult(error.message || "采集失败", true);

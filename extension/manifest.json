@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AliExpress 竞品监控采集助手",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "按日读取已监控 AliExpress 店铺和商品的公开可见信息，并同步到本地监控台。",
   "permissions": ["activeTab", "scripting", "tabs", "webNavigation", "alarms", "notifications", "storage"],
   "host_permissions": [

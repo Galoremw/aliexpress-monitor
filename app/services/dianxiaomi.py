@@ -73,6 +73,13 @@ def create_handoff_batch(db: Session, product_ids: list[int]) -> tuple[str, list
 
 
 def claim_next_handoff(db: Session, worker_id: str) -> DianxiaomiHandoff | None:
+    rows = claim_handoff_batch(db, worker_id, limit=1)
+    return rows[0] if rows else None
+
+
+def claim_handoff_batch(
+    db: Session, worker_id: str, *, limit: int = 20
+) -> list[DianxiaomiHandoff]:
     now = _now()
     expired = list(
         db.scalars(
@@ -86,21 +93,25 @@ def claim_next_handoff(db: Session, worker_id: str) -> DianxiaomiHandoff | None:
         row.status = "QUEUED"
         row.worker_id = None
 
-    row = db.scalar(
+    rows = list(
+        db.scalars(
         select(DianxiaomiHandoff)
         .where(DianxiaomiHandoff.status == "QUEUED")
         .order_by(DianxiaomiHandoff.requested_at, DianxiaomiHandoff.id)
-        .limit(1)
+        .limit(limit)
+        )
     )
-    if row is None:
+    if not rows:
         db.commit()
-        return None
-    row.status = "CLAIMED"
-    row.claimed_at = now
-    row.worker_id = worker_id
+        return []
+    for row in rows:
+        row.status = "CLAIMED"
+        row.claimed_at = now
+        row.worker_id = worker_id
     db.commit()
-    db.refresh(row)
-    return row
+    for row in rows:
+        db.refresh(row)
+    return rows
 
 
 def update_handoff(
@@ -136,6 +147,7 @@ def serialize_handoff(row: DianxiaomiHandoff) -> dict:
         "store_id": row.store_id,
         "product_title": product.title if product else None,
         "platform_product_id": product.aliexpress_product_id if product else None,
+        "store_name": row.store.name if row.store else None,
         "target_url": row.target_url,
         "status": row.status,
         "requested_at": row.requested_at,

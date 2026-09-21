@@ -336,6 +336,7 @@ class DianxiaomiHandoffCreate(BaseModel):
 
 class DianxiaomiHandoffClaimRequest(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
+    limit: int = Field(default=20, ge=1, le=50)
 
 
 class DianxiaomiHandoffStatusRequest(BaseModel):
@@ -354,6 +355,7 @@ class DianxiaomiHandoffRead(BaseModel):
     store_id: int
     product_title: str | None
     platform_product_id: str | None
+    store_name: str | None
     target_url: str
     status: str
     requested_at: datetime

@@ -141,6 +141,18 @@ tr:last-child td { border-bottom: 0; }
 .discovery-note { margin: -10px 0 24px; color: var(--muted); font-size: 12px; }
 .dianxiaomi-progress-grid { margin-top: 12px; }
 .dianxiaomi-band { border-left: 3px solid #d7a133; }
+.dianxiaomi-items { display: grid; gap: 8px; margin-top: 14px; }
+.dianxiaomi-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 11px 12px; border: 1px solid var(--line); background: #fffdf7; }
+.dianxiaomi-item-main { min-width: 0; display: grid; gap: 4px; }
+.dianxiaomi-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dianxiaomi-item-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.dianxiaomi-item-meta a { color: inherit; }
+.dianxiaomi-item-side { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.dianxiaomi-status { color: #8b6510; font-size: 12px; white-space: nowrap; }
+.dianxiaomi-status.success { color: var(--accent-strong); }
+.dianxiaomi-status.error { color: var(--danger); }
+.dianxiaomi-item-actions { display: flex; gap: 6px; }
+.dianxiaomi-item-actions .link-button { white-space: nowrap; }
 
 @media (max-width: 980px) {
   main { width: min(100% - 28px, 760px); }
@@ -173,6 +185,9 @@ tr:last-child td { border-bottom: 0; }
   .stats { grid-template-columns: 1fr 1fr; gap: 8px; }
   .stats article, .stat-card { min-height: 80px; padding: 13px; }
   .status-grid { grid-template-columns: repeat(2, 1fr); }
+  .dianxiaomi-item { grid-template-columns: 1fr; }
+  .dianxiaomi-item-side { justify-content: flex-start; flex-wrap: wrap; }
+  .dianxiaomi-item-title { white-space: normal; }
   .status-grid > *:nth-child(3n) { border-right: 1px solid var(--line); }
   .status-grid > *:nth-child(2n) { border-right: 0; }
   .browser-progress-grid { grid-template-columns: repeat(2, 1fr); }

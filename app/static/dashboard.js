@@ -148,31 +148,62 @@ async function refreshDianxiaomiStatus() {
       if (target) target.textContent = status[key];
     });
     const latest = section.querySelector("#dianxiaomi-latest");
-    const retry = section.querySelector("#dianxiaomi-retry");
-    const item = status.latest?.[0];
+    const item = status.items?.[0] || status.latest?.[0];
     if (latest && item) latest.textContent = `${item.product_title || item.platform_product_id || "商品"} · ${item.status}${item.error_message ? ` · ${item.error_message}` : ""}`;
-    if (retry) {
-      retry.hidden = !item || !["NEEDS_CONFIRMATION", "FAILED"].includes(item.status);
-      retry.dataset.handoffId = item?.id || "";
-    }
+    const list = section.querySelector("#dianxiaomi-items");
+    if (list) list.innerHTML = (status.items || []).map(renderDianxiaomiItem).join("") || '<p class="muted-value">当前没有店小秘任务。</p>';
   } catch {
     // The integration is optional; a temporary API restart should not affect the dashboard.
   }
 }
 
+const dianxiaomiStatusLabels = {
+  QUEUED: "待发送",
+  CLAIMED: "扩展已领取",
+  OPENED: "后台页面已打开",
+  FILLED: "链接已填入",
+  COLLECTING: "店小秘采集中",
+  SUCCEEDED: "店小秘已完成",
+  FAILED: "失败",
+  NEEDS_CONFIRMATION: "需要人工处理",
+  CANCELED: "已取消",
+};
+
+function escapeDianxiaomiHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]));
+}
+
+function renderDianxiaomiItem(item) {
+  const status = dianxiaomiStatusLabels[item.status] || item.status;
+  const statusClass = item.status === "SUCCEEDED" ? "success" : ["FAILED", "NEEDS_CONFIRMATION"].includes(item.status) ? "error" : "";
+  const action = ["NEEDS_CONFIRMATION", "FAILED"].includes(item.status)
+    ? `<button class="link-button" type="button" data-dianxiaomi-action="resume" data-handoff-id="${item.id}">重新排队</button>`
+    : ["QUEUED", "CLAIMED", "OPENED", "FILLED", "COLLECTING"].includes(item.status)
+      ? `<button class="link-button danger" type="button" data-dianxiaomi-action="cancel" data-handoff-id="${item.id}">取消</button>`
+      : "";
+  const label = escapeDianxiaomiHtml(item.product_title || item.platform_product_id || `商品 #${item.product_id}`);
+  const store = escapeDianxiaomiHtml(item.store_name || `店铺 #${item.store_id}`);
+  const url = escapeDianxiaomiHtml(item.target_url);
+  const error = item.error_message ? ` · ${escapeDianxiaomiHtml(item.error_message)}` : "";
+  return `<article class="dianxiaomi-item"><div class="dianxiaomi-item-main"><strong class="dianxiaomi-item-title">${label}</strong><span class="dianxiaomi-item-meta">${store} · <a href="${url}" target="_blank" rel="noreferrer">${url}</a></span><span class="dianxiaomi-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(item.requested_at))}${error}</span></div><div class="dianxiaomi-item-side"><span class="dianxiaomi-status ${statusClass}">${status}</span><span class="dianxiaomi-item-actions">${action}</span></div></article>`;
+}
+
+function formatDashboardDate(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—"; }
+
 void refreshDianxiaomiStatus();
 window.setInterval(refreshDianxiaomiStatus, 5000);
-document.querySelector("#dianxiaomi-retry")?.addEventListener("click", async (event) => {
-  const button = event.currentTarget;
-  if (!button.dataset.handoffId) return;
+document.querySelector("#dianxiaomi-items")?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-dianxiaomi-action]");
+  if (!button) return;
   button.disabled = true;
   try {
-    await jsonRequest(`/api/integrations/dianxiaomi/handoffs/${button.dataset.handoffId}/resume`, { method: "POST" });
-    notify("店小秘任务已重新排队");
+    const action = button.dataset.dianxiaomiAction;
+    const endpoint = action === "resume" ? "resume" : "cancel";
+    await jsonRequest(`/api/integrations/dianxiaomi/handoffs/${button.dataset.handoffId}/${endpoint}`, { method: "POST" });
+    notify(action === "resume" ? "店小秘任务已重新排队" : "店小秘任务已取消");
     await refreshDianxiaomiStatus();
   } catch (error) {
     notify(error.message, true);
-  } finally {
     button.disabled = false;
   }
 });

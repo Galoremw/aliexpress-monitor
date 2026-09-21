@@ -86,6 +86,7 @@ from app.services.browser_collection import (
 )
 from app.services.dianxiaomi import (
     ACTIVE_HANDOFF_STATUSES,
+    claim_handoff_batch,
     claim_next_handoff,
     create_handoff_batch,
     serialize_handoff,
@@ -540,6 +541,7 @@ def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
     return {
         **counts,
         "latest_at": rows[0].requested_at if rows else None,
+        "items": [serialize_handoff(row) for row in rows[:50]],
         "latest": [serialize_handoff(row) for row in rows[:10]],
     }
 
@@ -554,6 +556,18 @@ def claim_next_dianxiaomi_handoff(
 ) -> dict | None:
     row = claim_next_handoff(db, payload.worker_id)
     return serialize_handoff(row) if row else None
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/claim-batch",
+    response_model=list[DianxiaomiHandoffRead],
+)
+def claim_dianxiaomi_handoff_batch(
+    payload: DianxiaomiHandoffClaimRequest,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    rows = claim_handoff_batch(db, payload.worker_id, limit=payload.limit)
+    return [serialize_handoff(row) for row in rows]
 
 
 @router.post(

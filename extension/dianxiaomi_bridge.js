@@ -52,7 +52,7 @@
     box.dispatchEvent(new Event("change", { bubbles: true }));
     start.click();
     await new Promise((resolve) => setTimeout(resolve, 500));
-    return { state: "submitted", count: cleanUrls.length };
+    return { state: "submitted", count: cleanUrls.length, message: `已提交 ${cleanUrls.length} 条商品链接` };
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

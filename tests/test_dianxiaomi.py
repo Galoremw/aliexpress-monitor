@@ -42,6 +42,27 @@ def test_dianxiaomi_batch_deduplicates_and_claims_next(client, db_session):
     assert claimed.json()["product_id"] == product["id"]
 
 
+def test_dianxiaomi_claim_batch_returns_multiple_urls(client):
+    store, first = create_store_product(client, product_id="100500884")
+    second = client.post(
+        "/api/products",
+        json={"store_id": store["id"], "aliexpress_product_id": "100500885"},
+    ).json()
+    client.post(
+        "/api/integrations/dianxiaomi/handoffs",
+        json={"product_ids": [first["id"], second["id"]]},
+    )
+    claimed = client.post(
+        "/api/integrations/dianxiaomi/handoffs/claim-batch",
+        json={"worker_id": "test-extension", "limit": 20},
+    )
+    assert claimed.status_code == 200
+    body = claimed.json()
+    assert len(body) == 2
+    assert {item["status"] for item in body} == {"CLAIMED"}
+    assert {item["store_name"] for item in body} == {store["name"]}
+
+
 def test_dianxiaomi_handoff_status_and_summary(client, db_session):
     _, product = create_store_product(client, product_id="100500881")
     created = client.post(
