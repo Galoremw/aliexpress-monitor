@@ -60,7 +60,7 @@ async function dashboard() {
       const status = await api("/api/integrations/dianxiaomi/status").catch(() => null);
       if (!status) return;
       panel.outerHTML = dianxiaomiPanel(status);
-      bindActions();
+      bindDianxiaomiQueueActions();
     }, 5000);
   }
   void products;
@@ -128,10 +128,10 @@ function bindActions() {
   document.querySelectorAll("[data-action='resume-browser']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/browser-collection/runs/${button.dataset.id}/resume`, "浏览器采集任务已恢复"); }));
   document.querySelectorAll(".dianxiaomi-product").forEach((button) => button.addEventListener("click", () => submitDianxiaomi([button.dataset.productId], button)));
   document.querySelectorAll(".dianxiaomi-store").forEach((button) => button.addEventListener("click", () => submitDianxiaomi((button.dataset.productIds || "").split(","), button)));
-  document.querySelectorAll("[data-action='dianxiaomi-resume']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/integrations/dianxiaomi/handoffs/${button.dataset.id}/resume`, "店小秘任务已重新排队"); }));
-  document.querySelectorAll("[data-action='dianxiaomi-cancel']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/integrations/dianxiaomi/handoffs/${button.dataset.id}/cancel`, "店小秘任务已取消"); }));
+  bindDianxiaomiQueueActions();
   document.querySelectorAll("[data-action='edit-store']").forEach((button) => button.addEventListener("click", async () => editStoreName(button.dataset.id)));
 }
+function bindDianxiaomiQueueActions() { document.querySelectorAll("[data-action='dianxiaomi-resume']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/integrations/dianxiaomi/handoffs/${button.dataset.id}/resume`, "店小秘任务已重新排队"); })); document.querySelectorAll("[data-action='dianxiaomi-cancel']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/integrations/dianxiaomi/handoffs/${button.dataset.id}/cancel`, "店小秘任务已取消"); })); }
 async function action(button, path, message, payload = null) { button.disabled = true; button.textContent = "处理中…"; try { await api(path, { method: "POST", ...(payload ? { body: JSON.stringify(payload) } : {}) }); alert(message); await render(); } catch (error) { alert(error.message); button.disabled = false; button.textContent = "重试"; } }
 async function addStore() { const name = prompt("监控店铺名称（可选）", ""); const url = prompt("AliExpress 店铺链接"); if (!url) return; try { const store = await api("/api/stores", { method: "POST", body: JSON.stringify({ name, url }) }); const discovery = await api(`/api/stores/${store.id}/discover?limit=20`, { method: "POST" }); if (discovery.parse_status === "failed") alert(`店铺已添加，但前 20 个商品发现失败：${discovery.error_message || discovery.error_type}`); else alert(`店铺已添加，已加入销量排序前 ${discovery.added_count} 个商品`); await render(); } catch (error) { alert(error.message); } }
 async function addProduct() { const storeId = prompt("所属店铺 ID（留空则归入“自定义监控”）"); const url = prompt("AliExpress 商品链接"); if (!url) return; try { await api("/api/products", { method: "POST", body: JSON.stringify({ store_id: storeId ? Number(storeId) : null, url }) }); await render(); } catch (error) { alert(error.message); } }
