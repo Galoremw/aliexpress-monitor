@@ -17,6 +17,7 @@ ACTIVE_HANDOFF_STATUSES = {
     "COLLECTING",
     "NEEDS_CONFIRMATION",
 }
+LEASED_HANDOFF_STATUSES = {"CLAIMED", "OPENED", "FILLED", "COLLECTING"}
 
 
 def _now() -> datetime:
@@ -84,7 +85,7 @@ def claim_handoff_batch(
     expired = list(
         db.scalars(
             select(DianxiaomiHandoff).where(
-                DianxiaomiHandoff.status == "CLAIMED",
+                DianxiaomiHandoff.status.in_(LEASED_HANDOFF_STATUSES),
                 DianxiaomiHandoff.claimed_at < now - timedelta(minutes=10),
             )
         )
@@ -92,13 +93,18 @@ def claim_handoff_batch(
     for row in expired:
         row.status = "QUEUED"
         row.worker_id = None
+        row.claimed_at = None
+        row.error_type = None
+        row.error_message = None
+    if expired:
+        db.flush()
 
     rows = list(
         db.scalars(
-        select(DianxiaomiHandoff)
-        .where(DianxiaomiHandoff.status == "QUEUED")
-        .order_by(DianxiaomiHandoff.requested_at, DianxiaomiHandoff.id)
-        .limit(limit)
+            select(DianxiaomiHandoff)
+            .where(DianxiaomiHandoff.status == "QUEUED")
+            .order_by(DianxiaomiHandoff.requested_at, DianxiaomiHandoff.id)
+            .limit(limit)
         )
     )
     if not rows:

@@ -1,3 +1,6 @@
+from datetime import timedelta
+from datetime import datetime, timezone
+
 from app.db.models import DianxiaomiHandoff
 
 
@@ -61,6 +64,27 @@ def test_dianxiaomi_claim_batch_returns_multiple_urls(client):
     assert len(body) == 2
     assert {item["status"] for item in body} == {"CLAIMED"}
     assert {item["store_name"] for item in body} == {store["name"]}
+
+
+def test_dianxiaomi_reclaims_stale_opened_handoff(client, db_session):
+    _, product = create_store_product(client, product_id="100500886")
+    created = client.post(
+        "/api/integrations/dianxiaomi/handoffs",
+        json={"product_ids": [product["id"]]},
+    ).json()
+    handoff = db_session.get(DianxiaomiHandoff, created["items"][0]["id"])
+    handoff.status = "OPENED"
+    handoff.worker_id = "old-extension"
+    handoff.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=11)
+    db_session.commit()
+
+    claimed = client.post(
+        "/api/integrations/dianxiaomi/handoffs/claim-batch",
+        json={"worker_id": "new-extension", "limit": 20},
+    )
+    assert claimed.status_code == 200
+    assert claimed.json()[0]["status"] == "CLAIMED"
+    assert claimed.json()[0]["worker_id"] == "new-extension"
 
 
 def test_dianxiaomi_handoff_status_and_summary(client, db_session):
