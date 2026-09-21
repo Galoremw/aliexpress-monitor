@@ -23,9 +23,9 @@ set "EXTENSION_DIR=%~dp0extension"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$profile=$env:PROFILE_DIR; Get-CimInstance Win32_Process -Filter 'Name = ''chrome.exe''' | Where-Object { $_.CommandLine -and $_.CommandLine -like ('*' + $profile + '*') -and $_.CommandLine -notmatch '--type=' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
 timeout /t 1 /nobreak >nul
 
-start "AliExpress Monitor Dianxiaomi Worker Setup" "%CHROME_EXE%" --user-data-dir="%PROFILE_DIR%" --profile-directory="Default" --load-extension="%EXTENSION_DIR%" --new-window "http://127.0.0.1:3000/?dianxiaomi_worker=1"
+start "AliExpress Monitor Dianxiaomi Worker Setup" "%CHROME_EXE%" --user-data-dir="%PROFILE_DIR%" --profile-directory="Default" --load-extension="%EXTENSION_DIR%" --new-window "http://127.0.0.1:3000/?dianxiaomi_worker=1" "https://www.dianxiaomi.com/web/productCrawl/dataAcquisition" "chrome://extensions/"
 echo.
-echo Dedicated Dianxiaomi Chrome profile started.
-echo First time: sign in to the monitor extension and Dianxiaomi in this window, then confirm the collection agreement.
+echo Dedicated Dianxiaomi Chrome profile started with dashboard, Dianxiaomi, and extension management tabs.
+echo First time: reload the unpacked extension if needed, sign in to the monitor extension and Dianxiaomi, then confirm the collection agreement.
 pause
 endlocal
