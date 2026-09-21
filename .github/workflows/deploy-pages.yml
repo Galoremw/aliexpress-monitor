@@ -36,11 +36,21 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Validate hosted Backend URL
+        working-directory: frontend
+        env:
+          VITE_API_BASE_URL: ${{ vars.BACKEND_URL }}
+        run: |
+          test -n "$VITE_API_BASE_URL"
+          case "$VITE_API_BASE_URL" in
+            http://127.0.0.1:*|http://localhost:*) echo "BACKEND_URL must be a hosted origin"; exit 1 ;;
+          esac
+
       - name: Build static demo
         working-directory: frontend
         env:
           PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}/
-          VITE_API_BASE_URL: http://127.0.0.1:8000
+          VITE_API_BASE_URL: ${{ vars.BACKEND_URL }}
         run: npm run build
 
       - name: Test static demo

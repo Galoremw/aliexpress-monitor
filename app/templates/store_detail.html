@@ -5,7 +5,7 @@
 <section class="data-section">
   <div class="section-heading"><h2>昨日估算销量 Top 20</h2><span>{{ yesterday }} · 公开数据推算</span></div>
   <div class="table-wrap"><table><thead><tr><th>排名</th><th>商品</th><th>昨日估算销量</th><th>商品链接</th></tr></thead><tbody>
-  {% for metric, product in top_products %}<tr><td>{{ loop.index }}</td><td><a href="/dashboard/products/{{ product.id }}">{{ product.title or product.aliexpress_product_id }}</a></td><td class="number">{{ metric.estimated_sales }}</td><td><a href="{{ product.url }}" target="_blank" rel="noreferrer">打开商品页</a></td></tr>
+  {% for metric, product in top_products %}<tr><td>{{ loop.index }}</td><td><a href="/dashboard/products/{{ product.id }}">{{ product.title or product.aliexpress_product_id }}</a></td><td class="number">{{ metric.estimated_sales }}</td><td><a href="{{ product.url }}#monitor_product_id={{ product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品页</a></td></tr>
   {% else %}<tr><td colspan="4" class="empty">尚未形成昨日销量基线。发现商品并完成连续两天公开数据采集后，这里会按估算销量显示前 20。</td></tr>{% endfor %}
   </tbody></table></div>
 </section>
@@ -16,13 +16,13 @@
 <section class="data-section">
   <div class="section-heading"><h2>监控商品</h2><span>{{ products|length }} 个 · 最近 7 个自然日</span></div>
   <div class="table-wrap"><table class="monitor-table"><thead><tr><th>商品链接</th><th>最近估算日销</th><th>近 7 天合计</th><th>历史 7 天日销</th><th>采集状态</th><th></th></tr></thead><tbody>
-  {% for row in product_rows %}<tr>
-    <td class="product-cell"><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a><a class="external-link" href="{{ row.product.url }}" target="_blank" rel="noreferrer">打开商品页</a></td>
+  {% for row in product_rows %}<tr data-product-id="{{ row.product.id }}">
+    <td class="product-cell"><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a></td>
     <td>{% if row.latest_metric and row.latest_metric.is_estimable %}<strong class="number">{{ row.latest_metric.estimated_sales }}</strong><small>{{ row.latest_metric.metric_date }}</small>{% else %}<span class="muted-value">待形成基线</span>{% endif %}</td>
     <td>{% if row.seven_day_total is not none %}<strong class="number">{{ row.seven_day_total }}</strong><small>{{ row.coverage }} / 7 天可估算</small>{% else %}<span class="muted-value">—</span>{% endif %}</td>
     <td><div class="sales-strip">{% for item in row.history %}<span title="{{ item.date }}"><small>{{ item.date.strftime("%m-%d") }}</small><b>{{ item.value if item.value is not none else "—" }}</b></span>{% endfor %}</div></td>
-    <td><span class="status {{ row.status_class }}">{{ row.status_label }}</span>{% if row.latest_snapshot %}<small>{{ row.latest_snapshot.collected_at.strftime("%m-%d %H:%M") }}</small>{% endif %}</td>
-    <td><button class="link-button collect-one" data-product-id="{{ row.product.id }}" {% if row.product.status != "active" %}disabled{% endif %}>采集</button></td>
+    <td><span class="status {{ row.collection_status_class }}" data-collection-status>{{ row.collection_status_label }}</span>{% if row.collection_captured_at %}<small data-collection-time>{{ row.collection_captured_at.strftime("%m-%d %H:%M") }}</small>{% endif %}</td>
+    <td class="row-actions"><a class="link-button" href="{{ row.product.url }}#monitor_product_id={{ row.product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品页</a><button class="link-button danger deactivate-product" type="button" data-product-id="{{ row.product.id }}" aria-label="删除 {{ row.product.title or row.product.aliexpress_product_id }} 的监控">删除监控</button></td>
   </tr>{% else %}<tr><td colspan="6" class="empty">该店铺尚未添加商品。</td></tr>{% endfor %}
   </tbody></table></div>
 </section>

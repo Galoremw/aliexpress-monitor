@@ -51,7 +51,11 @@ def _upsert_product_metric(
 
 
 def calculate_product_daily_metrics(
-    db: Session, product_id: int, timezone_name: str = "Asia/Shanghai"
+    db: Session,
+    product_id: int,
+    timezone_name: str = "Asia/Shanghai",
+    *,
+    commit: bool = True,
 ) -> list[ProductDailyMetric]:
     snapshots = list(
         db.scalars(
@@ -102,14 +106,17 @@ def calculate_product_daily_metrics(
                 db, product_id, start_day, start, end, estimated_sales, reason
             )
         )
-    db.commit()
-    for metric in metrics:
-        db.refresh(metric)
+    if commit:
+        db.commit()
+        for metric in metrics:
+            db.refresh(metric)
+    else:
+        db.flush()
     return metrics
 
 
 def calculate_store_daily_metric(
-    db: Session, store_id: int, metric_date: date
+    db: Session, store_id: int, metric_date: date, *, commit: bool = True
 ) -> StoreDailyMetric:
     active_product_ids = list(
         db.scalars(
@@ -150,8 +157,11 @@ def calculate_store_daily_metric(
     aggregate.unavailable_products = unavailable_count
     aggregate.product_scope_count = len(active_product_ids)
     aggregate.calculation_method = "sum_of_monitored_product_estimates"
-    db.commit()
-    db.refresh(aggregate)
+    if commit:
+        db.commit()
+        db.refresh(aggregate)
+    else:
+        db.flush()
     return aggregate
 
 

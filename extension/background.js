@@ -1,0 +1,399 @@
+importScripts("config.js");
+
+const API_BASE = globalThis.ALIEXPRESS_MONITOR_API_BASE || "http://127.0.0.1:8000";
+const POLL_ALARM = "aliexpress-monitor-browser-collection";
+const NOTIFICATION_ID = "aliexpress-monitor-verification";
+const FIRST_PRODUCT_NOTIFICATION_ID = "aliexpress-monitor-first-product";
+const tabProductIds = new Map();
+let automationBusy = false;
+
+function productIdFromUrl(url) {
+  try {
+    return new URL(url).pathname.match(/\/item\/(\d+)/i)?.[1] || null;
+  } catch {
+    return null;
+  }
+}
+
+function monitoredProductIdFromUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.searchParams.get("monitor_product_id")
+      || parsed.hash.match(/monitor_product_id=(\d+)/i)?.[1]
+      || null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberTabProduct(tabId, url) {
+  const monitoredId = monitoredProductIdFromUrl(url);
+  const productId = productIdFromUrl(url);
+  if (monitoredId) tabProductIds.set(tabId, monitoredId);
+  else if (productId && !tabProductIds.has(tabId)) tabProductIds.set(tabId, productId);
+}
+
+function isAliExpressPage(url) {
+  try {
+    const parsed = new URL(url);
+    return /(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
+      && (/\/item\/\d+/i.test(parsed.pathname) || /\/store\/\d+/i.test(parsed.pathname));
+  } catch {
+    return false;
+  }
+}
+
+function isAutomationBootstrap(url) {
+  try {
+    const parsed = new URL(url);
+    return ["127.0.0.1", "localhost"].includes(parsed.hostname)
+      && parsed.searchParams.get("browser_collection") === "1";
+  } catch {
+    return false;
+  }
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || `本地监控台请求失败 (${response.status})`);
+  return body;
+}
+
+async function injectCollector(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!isAliExpressPage(tab.url)) return;
+    rememberTabProduct(tabId, tab.url);
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["page_collector.js", "content.js"],
+    });
+  } catch {
+    // Navigation may still be replacing the document; the completion event retries it.
+  }
+}
+
+async function injectOpenAliExpressTabs() {
+  const tabs = await chrome.tabs.query({
+    url: ["https://aliexpress.com/*", "https://*.aliexpress.com/*"],
+  });
+  await Promise.all(tabs.map((tab) => injectCollector(tab.id)));
+}
+
+async function automationState() {
+  return chrome.storage.local.get([
+    "automationWindowId",
+    "automationTabId",
+    "automationItem",
+    "challengePaused",
+    "firstProductPresentedRunId",
+  ]);
+}
+
+async function clearAutomationItem() {
+  await chrome.storage.local.remove(["automationTabId", "automationItem", "challengePaused"]);
+}
+
+async function rememberAutomationWindow(tab) {
+  if (tab?.windowId && isAutomationBootstrap(tab.url)) {
+    await chrome.storage.local.set({ automationWindowId: tab.windowId });
+  }
+}
+
+async function ensureAlarm() {
+  const alarm = await chrome.alarms.get(POLL_ALARM);
+  if (!alarm) chrome.alarms.create(POLL_ALARM, { periodInMinutes: 1 });
+}
+
+async function sendCollectMessage(tabId, targetType) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, {
+      type: "collect-visible-page",
+      target_type: targetType,
+    });
+  } catch {
+    await injectCollector(tabId);
+    return chrome.tabs.sendMessage(tabId, {
+      type: "collect-visible-page",
+      target_type: targetType,
+    });
+  }
+}
+
+async function closeItemTab(tabId) {
+  await clearAutomationItem();
+  await chrome.tabs.remove(tabId).catch(() => undefined);
+}
+
+async function closeAutomationWindow() {
+  const state = await automationState();
+  await chrome.storage.local.remove([
+    "automationWindowId",
+    "automationTabId",
+    "automationItem",
+    "challengePaused",
+    "firstProductPresentedRunId",
+  ]);
+  if (state.automationWindowId) {
+    await chrome.windows.remove(state.automationWindowId).catch(() => undefined);
+  }
+}
+
+async function notifyChallenge(item) {
+  await chrome.notifications.create(NOTIFICATION_ID, {
+    type: "basic",
+    iconUrl: "icon.svg",
+    title: "AliExpress 自动采集已暂停",
+    message: `${item.title || "当前页面"}需要人工完成平台验证，通过后任务会自动继续。`,
+    priority: 2,
+    requireInteraction: true,
+  }).catch(() => undefined);
+}
+
+async function notifyFirstProduct(item) {
+  await chrome.notifications.create(FIRST_PRODUCT_NOTIFICATION_ID, {
+    type: "basic",
+    iconUrl: "icon.svg",
+    title: "AliExpress 首个商品已打开",
+    message: `${item.title || "第一个商品"}已显示。如平台要求验证，请正常完成；通过后会自动继续采集。`,
+    priority: 1,
+  }).catch(() => undefined);
+}
+
+async function finishAutomationFailure(state, errorType, message) {
+  if (!state.automationItem) return;
+  await api(`/api/browser-collection/items/${state.automationItem.id}/failure`, {
+    method: "POST",
+    body: JSON.stringify({ error_type: errorType, error_message: message }),
+  }).catch(() => undefined);
+  if (state.automationTabId) await closeItemTab(state.automationTabId);
+}
+
+async function processAutomationTabInternal(tabId) {
+  const state = await automationState();
+  const item = state.automationItem;
+  if (!item || state.automationTabId !== tabId) return;
+  const result = await sendCollectMessage(tabId, item.target_type);
+
+  if (result?.state === "challenge") {
+    await api(`/api/browser-collection/items/${item.id}/challenge`, {
+      method: "POST",
+      body: JSON.stringify({ error_message: result.message || "AliExpress 要求人工完成验证" }),
+    });
+    await chrome.storage.local.set({ challengePaused: true });
+    await notifyChallenge(item);
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab?.windowId) {
+      await chrome.windows.update(tab.windowId, { focused: true, state: "normal" }).catch(() => undefined);
+      await chrome.tabs.update(tabId, { active: true }).catch(() => undefined);
+    }
+    return;
+  }
+
+  if (!result?.payload) {
+    await finishAutomationFailure(
+      state,
+      result?.state === "partial" ? "observable_data_missing" : "page_not_ready",
+      result?.message || "页面在限定时间内没有出现可读取的公开数据",
+    );
+    return;
+  }
+
+  const endpoint = item.target_type === "STORE"
+    ? `/api/browser-collection/items/${item.id}/store-discovery`
+    : `/api/browser-collection/items/${item.id}/snapshot`;
+  await api(endpoint, { method: "POST", body: JSON.stringify(result.payload) });
+  await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
+  await chrome.notifications.clear(FIRST_PRODUCT_NOTIFICATION_ID).catch(() => undefined);
+  await closeItemTab(tabId);
+}
+
+async function processAutomationTab(tabId) {
+  if (automationBusy) return;
+  automationBusy = true;
+  try {
+    await processAutomationTabInternal(tabId);
+  } catch (error) {
+    const state = await automationState();
+    await finishAutomationFailure(state, "extension_collection_error", error.message || "扩展采集失败");
+  } finally {
+    automationBusy = false;
+  }
+  void pollAutomation();
+}
+
+async function openAutomationItem(item) {
+  let state = await automationState();
+  let windowId = state.automationWindowId;
+  const presentFirstProduct = item.target_type === "PRODUCT"
+    && state.firstProductPresentedRunId !== item.run_id;
+  if (windowId) {
+    const existingWindow = await chrome.windows.get(windowId).catch(() => null);
+    if (!existingWindow) windowId = null;
+  }
+
+  let tab;
+  if (!windowId) {
+    const created = await chrome.windows.create({
+      url: "http://127.0.0.1:3000/?browser_collection=1",
+      focused: presentFirstProduct,
+      state: "normal",
+    });
+    windowId = created.id;
+    await chrome.storage.local.set({ automationWindowId: windowId });
+  }
+  tab = await chrome.tabs.create({ windowId, url: item.target_url, active: true });
+  await chrome.storage.local.set({
+    automationTabId: tab.id,
+    automationItem: item,
+    challengePaused: false,
+    ...(presentFirstProduct ? { firstProductPresentedRunId: item.run_id } : {}),
+  });
+  if (presentFirstProduct) {
+    await chrome.windows.update(windowId, { focused: true, state: "normal" }).catch(() => undefined);
+    await chrome.tabs.update(tab.id, { active: true }).catch(() => undefined);
+    await notifyFirstProduct(item);
+  } else {
+    await chrome.windows.update(windowId, { state: "minimized" }).catch(() => undefined);
+  }
+}
+
+async function pollAutomation() {
+  if (automationBusy) return;
+  automationBusy = true;
+  try {
+    const run = await api("/api/browser-collection/heartbeat", {
+      method: "POST",
+      body: JSON.stringify({ extension_version: chrome.runtime.getManifest().version }),
+    });
+    let state = await automationState();
+
+    if (state.challengePaused && run.status === "NEEDS_VERIFICATION") {
+      const tab = state.automationTabId
+        ? await chrome.tabs.get(state.automationTabId).catch(() => null)
+        : null;
+      if (!tab || tab.status !== "complete") return;
+      const probe = await sendCollectMessage(tab.id, state.automationItem?.target_type);
+      if (!probe?.payload) return;
+      await chrome.storage.local.set({ challengePaused: false });
+      state = await automationState();
+    }
+    if (state.challengePaused && run.status !== "NEEDS_VERIFICATION") {
+      if (state.automationTabId) await closeItemTab(state.automationTabId);
+      state = await automationState();
+    }
+    if (state.automationItem && state.automationTabId) {
+      const tab = await chrome.tabs.get(state.automationTabId).catch(() => null);
+      if (tab) {
+        if (tab.status === "complete") {
+          automationBusy = false;
+          void processAutomationTab(tab.id);
+        }
+        return;
+      }
+      await finishAutomationFailure(state, "browser_tab_closed", "自动采集标签页被关闭");
+    }
+
+    const claimed = await api("/api/browser-collection/items/claim", {
+      method: "POST",
+      body: "{}",
+    });
+    if (claimed.item) {
+      await openAutomationItem(claimed.item);
+    } else if (["COMPLETED", "PARTIAL", "FAILED"].includes(claimed.run.status)) {
+      await closeAutomationWindow();
+    }
+  } catch {
+    // The local backend may still be starting; the minute alarm retries without page side effects.
+  } finally {
+    automationBusy = false;
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  void ensureAlarm();
+  void injectOpenAliExpressTabs();
+  void pollAutomation();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  void ensureAlarm();
+  void injectOpenAliExpressTabs();
+  setTimeout(() => void pollAutomation(), 1500);
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === POLL_ALARM) void pollAutomation();
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  rememberTabProduct(tabId, changeInfo.url || tab.url);
+  void rememberAutomationWindow(tab);
+  if (changeInfo.status === "complete" && isAliExpressPage(tab.url)) {
+    void injectCollector(tabId);
+    void automationState().then((state) => {
+      if (state.automationTabId === tabId) {
+        if (state.challengePaused) void pollAutomation();
+        else void processAutomationTab(tabId);
+      }
+    });
+  }
+});
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab && isAliExpressPage(tab.url)) void injectCollector(tabId);
+});
+
+chrome.webNavigation.onCommitted.addListener(({ tabId, url }) => {
+  rememberTabProduct(tabId, url);
+});
+
+chrome.webNavigation.onHistoryStateUpdated.addListener(({ tabId, url }) => {
+  rememberTabProduct(tabId, url);
+  if (isAliExpressPage(url)) void injectCollector(tabId);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabProductIds.delete(tabId);
+  void automationState().then((state) => {
+    if (state.automationTabId === tabId && !state.challengePaused) {
+      void finishAutomationFailure(state, "browser_tab_closed", "自动采集标签页被关闭");
+    }
+  });
+});
+
+chrome.notifications.onClicked.addListener(async (notificationId) => {
+  if (![NOTIFICATION_ID, FIRST_PRODUCT_NOTIFICATION_ID].includes(notificationId)) return;
+  const state = await automationState();
+  if (state.automationWindowId) {
+    await chrome.windows.update(state.automationWindowId, { focused: true, state: "normal" }).catch(() => undefined);
+  }
+  if (state.automationTabId) await chrome.tabs.update(state.automationTabId, { active: true }).catch(() => undefined);
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "sync-product-snapshot") return false;
+  const monitoredProductId = sender?.tab?.id ? tabProductIds.get(sender.tab.id) : null;
+  const payload = {
+    ...message.payload,
+    raw_data: {
+      ...(message.payload?.raw_data || {}),
+      ...(monitoredProductId ? { monitored_product_id: monitoredProductId } : {}),
+    },
+  };
+  api("/api/collection/browser-extension", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  })
+    .then((body) => sendResponse({ ok: true, status: 201, body }))
+    .catch((error) => sendResponse({ ok: false, status: 0, body: { detail: error.message || "无法连接本地监控台" } }));
+  return true;
+});
+
+void ensureAlarm();
+setTimeout(() => void pollAutomation(), 1500);

@@ -20,6 +20,12 @@ from app.db.models import (
 from app.db.session import get_db
 from app.core.config import get_settings
 from app.services.store_discovery import store_top_products
+from app.services.collection_progress import (
+    build_collection_progress,
+    manual_completed_product_ids,
+    snapshot_collection_state,
+)
+from app.services.browser_collection import get_today_run, serialize_run
 
 router = APIRouter(include_in_schema=False)
 templates = Jinja2Templates(directory="app/templates")
@@ -40,7 +46,8 @@ def _collection_status(db: Session) -> dict:
     )
     auto_success = {a.product_id for a in attempts if a.source == "AUTO" and a.status != "FAILED"}
     auto_failed = {a.product_id for a in attempts if a.source == "AUTO" and a.status == "FAILED"}
-    manual_completed = {
+    manual_completed = manual_completed_product_ids(db, day_start)
+    manual_completed.update(
         task.product_id
         for task in db.scalars(
             select(ManualCollectionTask).where(
@@ -48,7 +55,7 @@ def _collection_status(db: Session) -> dict:
                 ManualCollectionTask.completed_at >= day_start,
             )
         )
-    }
+    )
     pending_manual = db.scalar(
         select(func.count())
         .select_from(ManualCollectionTask)
@@ -69,7 +76,7 @@ def _collection_status(db: Session) -> dict:
 
 def _snapshot_status(snapshot: ProductSnapshot | None) -> tuple[str, str]:
     if snapshot is None:
-        return "pending", "尚未采集"
+        return "pending", "待采集"
     if snapshot.parse_status == "success":
         return "success", "采集成功"
     if snapshot.parse_status == "partial":
@@ -124,6 +131,11 @@ def _product_monitor_rows(
         latest_metric = metric_by_key.get((product.id, latest_date))
         latest_snapshot = latest_snapshot_by_product.get(product.id)
         status_class, status_label = _snapshot_status(latest_snapshot)
+        collection_state, collection_label, collection_status_class, collection_captured_at = snapshot_collection_state(
+            latest_snapshot,
+            latest_date + timedelta(days=1),
+            ZoneInfo(get_settings().timezone),
+        )
         rows.append(
             {
                 "product": product,
@@ -134,6 +146,12 @@ def _product_monitor_rows(
                 "latest_snapshot": latest_snapshot,
                 "status_class": status_class,
                 "status_label": status_label,
+                "collection_state": collection_state,
+                "collection_status_class": collection_status_class,
+                "collection_status_label": collection_label,
+                "collection_captured_at": collection_captured_at
+                if collection_state in {"completed", "failed"}
+                else None,
             }
         )
     return rows
@@ -142,7 +160,12 @@ def _product_monitor_rows(
 @router.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     stores = list(db.scalars(select(Store).order_by(Store.status, Store.name)))
-    products = list(db.scalars(select(Product).order_by(Product.status, Product.id.desc())))
+    all_products = list(
+        db.scalars(select(Product).order_by(Product.status, Product.id.desc()))
+    )
+    products = [
+        product for product in all_products if product.status == "active"
+    ]
     recent_snapshots = list(
         db.scalars(
             select(ProductSnapshot)
@@ -198,6 +221,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
         for store in stores
         if store.status == "active"
     ]
+    browser_collection_run = get_today_run(db)
     context = {
         "request": request,
         "stores": stores,
@@ -207,10 +231,14 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
         "latest_store_metrics": latest_store_metrics,
         "growth_metrics": growth_metrics,
         "store_by_id": {store.id: store for store in stores},
-        "product_by_id": {product.id: product for product in products},
+        "product_by_id": {product.id: product for product in all_products},
         "history_dates": history_dates,
         "store_panels": store_panels,
         "collection_status": _collection_status(db),
+        "collection_progress": build_collection_progress(db),
+        "browser_collection_run": serialize_run(browser_collection_run)
+        if browser_collection_run
+        else None,
         "active_store_count": db.scalar(
             select(func.count()).select_from(Store).where(Store.status == "active")
         ),
@@ -267,6 +295,7 @@ def product_detail(
 
 
 @router.get("/collection/pending", response_class=HTMLResponse)
+@router.get("/manual", response_class=HTMLResponse)
 def pending_collection(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     tasks = list(
         db.scalars(
@@ -310,7 +339,11 @@ def store_detail(
     if store is None:
         raise HTTPException(status_code=404, detail="Store not found")
     products = list(
-        db.scalars(select(Product).where(Product.store_id == store_id).order_by(Product.id.desc()))
+        db.scalars(
+            select(Product)
+            .where(Product.store_id == store_id, Product.status == "active")
+            .order_by(Product.id.desc())
+        )
     )
     metrics = list(
         db.scalars(

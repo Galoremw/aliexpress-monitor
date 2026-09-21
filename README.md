@@ -11,7 +11,7 @@
 - 按 `Asia/Shanghai` 自然日估算商品销量并汇总店铺监控范围
 - APScheduler 每日采集，以及单商品/全量手动采集
 - FastAPI JSON API、OpenAPI 文档和轻量中文 Dashboard
-- AUTO FIRST + MANUAL FALLBACK：自动采集失败进入待补采队列，可用 Chrome Extension 用户主动补采
+- AUTO FIRST + BROWSER FALLBACK：HTTP 失败后由专用 Chrome 顺序采集，验证页只允许人工正常通过
 - PostgreSQL + Alembic + Docker Compose 部署
 
 系统不实现登录、验证码绕过、浏览器指纹规避、代理轮换或其他平台安全机制规避。若公开页面拒绝访问或结构无法识别，会保存失败快照供排查。
@@ -26,33 +26,57 @@
 
 项目目录中还提供 `AliExpress Monitor.url`，可以右键发送到桌面作为网页快捷方式。网页快捷方式要求服务已经运行；希望双击时自动启动 Docker 的场景，请为 `open-monitor.bat` 创建桌面快捷方式。
 
-## GitHub Pages Deployment
+## Hosted Frontend and Backend
 
-GitHub Pages 部署的是 `frontend/` 下的静态前端，当前配置连接使用者本机的 `http://127.0.0.1:8000` Backend。使用 Pages 前，必须在本机启动 Docker/Backend；否则页面会显示 Backend 连接失败。GitHub Pages 本身不运行数据库、Scheduler、Collector 或 Chrome Extension Backend。前端使用 Hash 路由。
+GitHub Pages 部署的是 `frontend/` 下的静态前端，生产构建通过 GitHub Actions 变量 `BACKEND_URL` 连接托管 FastAPI。前端使用 Hash 路由，打开 Pages 不需要当前电脑运行 Docker、FastAPI 或 PostgreSQL。数据库、Scheduler、Collector 和 Chrome Extension Backend 都运行在托管 Backend 所在的服务器。
 
 GitHub Actions 文件为 `.github/workflows/deploy-pages.yml`，在 `main` 分支 push 或手动触发时执行 `npm ci`、`npm run build`、`npm test`，然后使用 GitHub Pages 官方 Actions 发布 `frontend/dist`。
 
 ### Environment Variables
 
-`VITE_API_BASE_URL` 只能填写 API 地址，不能放 API key、数据库密码、Cookie、Token 或其他秘密。本次 Pages 构建使用 `http://127.0.0.1:8000`，它只对打开 Pages 的同一台电脑有效。生产 Backend 尚未部署时，不要把本地地址误认为公网 API。
+`VITE_API_BASE_URL` 只能填写 Backend origin，例如 `https://monitor-api.example.com`，不能放 API key、数据库密码、Cookie、Token 或其他秘密。到 GitHub 仓库 Settings -> Secrets and variables -> Actions -> Variables 中创建：
+
+```text
+BACKEND_URL=https://你的后端域名
+```
+
+工作流会拒绝空地址、本机地址和 `127.0.0.1` 地址，避免发布一个无法连接的 Pages。Backend 必须提供 `GET /health`，并通过 HTTPS 对外服务。
 
 ### Backend Deployment
 
-GitHub Pages 只能托管静态 Frontend。FastAPI、PostgreSQL、APScheduler 和 AliExpress Collector 仍需运行在本地 Docker 或另一个受控 Backend 环境中。当前本地入口仍然是 `http://127.0.0.1:3000`，Pages Demo 不会连接访问者电脑上的 `127.0.0.1:8000`。
+GitHub Pages 只托管静态 Frontend；FastAPI、PostgreSQL、APScheduler 和 AliExpress Collector 应运行在云服务器或受控 Backend 环境中。服务器部署时设置 `BACKEND_BIND_HOST=0.0.0.0`，并在防火墙或反向代理层限制访问。PostgreSQL 不在 Compose 中对公网发布，建议 Backend 使用托管 PostgreSQL 或服务器内网数据库。
+
+将 Backend 的 `FRONTEND_ALLOWED_ORIGINS` 设置为 Pages 的 origin，例如：
+
+```text
+FRONTEND_ALLOWED_ORIGINS=https://galoremw.github.io,http://127.0.0.1:3000
+```
+
+如果使用自定义前端域名，把它加入同一逗号分隔列表。部署后先访问 `https://你的后端域名/health`，再打开 Pages。
 
 ### Architecture
 
 ```text
-GitHub Pages -> static frontend demo only
-Local Docker -> frontend proxy + FastAPI + PostgreSQL + scheduler
-Chrome Extension -> local FastAPI browser-extension endpoint
+GitHub Pages -> hosted FastAPI + PostgreSQL + scheduler
+Cloud Docker -> FastAPI + PostgreSQL + scheduler + collectors
+Chrome Extension -> hosted FastAPI browser-extension endpoint
 ```
 
-固定地址：
+本地 Compose 固定地址：
 
 - Frontend: <http://127.0.0.1:3000>
 - Backend: <http://127.0.0.1:8000>
 - API 文档: <http://127.0.0.1:8000/docs>
+
+## Render 云端部署
+
+根目录的 `render.yaml` 提供 Render Blueprint：FastAPI Web Service、独立 Scheduler Worker、静态 Frontend 和 Render PostgreSQL。创建 Blueprint 时填写：
+
+- `FRONTEND_ALLOWED_ORIGINS`: GitHub Pages 或 Render Frontend 的 HTTPS 地址
+- `VITE_API_BASE_URL`: Backend 的 HTTPS 地址，例如 `https://aliexpress-monitor-api.onrender.com`
+- `FIRECRAWL_API_KEY`: 只有启用 Firecrawl fallback 时才填写
+
+Backend 使用 `/health` 做健康检查，数据库迁移由部署前命令执行，不会清空已有数据。Render PostgreSQL 的标准 `postgresql://` 连接串会在应用内转换为 `postgresql+psycopg://`，本地 Docker Compose 不受影响。
 
 ## Docker Compose 启动
 
@@ -60,7 +84,7 @@ Chrome Extension -> local FastAPI browser-extension endpoint
 docker compose up -d --build
 ```
 
-启动后访问：
+本地启动后访问：
 
 - Dashboard: <http://localhost:8000/>
 - API 文档: <http://localhost:8000/docs>
@@ -71,6 +95,26 @@ docker compose up -d --build
 扩展目录为 `extension/`。在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，选择“加载已解压的扩展程序”并选中该目录。然后从监控台商品详情页点击“在 Chrome 打开”，在商品页点击扩展图标中的“采集当前商品”。
 
 扩展只读取当前商品页的公开可见信息，并通过 `POST /api/collection/browser-extension` 写入新的 `ProductSnapshot(source=CHROME_EXTENSION)`；它不会读取 Cookie、绕过验证码或后台自动监控页面。自动采集失败的商品可在 `/collection/pending` 查看并补采。
+
+## Hosted Chrome Extension
+
+扩展的 API 地址在 [extension/config.js](extension/config.js) 中配置。将其中的 `http://127.0.0.1:8000` 改成同一个托管 Backend origin，并在 `extension/manifest.json` 的 `host_permissions` 中加入该 Backend 的精确 origin，例如：
+
+```json
+"https://monitor-api.example.com/*"
+```
+
+不要使用 `https://*/*` 放宽权限。修改后在 `chrome://extensions` 重新加载扩展。扩展仍然需要在用户自己的 Chrome 配置中正常登录 AliExpress；它不会把 Cookie 或登录凭据上传到 Backend。
+
+## 每日浏览器自动采集
+
+双击 `install-browser-collector.bat` 会创建 Windows 计划任务 `AliExpress Monitor Daily Collection`，每天北京时间 `02:00` 调用 `start-browser-collector.bat`。如果计划时间电脑未开机，Windows 会在当前用户下次登录后尽快补跑。专用浏览器配置保存在 `%LOCALAPPDATA%\AliExpressMonitor\ChromeProfile`，与日常 Chrome 配置隔离。
+
+首次安装后需在脚本打开的专用 Chrome 中完成两件事：从 `extension/` 加载未打包扩展，以及正常登录 AliExpress。之后每日流程会先刷新各活跃店铺的公开订单排序页并更新前 20 监控池，再逐个采集当天尚无有效快照的商品。自动发现且已离开前 20 的商品会停用，手动添加商品不会自动停用。
+
+如果页面要求验证，任务会暂停并保留当前标签页，同时发送 Chrome 系统通知。人工正常完成验证后，扩展会自动继续；也可以在监控台点击“验证完成，继续任务”。系统不会识别或绕过验证码，也不会读取 Cookie、密码或浏览器凭据。
+
+可在监控台点击“立即运行今日任务”创建或恢复当日幂等队列。`remove-browser-collector-task.bat` 只删除 Windows 计划任务，不会删除专用 Chrome 配置或历史监控数据。
 
 应用容器启动时会先执行 `alembic upgrade head`。PostgreSQL 数据保存在 `postgres_data` volume。
 
@@ -111,6 +155,9 @@ SQLite 仅用于本地开发和测试；正式 Compose 环境使用 PostgreSQL�
 | `POST` | `/api/collection/manual` | 接收手动录入的公开数据 |
 | `GET` | `/api/collection/status/today` | 查询今日自动/手动采集状态 |
 | `GET` | `/api/collection/pending` | 查询自动失败、待人工补采商品 |
+| `GET` | `/api/browser-collection/runs/today` | 查询今日浏览器任务与心跳 |
+| `POST` | `/api/browser-collection/runs/ensure` | 幂等创建或恢复今日任务 |
+| `POST` | `/api/browser-collection/items/claim` | 扩展领取下一条顺序任务 |
 | `GET` | `/api/products/{id}/snapshots` | 查询原始快照历史 |
 | `GET` | `/api/products/{id}/daily-metrics` | 查询商品日销量估算 |
 | `GET` | `/api/stores/{id}/daily-metrics` | 查询店铺监控范围估算 |

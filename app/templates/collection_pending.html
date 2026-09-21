@@ -11,7 +11,7 @@
   <article><span>Success Rate</span><strong>{{ status.success_rate }}%</strong></article>
 </section>
 <section class="data-section"><div class="section-heading"><h2>自动采集失败商品</h2><span>日期 {{ status.date }}</span></div><div class="table-wrap"><table><thead><tr><th>商品</th><th>店铺</th><th>最后成功时间</th><th>失败原因</th><th>操作</th></tr></thead><tbody>
-{% for row in rows %}<tr><td><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a></td><td><a href="/dashboard/stores/{{ row.store.id }}">{{ row.store.name }}</a></td><td>{{ row.last_success_at.strftime("%Y-%m-%d %H:%M") if row.last_success_at else "从未成功" }}</td><td><span class="status failed">{{ row.task.reason }}</span></td><td><a class="button" href="{{ row.product.url }}" target="_blank" rel="noreferrer">打开商品</a></td></tr>
+{% for row in rows %}<tr><td><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a></td><td><a href="/dashboard/stores/{{ row.store.id }}">{{ row.store.name }}</a></td><td>{{ row.last_success_at.strftime("%Y-%m-%d %H:%M") if row.last_success_at else "从未成功" }}</td><td><span class="status failed">{{ row.task.reason }}</span></td><td><a class="button" href="{{ row.product.url }}#monitor_product_id={{ row.product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品</a></td></tr>
 {% else %}<tr><td colspan="5" class="empty">当前没有待人工补采商品。</td></tr>{% endfor %}
 </tbody></table></div></section>
 {% endblock %}

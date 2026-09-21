@@ -5,7 +5,16 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect
 
-from app.db.models import Product, ProductDailyMetric, ProductSnapshot, Store, StoreDailyMetric
+from app.db.models import (
+    BrowserCollectionItem,
+    BrowserCollectionRun,
+    Product,
+    ProductDailyMetric,
+    ProductSnapshot,
+    Store,
+    StoreDailyMetric,
+)
+from app.core.config import normalize_database_url
 
 
 def test_all_tables_are_created(db_session):
@@ -17,7 +26,18 @@ def test_all_tables_are_created(db_session):
         "product_daily_metrics",
         "store_daily_metrics",
         "store_snapshots",
+        "browser_collection_runs",
+        "browser_collection_items",
     } <= tables
+
+
+def test_render_postgres_url_is_normalized_for_psycopg():
+    assert normalize_database_url(
+        "postgresql://user:pass@host:5432/db"
+    ) == "postgresql+psycopg://user:pass@host:5432/db"
+    assert normalize_database_url(
+        "postgresql+psycopg://user:pass@host:5432/db"
+    ) == "postgresql+psycopg://user:pass@host:5432/db"
 
 
 def test_alembic_upgrade_creates_schema(tmp_path: Path, monkeypatch):
@@ -78,3 +98,27 @@ def test_model_relationships(db_session):
     assert store.products == [product]
     assert product.snapshots[0].raw_payload == {"sold": 10}
     assert store.daily_metrics[0].calculation_method == "sum_of_monitored_product_estimates"
+
+
+def test_browser_collection_relationships(db_session):
+    store = Store(name="Browser Store", url="https://www.aliexpress.com/store/900001")
+    product = Product(
+        store=store,
+        aliexpress_product_id="100500900001",
+        url="https://www.aliexpress.com/item/100500900001.html",
+    )
+    run = BrowserCollectionRun(target_date=date(2026, 9, 21))
+    item = BrowserCollectionItem(
+        run=run,
+        target_type="PRODUCT",
+        target_key="product:1",
+        store=store,
+        product=product,
+        target_url=product.url,
+        position=1,
+    )
+    db_session.add(item)
+    db_session.commit()
+
+    assert run.items[0].product.aliexpress_product_id == "100500900001"
+    assert item.store.name == "Browser Store"

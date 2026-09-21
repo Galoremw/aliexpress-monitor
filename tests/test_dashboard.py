@@ -85,6 +85,70 @@ def test_dashboard_expands_store_with_product_and_seven_day_sales(client, db_ses
     assert ">7<" in response.text
 
 
+def test_dashboard_marks_discovered_product_pending_and_links_to_product(client, db_session):
+    store = Store(name="Discovered Store", url="https://www.aliexpress.com/store/660004")
+    product = Product(
+        store=store,
+        aliexpress_product_id="100500663",
+        url="https://www.aliexpress.com/item/100500663.html",
+        discovery_source="chrome_extension_store",
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    response = client.get(f"/dashboard/stores/{store.id}")
+
+    assert response.status_code == 200
+    assert "待采集" in response.text
+    assert f'href="{product.url}#monitor_product_id={product.aliexpress_product_id}"' in response.text
+    assert f'data-product-id="{product.id}"' in response.text
+    assert "删除监控" in response.text
+
+
+def test_dashboard_has_product_deactivate_control(client, db_session):
+    store = Store(name="Remove Store", url="https://www.aliexpress.com/store/660005")
+    product = Product(
+        store=store,
+        aliexpress_product_id="100500664",
+        url="https://www.aliexpress.com/item/100500664.html",
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    response = client.get(f"/dashboard/stores/{store.id}")
+
+    assert response.status_code == 200
+    assert f'data-product-id="{product.id}"' in response.text
+    assert "删除监控" in response.text
+
+
+def test_dashboard_keeps_rendering_after_product_is_deactivated(client, db_session):
+    store = Store(name="Inactive Store", url="https://www.aliexpress.com/store/660006")
+    product = Product(
+        store=store,
+        aliexpress_product_id="100500665",
+        url="https://www.aliexpress.com/item/100500665.html",
+        status="inactive",
+    )
+    db_session.add(
+        ProductSnapshot(
+            product=product,
+            collected_at=datetime.now(timezone.utc),
+            collector_name="fixture",
+            collector_version="1",
+            parse_status="success",
+            cumulative_sold=12,
+            raw_payload={},
+        )
+    )
+    db_session.commit()
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Inactive Store" in response.text
+
+
 def test_dashboard_labels_saved_challenge_page_clearly(client, db_session):
     store = Store(name="Challenge Store", url="https://www.aliexpress.com/store/660003")
     product = Product(
@@ -123,6 +187,15 @@ def test_dashboard_css_and_store_detail_are_available(client, db_session):
     assert "仅覆盖" in detail.text
     assert "已监控商品求和" in detail.text
     assert 'class="store-rename-form compact-rename"' in detail.text
+
+
+def test_manual_processing_page_has_stable_alias(client):
+    pending = client.get("/collection/pending")
+    manual = client.get("/manual")
+
+    assert pending.status_code == 200
+    assert manual.status_code == 200
+    assert "待人工补采" in manual.text
 
 
 def test_dashboard_exposes_store_rename_control(client, db_session):

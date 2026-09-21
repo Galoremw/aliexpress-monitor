@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from app.collectors.base import CollectorResult
 from app.collectors.dependencies import get_collector
@@ -27,7 +28,7 @@ def extension_payload(product_id="100500700", sold_count=88):
         "price": "12.50",
         "rating": "4.8",
         "review_count": 321,
-        "captured_at": "2026-09-21T10:00:00+08:00",
+        "captured_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
         "raw_data": {"extractor_version": "extension-test"},
     }
 
@@ -62,6 +63,42 @@ def test_browser_extension_rejects_unmonitored_product(client):
     assert response.json()["detail"] == "该商品尚未加入监控"
 
 
+def test_browser_extension_rejects_deactivated_product(client):
+    _, product = create_product(client, product_id="100500798")
+    response = client.post(f"/api/products/{product['id']}/deactivate")
+    assert response.status_code == 200
+
+    response = client.post(
+        "/api/collection/browser-extension",
+        json=extension_payload(product_id="100500798"),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "该商品尚未加入监控"
+
+
+def test_browser_extension_matches_monitored_url_when_page_id_is_redirected(client):
+    _, product = create_product(client, product_id="100500705")
+    payload = extension_payload(product_id="3256810400878106")
+    payload["url"] = product["url"]
+
+    response = client.post("/api/collection/browser-extension", json=payload)
+
+    assert response.status_code == 201
+    assert response.json()["product_id"] == product["id"]
+
+
+def test_browser_extension_matches_navigation_alias_when_page_redirects(client):
+    _, product = create_product(client, product_id="3256812061169120")
+    payload = extension_payload(product_id="1005012247483872")
+    payload["raw_data"]["monitored_product_id"] = "3256812061169120"
+
+    response = client.post("/api/collection/browser-extension", json=payload)
+
+    assert response.status_code == 201
+    assert response.json()["product_id"] == product["id"]
+
+
 def test_browser_extension_store_discovery_adds_top_twenty_links(client, db_session):
     store = client.post(
         "/api/stores",
@@ -89,6 +126,33 @@ def test_browser_extension_store_discovery_adds_top_twenty_links(client, db_sess
     products = list(db_session.query(Product).filter_by(store_id=store["id"]))
     assert len(products) == 20
     assert products[0].discovery_source == "chrome_extension_store"
+    snapshots = list(
+        db_session.query(ProductSnapshot).filter(ProductSnapshot.source == "CHROME_EXTENSION")
+    )
+    assert len(snapshots) == 20
+    assert all(snapshot.sold_count is not None for snapshot in snapshots)
+
+
+def test_product_without_store_is_added_to_custom_monitoring_store(client):
+    response = client.post(
+        "/api/products",
+        json={"url": "https://www.aliexpress.com/item/100500799001.html"},
+    )
+
+    assert response.status_code == 201
+    product = response.json()
+    assert product["store_id"] > 0
+    stores = client.get("/api/stores").json()
+    custom_stores = [store for store in stores if store["name"] == "自定义监控"]
+    assert len(custom_stores) == 1
+    assert product["store_id"] == custom_stores[0]["id"]
+
+    second = client.post(
+        "/api/products",
+        json={"url": "https://www.aliexpress.com/item/100500799002.html"},
+    )
+    assert second.status_code == 201
+    assert second.json()["store_id"] == product["store_id"]
 
 
 def test_auto_failure_creates_attempt_and_manual_task(client, db_session):
@@ -157,3 +221,37 @@ def test_collection_status_today_exposes_auto_and_manual_counts(client):
         "pending_manual",
         "success_rate",
     }
+
+
+def test_collection_progress_tracks_manual_snapshot_and_next_product(client, db_session):
+    store = client.post(
+        "/api/stores",
+        json={"name": "Progress Store", "url": "https://www.aliexpress.com/store/770702"},
+    ).json()
+    first = client.post(
+        "/api/products",
+        json={"store_id": store["id"], "aliexpress_product_id": "100500710"},
+    ).json()
+    second = client.post(
+        "/api/products",
+        json={"store_id": store["id"], "aliexpress_product_id": "100500711"},
+    ).json()
+
+    response = client.post(
+        "/api/collection/browser-extension",
+        json=extension_payload(product_id=first["aliexpress_product_id"], sold_count=22),
+    )
+
+    assert response.status_code == 201
+    progress = client.get("/api/collection/progress")
+    assert progress.status_code == 200
+    body = progress.json()
+    assert body["total"] == 2
+    assert body["completed"] == 1
+    assert body["pending"] == 1
+    assert body["next_product"]["product_id"] == second["id"]
+    assert body["items"][0]["status"] == "completed"
+
+    status = client.get("/api/collection/status/today")
+    assert status.status_code == 200
+    assert status.json()["manual_completed"] == 1

@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 const root = fileURLToPath(new URL(".", import.meta.url));
 const source = resolve(root, "src");
 const output = resolve(root, "dist");
-const apiBaseUrl = process.env.VITE_API_BASE_URL || "";
+const apiBaseUrl = (process.env.VITE_API_BASE_URL || "").trim().replace(/\/$/, "");
 
 await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });

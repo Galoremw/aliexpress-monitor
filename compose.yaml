@@ -1,3 +1,5 @@
+name: aliexpress-monitor
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -17,7 +19,7 @@ services:
   backend:
     build: .
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://monitor:monitor-local-only@postgres:5432/monitor}
       TIMEZONE: Asia/Shanghai
       SCHEDULER_ENABLED: "false"
       SCHEDULER_HOUR: "2"
@@ -27,7 +29,7 @@ services:
       FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-https://api.firecrawl.dev}
       FRONTEND_ALLOWED_ORIGINS: ${FRONTEND_ALLOWED_ORIGINS:-https://galoremw.github.io,http://127.0.0.1:3000,http://localhost:3000}
     ports:
-      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+      - "${BACKEND_BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -41,7 +43,7 @@ services:
   scheduler:
     build: .
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://monitor:monitor-local-only@postgres:5432/monitor}
       TIMEZONE: ${TIMEZONE:-Asia/Shanghai}
       SCHEDULER_ENABLED: "true"
       SCHEDULER_HOUR: ${SCHEDULER_HOUR:-2}
@@ -62,7 +64,7 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
     ports:
-      - "127.0.0.1:${FRONTEND_PORT:-3000}:80"
+      - "${FRONTEND_BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-3000}:80"
     depends_on:
       backend:
         condition: service_healthy

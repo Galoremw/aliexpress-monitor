@@ -5,12 +5,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.config import get_settings
+from app.core.config import get_settings, normalize_database_url
 
 
 @lru_cache
 def get_engine() -> Engine:
-    url = get_settings().database_url
+    url = normalize_database_url(get_settings().database_url)
     kwargs = {"connect_args": {"check_same_thread": False}} if url.startswith("sqlite") else {}
     return create_engine(url, pool_pre_ping=True, **kwargs)
 
@@ -26,4 +26,3 @@ def get_db() -> Generator[Session, None, None]:
         yield session
     finally:
         session.close()
-

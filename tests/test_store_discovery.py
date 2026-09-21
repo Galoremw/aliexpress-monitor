@@ -12,7 +12,7 @@ from app.collectors.store_discovery import (
     StoreProductCandidate,
     parse_store_products,
 )
-from app.db.models import Product, ProductDailyMetric, StoreSnapshot
+from app.db.models import Product, ProductDailyMetric, ProductSnapshot, StoreSnapshot
 from app.core.config import get_settings
 
 
@@ -220,6 +220,52 @@ def test_store_discovery_default_monitors_top_twenty(client):
     assert len(products) == 20
     assert products[0]["discovery_rank"] == 1
     assert products[-1]["discovery_rank"] == 20
+
+
+def test_store_discovery_refreshes_auto_pool_and_keeps_snapshot_history(client, db_session):
+    store = create_store(client)
+    replacement = StoreProductCandidate(
+        product_id="100500999999",
+        url="https://www.aliexpress.com/item/100500999999.html",
+        title="Replacement Product",
+        public_cumulative_sold=9999,
+    )
+
+    class SequenceCollector:
+        name = "sequence_fixture"
+        version = "1"
+
+        def __init__(self):
+            self.results = [
+                candidates(20),
+                candidates(20)[1:] + [replacement],
+                candidates(20),
+            ]
+
+        def discover(self, store_url):
+            return StoreDiscoveryResult(
+                collected_at=datetime.now(timezone.utc),
+                collector_name=self.name,
+                collector_version=self.version,
+                parse_status="success",
+                candidates=self.results.pop(0),
+                source_http_status=200,
+            )
+
+    collector = SequenceCollector()
+    client.app.dependency_overrides[get_store_discovery_collector] = lambda: collector
+
+    for _ in range(3):
+        response = client.post(f"/api/stores/{store['id']}/discover")
+        assert response.status_code == 200
+
+    products = {
+        product.aliexpress_product_id: product
+        for product in db_session.query(Product).filter_by(store_id=store["id"])
+    }
+    assert products["100500900000"].status == "active"
+    assert products["100500999999"].status == "inactive"
+    assert len(db_session.query(ProductSnapshot).filter_by(source="AUTO").all()) == 60
 
 
 def test_yesterday_top_products_returns_only_best_twenty(client, db_session):

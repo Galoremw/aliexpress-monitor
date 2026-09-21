@@ -33,7 +33,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_frontend_origins + ["http://127.0.0.1:8000", "http://localhost:8000"],
     allow_origin_regex=settings.extension_allowed_origin_regex,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
 app.include_router(router)

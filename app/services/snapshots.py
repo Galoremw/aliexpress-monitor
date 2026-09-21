@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
 
+from datetime import datetime
+from typing import Any
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -48,6 +51,8 @@ def _save_snapshot_result(
     product: Product,
     result: CollectorResult,
     source: str,
+    *,
+    commit: bool = True,
 ) -> ProductSnapshot:
     status = snapshot_status(result.parse_status)
     captured_at = result.collected_at or datetime.now(timezone.utc)
@@ -90,8 +95,11 @@ def _save_snapshot_result(
     db.add(attempt)
     db.flush()
     _sync_manual_task(db, product.id, source, status, attempt)
-    db.commit()
-    db.refresh(snapshot)
+    if commit:
+        db.commit()
+        db.refresh(snapshot)
+    else:
+        db.flush()
     return snapshot
 
 
@@ -122,6 +130,43 @@ def save_external_snapshot(
     product: Product,
     result: CollectorResult,
     source: str,
+    *,
+    commit: bool = True,
 ) -> ProductSnapshot:
     """Persist an observation from a non-HTTP channel through the same path."""
-    return _save_snapshot_result(db, product, result, source)
+    return _save_snapshot_result(db, product, result, source, commit=commit)
+
+
+def save_store_product_snapshot(
+    db: Session,
+    product: Product,
+    *,
+    captured_at: datetime,
+    sold_count: int | None,
+    title: str | None,
+    source: str,
+    collector_name: str,
+    collector_version: str,
+    raw_payload: dict[str, Any],
+    commit: bool = False,
+) -> ProductSnapshot:
+    """Persist the public cumulative sales observed on a store listing page.
+
+    Store pages generally expose only a subset of product fields.  A sold count
+    is enough for the daily delta calculation, while missing counts remain a
+    suspect snapshot and can be sent to the product-page fallback queue.
+    """
+    has_sold_count = sold_count is not None
+    result = CollectorResult(
+        collected_at=captured_at,
+        collector_name=collector_name,
+        collector_version=collector_version,
+        parse_status="success" if has_sold_count else "partial",
+        cumulative_sold=sold_count,
+        title=title,
+        source_http_status=200,
+        raw_payload=raw_payload,
+        error_type=None if has_sold_count else "missing_sold_count",
+        error_message=None if has_sold_count else "店铺页未提供累计销量",
+    )
+    return _save_snapshot_result(db, product, result, source, commit=commit)

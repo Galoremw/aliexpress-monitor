@@ -9,6 +9,7 @@ from app.collectors.store_dependencies import build_store_discovery_collector
 from app.core.config import Settings, get_settings
 from app.db.session import get_session_factory
 from app.services.collection_runs import run_collection_cycle
+from app.services.browser_collection import ensure_browser_collection_run
 from app.services.store_discovery import discover_store_products
 from app.db.models import Store
 
@@ -23,11 +24,21 @@ def run_scheduled_collection() -> None:
     try:
         for store in session.scalars(select(Store).where(Store.status == "active")):
             discover_store_products(session, store, store_collector, limit=20)
-        summary = run_collection_cycle(session, collector)
+        summary = run_collection_cycle(
+            session,
+            collector,
+            skip_current_date_snapshots=True,
+        )
         logger.info("Scheduled collection completed: %s", summary.to_dict())
     except Exception:
         session.rollback()
-        logger.exception("Scheduled collection failed")
+        logger.exception("Scheduled HTTP collection failed; browser fallback will still be queued")
+    try:
+        run = ensure_browser_collection_run(session, trigger="SCHEDULED")
+        logger.info("Browser fallback run ready: id=%s status=%s", run.id, run.status)
+    except Exception:
+        session.rollback()
+        logger.exception("Unable to create browser fallback run")
     finally:
         collector.close()
         store_collector.close()

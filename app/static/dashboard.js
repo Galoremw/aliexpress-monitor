@@ -37,7 +37,8 @@ document.querySelector("#product-form")?.addEventListener("submit", async (event
   event.preventDefault();
   const data = new FormData(event.currentTarget);
   const target = String(data.get("target") || "").trim();
-  const payload = { store_id: Number(data.get("store_id")) };
+  const selectedStore = String(data.get("store_id") || "").trim();
+  const payload = { store_id: selectedStore ? Number(selectedStore) : null };
   if (/^\d+$/.test(target)) payload.aliexpress_product_id = target;
   else payload.url = target;
   try {
@@ -105,6 +106,21 @@ document.querySelectorAll(".collect-one").forEach((button) => {
   });
 });
 
+document.querySelectorAll(".deactivate-product").forEach((button) => {
+  button.addEventListener("click", async () => {
+    if (!window.confirm("确定删除这个商品的监控吗？历史快照会保留，但它将不再参与自动采集和店铺汇总。")) return;
+    button.disabled = true;
+    try {
+      await jsonRequest(`/api/products/${button.dataset.productId}/deactivate`, { method: "POST" });
+      notify("商品已移出监控，历史数据已保留");
+      window.location.reload();
+    } catch (error) {
+      notify(error.message, true);
+      button.disabled = false;
+    }
+  });
+});
+
 document.querySelectorAll(".discover-store").forEach((button) => {
   button.addEventListener("click", async () => {
     button.disabled = true;
@@ -122,3 +138,183 @@ document.querySelectorAll(".discover-store").forEach((button) => {
     }
   });
 });
+
+function trackedProgressUrl(item) {
+  return `${item.product_url}#monitor_product_id=${encodeURIComponent(item.platform_product_id)}`;
+}
+
+function updateCollectionProgress(progress) {
+  ["completed", "pending", "failed", "total"].forEach((key) => {
+    const target = document.querySelector(`[data-progress-value="${key}"]`);
+    if (target) target.textContent = progress[key];
+  });
+  const date = document.querySelector("#collection-progress-date");
+  if (date) date.textContent = `${progress.date} · 手动采集同步`;
+
+  const nextLink = document.querySelector("#next-product-link");
+  const nextLabel = document.querySelector("#next-product-label");
+  if (nextLink && nextLabel) {
+    if (progress.next_product) {
+      nextLink.href = trackedProgressUrl(progress.next_product);
+      nextLink.target = "_blank";
+      nextLink.rel = "noreferrer";
+      nextLink.classList.remove("disabled-link");
+      nextLabel.textContent = "打开下一条商品";
+    } else {
+      nextLink.removeAttribute("href");
+      nextLink.classList.add("disabled-link");
+      nextLabel.textContent = "本轮已完成";
+    }
+  }
+
+  const itemsById = new Map(progress.items.map((item) => [String(item.product_id), item]));
+  document.querySelectorAll("tr[data-product-id]").forEach((row) => {
+    const item = itemsById.get(row.dataset.productId);
+    if (!item) return;
+    const status = row.querySelector("[data-collection-status]");
+    if (status) {
+      status.className = `status ${item.status_class}`;
+      status.textContent = item.status_label;
+    }
+    const cell = status?.parentElement;
+    if (!cell) return;
+    let time = cell.querySelector("[data-collection-time]");
+    if (item.captured_at) {
+      if (!time) {
+        time = document.createElement("small");
+        time.dataset.collectionTime = "";
+        cell.appendChild(time);
+      }
+      time.textContent = new Date(item.captured_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+    } else if (time) {
+      time.remove();
+    }
+  });
+}
+
+async function refreshCollectionProgress() {
+  const section = document.querySelector("#collection-progress");
+  if (!section) return;
+  try {
+    updateCollectionProgress(await jsonRequest(section.dataset.progressEndpoint));
+  } catch {
+    // A short backend restart should not interrupt the current collection flow.
+  }
+}
+
+const browserPhaseLabels = {
+  STORE_DISCOVERY: "刷新店铺前 20",
+  PRODUCT_COLLECTION: "采集商品数据",
+  COMPLETED: "今日任务完成",
+};
+
+function formatBrowserTime(value) {
+  if (!value) return "尚未收到扩展心跳";
+  return `最近心跳：${new Date(value).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })}`;
+}
+
+function updateBrowserCollection(run) {
+  const online = document.querySelector("#browser-online");
+  const phase = document.querySelector("#browser-run-phase");
+  const date = document.querySelector("#browser-run-date");
+  const current = document.querySelector("#browser-current-item");
+  const heartbeat = document.querySelector("#browser-last-heartbeat");
+  const challenge = document.querySelector("#browser-challenge-message");
+  const resume = document.querySelector("#browser-run-resume");
+
+  if (!run) {
+    if (online) {
+      online.className = "status pending";
+      online.textContent = "Chrome 离线";
+    }
+    if (phase) phase.textContent = "等待启动";
+    if (date) date.textContent = "今日任务尚未创建";
+    if (current) current.textContent = "队列空闲";
+    if (heartbeat) heartbeat.textContent = "尚未收到扩展心跳";
+    if (challenge) challenge.hidden = true;
+    if (resume) resume.hidden = true;
+    return;
+  }
+
+  if (online) {
+    online.className = `status ${run.chrome_online ? "success" : "pending"}`;
+    online.textContent = run.chrome_online ? "Chrome 在线" : "Chrome 离线";
+  }
+  if (phase) phase.textContent = browserPhaseLabels[run.phase] || run.phase;
+  if (date) date.textContent = `${run.target_date} · 专用 Chrome 顺序采集`;
+  if (current) {
+    const item = run.current_item;
+    current.textContent = item ? `当前：${item.title || item.target_url}` : (run.phase === "COMPLETED" ? "今日队列已完成" : "等待扩展领取任务");
+  }
+  if (heartbeat) heartbeat.textContent = formatBrowserTime(run.last_heartbeat_at);
+  ["total_count", "succeeded_count", "partial_count", "failed_count", "pending_count"].forEach((key) => {
+    const target = document.querySelector(`[data-browser-value="${key}"]`);
+    if (target) target.textContent = run[key];
+  });
+
+  const needsVerification = run.status === "NEEDS_VERIFICATION";
+  if (challenge) challenge.hidden = !needsVerification;
+  if (resume) {
+    resume.hidden = !needsVerification;
+    resume.dataset.runId = run.id;
+  }
+}
+
+async function refreshBrowserCollection() {
+  const section = document.querySelector("#browser-collection-status");
+  if (!section) return;
+  try {
+    updateBrowserCollection(await jsonRequest(section.dataset.statusEndpoint));
+  } catch (error) {
+    if (!String(error.message).includes("404")) return;
+    updateBrowserCollection(null);
+  }
+}
+
+document.querySelector("#browser-run-now")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const run = await jsonRequest("/api/browser-collection/runs/ensure", {
+      method: "POST",
+      body: JSON.stringify({ trigger: "MANUAL" }),
+    });
+    updateBrowserCollection(run);
+    notify(run.chrome_online ? "今日浏览器采集任务已启动" : "任务已创建，正在等待专用 Chrome 扩展上线");
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector("#browser-run-resume")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (!button.dataset.runId) return;
+  button.disabled = true;
+  try {
+    const run = await jsonRequest(`/api/browser-collection/runs/${button.dataset.runId}/resume`, { method: "POST" });
+    updateBrowserCollection(run);
+    notify("任务已恢复，将从暂停位置继续");
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+if (document.querySelector("#collection-progress")) {
+  void refreshCollectionProgress();
+  window.setInterval(refreshCollectionProgress, 3000);
+}
+
+if (document.querySelector("#browser-collection-status")) {
+  void refreshBrowserCollection();
+  window.setInterval(refreshBrowserCollection, 3000);
+}

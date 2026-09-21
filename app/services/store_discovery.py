@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.collectors.store_discovery import StoreDiscoveryCollector, StoreDiscoveryResult
+from app.core.config import get_settings
 from app.db.models import Product, ProductDailyMetric, Store, StoreSnapshot
+from app.services.metrics import calculate_product_daily_metrics, calculate_store_daily_metric
+from app.services.snapshots import save_store_product_snapshot
 
 
 @dataclass(slots=True)
@@ -74,6 +78,7 @@ def discover_store_products(
     added_count = 0
     deactivated_count = 0
     product_links: list[str] = []
+    observed_products: list[tuple[Product, object, int]] = []
     for rank, candidate in enumerate(candidates, start=1):
         product_links.append(candidate.url)
         existing = db.scalar(
@@ -86,22 +91,27 @@ def discover_store_products(
             existing.discovery_rank = rank
             if candidate.title and not existing.title:
                 existing.title = candidate.title
+            if existing.discovery_source in ("store_page", "chrome_extension_store"):
+                existing.status = "active"
+                existing.discovered_at = result.collected_at
+            observed_products.append((existing, candidate, rank))
             continue
         if candidate.product_id in existing_ids:
             continue
-        db.add(
-            Product(
-                store_id=store.id,
-                aliexpress_product_id=candidate.product_id,
-                url=candidate.url,
-                title=candidate.title,
-                discovery_source="store_page",
-                discovery_rank=rank,
-                discovered_at=result.collected_at,
-            )
+        product = Product(
+            store_id=store.id,
+            aliexpress_product_id=candidate.product_id,
+            url=candidate.url,
+            title=candidate.title,
+            discovery_source="store_page",
+            discovery_rank=rank,
+            discovered_at=result.collected_at,
         )
+        db.add(product)
+        db.flush()
         existing_ids.add(candidate.product_id)
         added_count += 1
+        observed_products.append((product, candidate, rank))
     if result.parse_status == "success" and candidates:
         current_ids = {candidate.product_id for candidate in candidates}
         pool_products = list(
@@ -117,6 +127,39 @@ def discover_store_products(
             if product.aliexpress_product_id not in current_ids:
                 product.status = "inactive"
                 deactivated_count += 1
+    db.flush()
+    metric_date = result.collected_at.astimezone(
+        ZoneInfo(get_settings().timezone)
+    ).date()
+    for product, candidate, rank in observed_products:
+        save_store_product_snapshot(
+            db,
+            product,
+            captured_at=result.collected_at,
+            sold_count=candidate.public_cumulative_sold,
+            title=candidate.title,
+            source="AUTO",
+            collector_name=result.collector_name,
+            collector_version=result.collector_version,
+            raw_payload={
+                "collection_mode": "store_page",
+                "store_snapshot_id": snapshot.id,
+                "rank": rank,
+                "product_id": candidate.product_id,
+                "url": candidate.url,
+                "title": candidate.title,
+                "public_cumulative_sold": candidate.public_cumulative_sold,
+            },
+            commit=False,
+        )
+        calculate_product_daily_metrics(
+            db,
+            product.id,
+            timezone_name=get_settings().timezone,
+            commit=False,
+        )
+    if observed_products:
+        calculate_store_daily_metric(db, store.id, metric_date, commit=False)
     try:
         db.commit()
     except IntegrityError:

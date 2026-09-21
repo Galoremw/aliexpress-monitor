@@ -9,5 +9,7 @@ test("static demo source includes hash routes and backend-not-configured state",
   assert.match(app, /Backend 尚未配置/);
   assert.match(app, /api\/collection\/status\/today/);
   assert.match(app, /api\/products\/\$\{id\}\/snapshots/);
+  assert.match(app, /api\/browser-collection\/runs\/today/);
+  assert.match(app, /ensure-browser/);
   assert.match(app, /#\/stores/);
 });

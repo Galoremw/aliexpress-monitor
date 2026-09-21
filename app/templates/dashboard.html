@@ -29,6 +29,46 @@
   </div>
 </section>
 
+<section id="browser-collection-status" class="data-section browser-collection-band" data-status-endpoint="/api/browser-collection/runs/today">
+  <div class="section-heading">
+    <h2>每日浏览器采集</h2>
+    <span id="browser-run-date">{% if browser_collection_run %}{{ browser_collection_run.target_date }} · 专用 Chrome 顺序采集{% else %}今日任务尚未创建{% endif %}</span>
+  </div>
+  <div class="browser-run-layout">
+    <div class="browser-run-state">
+      <div class="browser-state-line">
+        <span id="browser-online" class="status {% if browser_collection_run and browser_collection_run.chrome_online %}success{% else %}pending{% endif %}">{% if browser_collection_run and browser_collection_run.chrome_online %}Chrome 在线{% else %}Chrome 离线{% endif %}</span>
+        <strong id="browser-run-phase">{% if browser_collection_run %}{{ browser_collection_run.phase }}{% else %}等待启动{% endif %}</strong>
+      </div>
+      <p id="browser-current-item">{% if browser_collection_run and browser_collection_run.current_item %}当前：{{ browser_collection_run.current_item.title or browser_collection_run.current_item.target_url }}{% else %}队列空闲{% endif %}</p>
+      <p id="browser-challenge-message" class="verification-alert"{% if not browser_collection_run or browser_collection_run.status != "NEEDS_VERIFICATION" %} hidden{% endif %}>AliExpress 正在等待人工验证。完成专用 Chrome 中的正常验证后，点击继续任务。</p>
+      <small id="browser-last-heartbeat">{% if browser_collection_run and browser_collection_run.last_heartbeat_at %}最近心跳：{{ browser_collection_run.last_heartbeat_at.strftime("%m-%d %H:%M") }}{% else %}尚未收到扩展心跳{% endif %}</small>
+    </div>
+    <div class="status-grid browser-progress-grid">
+      <span><small>总任务</small><b data-browser-value="total_count">{{ browser_collection_run.total_count if browser_collection_run else 0 }}</b></span>
+      <span><small>成功</small><b data-browser-value="succeeded_count">{{ browser_collection_run.succeeded_count if browser_collection_run else 0 }}</b></span>
+      <span><small>部分数据</small><b data-browser-value="partial_count">{{ browser_collection_run.partial_count if browser_collection_run else 0 }}</b></span>
+      <span><small>失败</small><b data-browser-value="failed_count">{{ browser_collection_run.failed_count if browser_collection_run else 0 }}</b></span>
+      <span><small>待处理</small><b data-browser-value="pending_count">{{ browser_collection_run.pending_count if browser_collection_run else 0 }}</b></span>
+    </div>
+    <div class="browser-run-actions">
+      <button id="browser-run-now" class="button" type="button">立即运行今日任务</button>
+      <button id="browser-run-resume" class="button primary" type="button" data-run-id="{{ browser_collection_run.id if browser_collection_run else '' }}"{% if not browser_collection_run or browser_collection_run.status != "NEEDS_VERIFICATION" %} hidden{% endif %}>验证完成，继续任务</button>
+    </div>
+  </div>
+</section>
+
+<section id="collection-progress" class="data-section collection-progress-band" data-progress-endpoint="/api/collection/progress">
+  <div class="section-heading"><h2>本轮采集进度</h2><span id="collection-progress-date">{{ collection_progress.date }} · 手动采集同步</span></div>
+  <div class="status-grid progress-grid">
+    <span><small>已采集</small><b data-progress-value="completed">{{ collection_progress.completed }}</b></span>
+    <span><small>待采集</small><b data-progress-value="pending">{{ collection_progress.pending }}</b></span>
+    <span><small>采集失败</small><b data-progress-value="failed">{{ collection_progress.failed }}</b></span>
+    <span><small>总商品</small><b data-progress-value="total">{{ collection_progress.total }}</b></span>
+    <a id="next-product-link"{% if collection_progress.next_product %} href="{{ collection_progress.next_product.product_url }}#monitor_product_id={{ collection_progress.next_product.platform_product_id }}" target="_blank" rel="noreferrer"{% endif %}{% if not collection_progress.next_product %} class="disabled-link"{% endif %}><small>下一条待采集</small><b id="next-product-label">{% if collection_progress.next_product %}打开下一条商品{% else %}本轮已完成{% endif %}</b></a>
+  </div>
+</section>
+
 <section id="active-stores" class="data-section anchor-section">
   <div class="section-heading"><h2>活跃店铺</h2><span>展开店铺查看商品日销</span></div>
   <div class="store-accordion">
@@ -44,13 +84,13 @@
           <thead><tr><th>商品链接</th><th>最近估算日销</th><th>近 7 天合计</th><th>历史 7 天日销</th><th>采集状态</th><th></th></tr></thead>
           <tbody>
           {% for row in panel.rows %}
-            <tr>
-              <td class="product-cell"><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a><a class="external-link" href="{{ row.product.url }}" target="_blank" rel="noreferrer">打开商品页</a></td>
+            <tr data-product-id="{{ row.product.id }}">
+              <td class="product-cell"><a href="/dashboard/products/{{ row.product.id }}">{{ row.product.title or row.product.aliexpress_product_id }}</a></td>
               <td>{% if row.latest_metric and row.latest_metric.is_estimable %}<strong class="number">{{ row.latest_metric.estimated_sales }}</strong><small>{{ row.latest_metric.metric_date }}</small>{% else %}<span class="muted-value">待形成基线</span>{% endif %}</td>
               <td>{% if row.seven_day_total is not none %}<strong class="number">{{ row.seven_day_total }}</strong><small>{{ row.coverage }} / 7 天可估算</small>{% else %}<span class="muted-value">—</span>{% endif %}</td>
               <td><div class="sales-strip" aria-label="最近 7 天估算销量">{% for item in row.history %}<span title="{{ item.date }}"><small>{{ item.date.strftime("%m-%d") }}</small><b>{{ item.value if item.value is not none else "—" }}</b></span>{% endfor %}</div></td>
-              <td><span class="status {{ row.status_class }}">{{ row.status_label }}</span>{% if row.latest_snapshot %}<small>{{ row.latest_snapshot.collected_at.strftime("%m-%d %H:%M") }}</small>{% endif %}</td>
-              <td><button class="link-button collect-one" data-product-id="{{ row.product.id }}" {% if row.product.status != "active" %}disabled{% endif %}>采集</button></td>
+              <td><span class="status {{ row.collection_status_class }}" data-collection-status>{{ row.collection_status_label }}</span>{% if row.collection_captured_at %}<small data-collection-time>{{ row.collection_captured_at.strftime("%m-%d %H:%M") }}</small>{% endif %}</td>
+              <td class="row-actions"><a class="link-button" href="{{ row.product.url }}#monitor_product_id={{ row.product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品页</a><button class="link-button danger deactivate-product" type="button" data-product-id="{{ row.product.id }}" aria-label="删除 {{ row.product.title or row.product.aliexpress_product_id }} 的监控">删除监控</button></td>
             </tr>
           {% else %}<tr><td colspan="6" class="empty">该店铺还没有监控商品。</td></tr>{% endfor %}
           </tbody>
@@ -82,8 +122,8 @@
     <h2>添加监控商品</h2>
     <form id="product-form">
       <label>所属店铺
-        <select name="store_id" required>
-          <option value="">选择店铺</option>
+        <select name="store_id">
+          <option value="">不指定店铺，归入“自定义监控”</option>
           {% for store in stores if store.status == "active" %}<option value="{{ store.id }}">{{ store.name }}</option>{% endfor %}
         </select>
       </label>

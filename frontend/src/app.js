@@ -16,28 +16,29 @@ function api(path, options = {}) {
 function currentRoute() { return location.hash.replace(/^#/, "") || "/dashboard"; }
 
 async function render() {
-  app.innerHTML = `<div class="loading">正在连接本机 Backend…</div>`;
+  app.innerHTML = `<div class="loading">正在连接 Backend…</div>`;
   try {
     const route = currentRoute();
     if (!config.apiBaseUrl) return renderError("BACKEND_NOT_CONFIGURED", "当前 Pages 构建没有配置 Backend 地址。");
     if (route === "/dashboard") return dashboard();
     if (route === "/stores") return storesPage();
     if (route === "/products") return productsPage();
-    if (route === "/pending") return pendingPage();
+    if (route === "/manual" || route === "/pending") return pendingPage();
     const [, type, id] = route.split("/");
     if (type === "stores" && id) return storePage(Number(id));
     if (type === "products" && id) return productPage(Number(id));
     location.hash = "#/dashboard";
   } catch (error) {
-    renderError("Backend 连接失败", `${error.message}。请确认本机 Docker/Backend 正在运行，并允许 GitHub Pages 访问 8000 端口。`);
+    renderError("Backend 连接失败", `${error.message}。请确认云端 Backend 健康检查正常，并已允许当前前端域名跨域访问。`);
   }
 }
 
 async function dashboard() {
-  const [status, stores, products] = await Promise.all([
+  const [status, stores, products, browserRun] = await Promise.all([
     api("/api/collection/status/today"), api("/api/stores?status=active"), api("/api/products?status=active"),
+    api("/api/browser-collection/runs/today").catch(() => null),
   ]);
-  app.innerHTML = shell("监控台", `<section class="hero"><div><p class="eyebrow">LIVE LOCAL BACKEND</p><h1>AliExpress 竞品监控</h1><p class="lead">GitHub Pages 前端已连接本机 FastAPI Backend。</p></div><span class="status-badge ok">BACKEND_CONNECTED</span></section>${metrics(status)}<section class="section"><div class="section-heading"><h2>活跃店铺</h2><a class="button" href="#/stores">查看全部</a></div><div class="list">${stores.map(storeRow).join("") || empty("暂无活跃店铺")}</div></section><section class="section"><div class="section-heading"><h2>快捷操作</h2></div><div class="action-row"><button class="button primary" data-action="collect-all">立即采集全部活跃商品</button><a class="button" href="#/pending">查看待人工补采</a></div></section>`);
+  app.innerHTML = shell("监控台", `<section class="hero"><div><p class="eyebrow">HOSTED BACKEND</p><h1>AliExpress 竞品监控</h1><p class="lead">前端已连接托管 Backend，监控数据不依赖当前电脑上的本地服务。</p></div><span class="status-badge ok">BACKEND_CONNECTED</span></section>${metrics(status)}${browserCollectionPanel(browserRun)}<section class="section"><div class="section-heading"><h2>活跃店铺</h2><a class="button" href="#/stores">查看全部</a></div><div class="list">${stores.map(storeRow).join("") || empty("暂无活跃店铺")}</div></section><section class="section"><div class="section-heading"><h2>快捷操作</h2></div><div class="action-row"><button class="button primary" data-action="collect-all">立即采集全部活跃商品</button><a class="button" href="#/manual">进入人工处理</a></div></section>`);
   bindActions();
   void products;
 }
@@ -56,7 +57,7 @@ async function productsPage() {
 
 async function pendingPage() {
   const [pending, status] = await Promise.all([api("/api/collection/pending"), api("/api/collection/status/today")]);
-  app.innerHTML = shell("待人工补采", `<section class="page-heading"><div><p class="eyebrow">MANUAL FALLBACK</p><h1>待人工补采</h1><p>自动采集失败的商品需要在 Chrome 商品页主动补采。</p></div></section>${metrics(status)}<div class="list">${pending.map((row) => `<article class="row"><div><a href="#/products/${row.product_id}"><strong>${row.title || row.platform_product_id}</strong></a><span>${row.store_name} · ${row.failure_reason || "自动采集失败"}</span></div><a class="button" href="${row.product_url}" target="_blank" rel="noreferrer">打开商品</a></article>`).join("") || empty("当前没有待人工补采商品")}</div>`);
+  app.innerHTML = shell("待人工补采", `<section class="page-heading"><div><p class="eyebrow">MANUAL FALLBACK</p><h1>待人工补采</h1><p>自动采集失败的商品需要在 Chrome 商品页主动补采。</p></div></section>${metrics(status)}<div class="list">${pending.map((row) => `<article class="row"><div><a href="#/products/${row.product_id}"><strong>${row.title || row.platform_product_id}</strong></a><span>${row.store_name} · ${row.failure_reason || "自动采集失败"}</span></div><a class="button" href="${trackedPendingUrl(row)}" target="_blank" rel="noreferrer">打开商品</a></article>`).join("") || empty("当前没有待人工补采商品")}</div>`);
 }
 
 async function storePage(id) {
@@ -67,15 +68,18 @@ async function storePage(id) {
 
 async function productPage(id) {
   const [product, snapshots, metrics] = await Promise.all([api(`/api/products/${id}`), api(`/api/products/${id}/snapshots`), api(`/api/products/${id}/daily-metrics`)]);
-  app.innerHTML = shell(product.title || product.aliexpress_product_id, `<section class="page-heading"><div><p class="eyebrow">PRODUCT ${product.aliexpress_product_id}</p><h1>${product.title || "未命名商品"}</h1><p>公开数据快照与估算销量趋势。</p></div><div class="action-row"><a class="button" href="${product.url}" target="_blank" rel="noreferrer">在 Chrome 打开</a><button class="button primary" data-action="collect" data-id="${id}">立即采集</button></div></section><section class="section"><div class="section-heading"><h2>日销量估算</h2><span>非真实后台订单量</span></div>${metricTable(metrics)}</section><section class="section"><div class="section-heading"><h2>原始快照历史</h2><span>只追加，不覆盖</span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>来源</th><th>状态</th><th>累计 sold</th><th>价格</th><th>评价数</th></tr></thead><tbody>${snapshots.map((snapshot) => `<tr><td>${formatDate(snapshot.captured_at || snapshot.collected_at)}</td><td>${snapshot.source || "AUTO"}</td><td>${snapshot.status || snapshot.parse_status}</td><td>${snapshot.sold_count ?? snapshot.cumulative_sold ?? "—"}</td><td>${snapshot.price ?? snapshot.price_amount ?? "—"}</td><td>${snapshot.review_count ?? "—"}</td></tr>`).join("") || `<tr><td colspan="6">暂无快照</td></tr>`}</tbody></table></div></section>`);
+  app.innerHTML = shell(product.title || product.aliexpress_product_id, `<section class="page-heading"><div><p class="eyebrow">PRODUCT ${product.aliexpress_product_id}</p><h1>${product.title || "未命名商品"}</h1><p>公开数据快照与估算销量趋势。</p></div><div class="action-row"><a class="button primary" href="${trackedProductUrl(product)}" target="_blank" rel="noreferrer">打开商品链接</a>${product.status === "active" ? `<button class="button danger" data-action="deactivate" data-id="${product.id}">删除监控</button>` : ""}</div></section><section class="section"><div class="section-heading"><h2>日销量估算</h2><span>非真实后台订单量</span></div>${metricTable(metrics)}</section><section class="section"><div class="section-heading"><h2>原始快照历史</h2><span>只追加，不覆盖</span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>来源</th><th>状态</th><th>累计 sold</th><th>价格</th><th>评价数</th></tr></thead><tbody>${snapshots.map((snapshot) => `<tr><td>${formatDate(snapshot.captured_at || snapshot.collected_at)}</td><td>${snapshot.source || "AUTO"}</td><td>${snapshot.status || snapshot.parse_status}</td><td>${snapshot.sold_count ?? snapshot.cumulative_sold ?? "—"}</td><td>${snapshot.price ?? snapshot.price_amount ?? "—"}</td><td>${snapshot.review_count ?? "—"}</td></tr>`).join("") || `<tr><td colspan="6">暂无快照</td></tr>`}</tbody></table></div></section>`);
   bindActions();
 }
 
-function shell(title, content) { return `<header class="topbar"><a class="brand" href="#/dashboard">AliExpress 竞品监控</a><nav><a href="#/dashboard">监控台</a><a href="#/stores">店铺</a><a href="#/products">商品</a><a href="#/pending">待补采</a></nav></header><main><div class="page-title">${title}</div>${content}</main>`; }
+function shell(title, content) { return `<header class="topbar"><a class="brand" href="#/dashboard">AliExpress 竞品监控</a><nav><a href="#/dashboard">监控台</a><a href="#/stores">店铺</a><a href="#/products">商品</a><a href="#/manual">人工处理</a></nav></header><main><div class="page-title">${title}</div>${content}</main>`; }
 function metrics(s) { return `<section class="metric-grid">${metric("活跃商品", s.total_products, "今日")}${metric("自动成功", s.auto_success, "今日")}${metric("自动失败", s.auto_failed, "今日")}${metric("手动完成", s.manual_completed, "今日")}${metric("待人工补采", s.pending_manual, "当前")}${metric("成功率", `${s.success_rate}%`, "公开数据采集")}</section>`; }
+function browserCollectionPanel(run) { if (!run) return `<section class="section browser-collection"><div class="section-heading"><h2>每日浏览器采集</h2><span>今日任务尚未创建</span></div><div class="action-row"><button class="button primary" data-action="ensure-browser">立即运行今日任务</button></div></section>`; const phase = { STORE_DISCOVERY: "刷新店铺前 20", PRODUCT_COLLECTION: "采集商品数据", COMPLETED: "今日任务完成" }[run.phase] || run.phase; const challenge = run.status === "NEEDS_VERIFICATION" ? `<p class="warning-text">AliExpress 要求人工完成验证。完成验证后点击继续任务。</p>` : ""; const resume = run.status === "NEEDS_VERIFICATION" ? `<button class="button primary" data-action="resume-browser" data-id="${run.id}">验证完成，继续任务</button>` : ""; return `<section class="section browser-collection"><div class="section-heading"><h2>每日浏览器采集</h2><span>${run.target_date} · ${phase}</span></div><div class="browser-summary"><span>Chrome：${run.chrome_online ? "在线" : "离线"}</span><span>总任务：${run.total_count}</span><span>成功：${run.succeeded_count}</span><span>部分：${run.partial_count}</span><span>失败：${run.failed_count}</span><span>待处理：${run.pending_count}</span></div>${challenge}<div class="action-row"><button class="button" data-action="ensure-browser">立即运行今日任务</button>${resume}</div></section>`; }
 function metric(label, value, note) { return `<article class="metric"><span>${label}</span><strong>${value ?? "—"}</strong><small>${note}</small></article>`; }
 function storeRow(store) { return `<article class="row"><div><a href="#/stores/${store.id}"><strong>${store.name}</strong></a><span>${store.aliexpress_store_id || "未识别店铺 ID"} · ${store.status}</span></div><a class="button" href="#/stores/${store.id}">展开</a></article>`; }
-function productRow(product, stores) { const store = stores.find((item) => item.id === product.store_id); return `<article class="row"><div><a href="#/products/${product.id}"><strong>${product.title || product.aliexpress_product_id}</strong></a><span>${store?.name || "店铺"} · ${product.aliexpress_product_id}</span></div><button class="button" data-action="collect" data-id="${product.id}">采集</button></article>`; }
+function trackedProductUrl(product) { return `${product.url}#monitor_product_id=${encodeURIComponent(product.aliexpress_product_id)}`; }
+function trackedPendingUrl(row) { return `${row.product_url}#monitor_product_id=${encodeURIComponent(row.platform_product_id)}`; }
+function productRow(product, stores) { const store = stores.find((item) => item.id === product.store_id); return `<article class="row"><div><a href="#/products/${product.id}"><strong>${product.title || product.aliexpress_product_id}</strong></a><span>${store?.name || "店铺"} · ${product.aliexpress_product_id}</span></div><div class="row-actions"><a class="button" href="${trackedProductUrl(product)}" target="_blank" rel="noreferrer">打开商品页</a><button class="button danger" data-action="deactivate" data-id="${product.id}">删除监控</button></div></article>`; }
 function metricTable(rows) { return `<div class="table-wrap"><table><thead><tr><th>日期</th><th>估算销量</th><th>状态</th><th>依据</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${row.metric_date}</td><td>${row.is_estimable ? row.estimated_sales : "不可估算"}</td><td>${row.is_estimable ? "可估算" : "待基线"}</td><td>${row.reason || row.estimate_type || "public_observable_data"}</td></tr>`).join("") || `<tr><td colspan="4">暂无数据</td></tr>`}</tbody></table></div>`; }
 function empty(text) { return `<div class="empty-state"><strong>${text}</strong></div>`; }
 function formatDate(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—"; }
@@ -84,13 +88,19 @@ function renderError(title, detail) { app.innerHTML = `<main class="error-page">
 function bindActions() {
   document.querySelectorAll("[data-action='collect']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/products/${button.dataset.id}/collect`, "采集任务已完成"); }));
   document.querySelectorAll("[data-action='collect-all']").forEach((button) => button.addEventListener("click", async () => { await action(button, "/api/jobs/collect-now", "全量采集任务已完成"); }));
-  document.querySelectorAll("[data-action='discover']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/stores/${button.dataset.id}/discover`, "商品发现任务已完成"); }));
+  document.querySelectorAll("[data-action='discover']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/stores/${button.dataset.id}/discover?limit=20`, "已自动加入销量排序前 20 个商品"); }));
   document.querySelectorAll("[data-action='add-store']").forEach((button) => button.addEventListener("click", addStore));
   document.querySelectorAll("[data-action='add-product']").forEach((button) => button.addEventListener("click", addProduct));
+  document.querySelectorAll("[data-action='deactivate']").forEach((button) => button.addEventListener("click", async () => {
+    if (!window.confirm("确定删除这个商品的监控吗？历史快照会保留，但它将不再参与自动采集和店铺汇总。")) return;
+    await action(button, `/api/products/${button.dataset.id}/deactivate`, "商品已移出监控，历史数据已保留");
+  }));
+  document.querySelectorAll("[data-action='ensure-browser']").forEach((button) => button.addEventListener("click", async () => { await action(button, "/api/browser-collection/runs/ensure", "今日浏览器采集任务已创建", { trigger: "MANUAL" }); }));
+  document.querySelectorAll("[data-action='resume-browser']").forEach((button) => button.addEventListener("click", async () => { await action(button, `/api/browser-collection/runs/${button.dataset.id}/resume`, "浏览器采集任务已恢复"); }));
 }
-async function action(button, path, message) { button.disabled = true; button.textContent = "处理中…"; try { await api(path, { method: "POST" }); alert(message); await render(); } catch (error) { alert(error.message); button.disabled = false; button.textContent = "重试"; } }
-async function addStore() { const name = prompt("监控店铺名称（可选）", ""); const url = prompt("AliExpress 店铺链接"); if (!url) return; try { await api("/api/stores", { method: "POST", body: JSON.stringify({ name, url }) }); await render(); } catch (error) { alert(error.message); } }
-async function addProduct() { const storeId = prompt("所属店铺 ID"); const url = prompt("AliExpress 商品链接"); if (!storeId || !url) return; try { await api("/api/products", { method: "POST", body: JSON.stringify({ store_id: Number(storeId), url }) }); await render(); } catch (error) { alert(error.message); } }
+async function action(button, path, message, payload = null) { button.disabled = true; button.textContent = "处理中…"; try { await api(path, { method: "POST", ...(payload ? { body: JSON.stringify(payload) } : {}) }); alert(message); await render(); } catch (error) { alert(error.message); button.disabled = false; button.textContent = "重试"; } }
+async function addStore() { const name = prompt("监控店铺名称（可选）", ""); const url = prompt("AliExpress 店铺链接"); if (!url) return; try { const store = await api("/api/stores", { method: "POST", body: JSON.stringify({ name, url }) }); const discovery = await api(`/api/stores/${store.id}/discover?limit=20`, { method: "POST" }); if (discovery.parse_status === "failed") alert(`店铺已添加，但前 20 个商品发现失败：${discovery.error_message || discovery.error_type}`); else alert(`店铺已添加，已加入销量排序前 ${discovery.added_count} 个商品`); await render(); } catch (error) { alert(error.message); } }
+async function addProduct() { const storeId = prompt("所属店铺 ID（留空则归入“自定义监控”）"); const url = prompt("AliExpress 商品链接"); if (!url) return; try { await api("/api/products", { method: "POST", body: JSON.stringify({ store_id: storeId ? Number(storeId) : null, url }) }); await render(); } catch (error) { alert(error.message); } }
 
 window.addEventListener("hashchange", render);
 render();

@@ -31,7 +31,7 @@ class StoreRead(BaseModel):
 
 
 class ProductCreate(BaseModel):
-    store_id: int
+    store_id: int | None = None
     url: str | None = Field(default=None, max_length=2048)
     aliexpress_product_id: str | None = Field(default=None, max_length=128)
     title: str | None = Field(default=None, max_length=1024)
@@ -167,6 +167,90 @@ class CollectionStatusRead(BaseModel):
     manual_completed: int
     pending_manual: int
     success_rate: float
+
+
+class CollectionProgressItemRead(BaseModel):
+    product_id: int
+    store_id: int
+    store_name: str
+    platform_product_id: str
+    title: str | None
+    product_url: str
+    status: str
+    status_label: str
+    status_class: str
+    captured_at: datetime | None
+
+
+class CollectionProgressRead(BaseModel):
+    date: date
+    total: int
+    completed: int
+    pending: int
+    failed: int
+    items: list[CollectionProgressItemRead]
+    next_product: CollectionProgressItemRead | None
+
+
+class BrowserCollectionRunEnsureRequest(BaseModel):
+    target_date: date | None = None
+    trigger: str = Field(default="MANUAL", pattern="^(SCHEDULED|MANUAL|CATCH_UP)$")
+
+
+class BrowserCollectionFailureRequest(BaseModel):
+    error_type: str = Field(min_length=1, max_length=128)
+    error_message: str = Field(min_length=1, max_length=2000)
+
+
+class BrowserCollectionChallengeRequest(BaseModel):
+    error_message: str | None = Field(default=None, max_length=2000)
+    page_url: str | None = Field(default=None, max_length=2048)
+
+
+class BrowserCollectionHeartbeatRequest(BaseModel):
+    extension_version: str | None = Field(default=None, max_length=64)
+
+
+class BrowserCollectionItemRead(BaseModel):
+    id: int
+    run_id: int
+    target_type: str
+    store_id: int | None
+    product_id: int | None
+    title: str | None
+    target_url: str
+    position: int
+    status: str
+    attempt_count: int
+    claimed_at: datetime | None
+    completed_at: datetime | None
+    error_type: str | None
+    error_message: str | None
+
+
+class BrowserCollectionRunRead(BaseModel):
+    id: int
+    target_date: date
+    trigger: str
+    status: str
+    phase: str
+    total_count: int
+    succeeded_count: int
+    partial_count: int
+    failed_count: int
+    pending_count: int
+    chrome_online: bool
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    last_heartbeat_at: datetime | None
+    paused_reason: str | None
+    current_item: BrowserCollectionItemRead | None
+
+
+class BrowserCollectionClaimRead(BaseModel):
+    run: BrowserCollectionRunRead
+    item: BrowserCollectionItemRead | None
 
 
 class ProductDailyMetricRead(BaseModel):

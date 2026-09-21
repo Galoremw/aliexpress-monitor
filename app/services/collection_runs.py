@@ -1,11 +1,13 @@
 from dataclasses import asdict, dataclass
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.collectors.base import Collector
 from app.core.config import get_settings
-from app.db.models import Product, Store
+from app.db.models import Product, ProductSnapshot, Store
 from app.services.metrics import calculate_product_daily_metrics, calculate_store_daily_metric
 from app.services.snapshots import collect_product_snapshot
 
@@ -21,7 +23,27 @@ class CollectionRunSummary:
         return asdict(self)
 
 
-def run_collection_cycle(db: Session, collector: Collector) -> CollectionRunSummary:
+def run_collection_cycle(
+    db: Session,
+    collector: Collector,
+    *,
+    skip_current_date_snapshots: bool = False,
+) -> CollectionRunSummary:
+    valid_product_ids: set[int] = set()
+    if skip_current_date_snapshots:
+        local_timezone = ZoneInfo(get_settings().timezone)
+        today = datetime.now(local_timezone).date()
+        start = datetime.combine(today, time.min, tzinfo=local_timezone).astimezone(timezone.utc)
+        end = start + timedelta(days=1)
+        valid_product_ids = set(
+            db.scalars(
+                select(ProductSnapshot.product_id).where(
+                    ProductSnapshot.captured_at >= start,
+                    ProductSnapshot.captured_at < end,
+                    ProductSnapshot.status == "VALID",
+                )
+            )
+        )
     products = list(
         db.scalars(
             select(Product)
@@ -30,6 +52,7 @@ def run_collection_cycle(db: Session, collector: Collector) -> CollectionRunSumm
             .order_by(Product.id)
         )
     )
+    products = [product for product in products if product.id not in valid_product_ids]
     snapshots = [collect_product_snapshot(db, product, collector) for product in products]
     metric_dates_by_store: dict[int, set] = {}
     for product, snapshot in zip(products, snapshots, strict=True):
@@ -48,4 +71,3 @@ def run_collection_cycle(db: Session, collector: Collector) -> CollectionRunSumm
         failed=len(snapshots) - succeeded,
         snapshot_ids=[snapshot.id for snapshot in snapshots],
     )
-

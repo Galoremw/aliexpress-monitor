@@ -228,6 +228,91 @@ class ManualCollectionTask(Base):
     last_attempt: Mapped[CollectionAttempt | None] = relationship(foreign_keys=[last_attempt_id])
 
 
+class BrowserCollectionRun(Base):
+    __tablename__ = "browser_collection_runs"
+    __table_args__ = (
+        UniqueConstraint("target_date", name="uq_browser_collection_run_target_date"),
+        CheckConstraint(
+            "trigger IN ('SCHEDULED', 'MANUAL', 'CATCH_UP')",
+            name="ck_browser_collection_runs_trigger",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'NEEDS_VERIFICATION', 'COMPLETED', 'PARTIAL', 'FAILED')",
+            name="ck_browser_collection_runs_status",
+        ),
+        CheckConstraint(
+            "phase IN ('STORE_DISCOVERY', 'PRODUCT_COLLECTION', 'COMPLETED')",
+            name="ck_browser_collection_runs_phase",
+        ),
+        Index("ix_browser_collection_runs_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    trigger: Mapped[str] = mapped_column(String(16), default="SCHEDULED")
+    status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    phase: Mapped[str] = mapped_column(String(32), default="STORE_DISCOVERY")
+    total_count: Mapped[int] = mapped_column(Integer, default=0)
+    succeeded_count: Mapped[int] = mapped_column(Integer, default=0)
+    partial_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paused_reason: Mapped[str | None] = mapped_column(String(128))
+
+    items: Mapped[list[BrowserCollectionItem]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
+
+
+class BrowserCollectionItem(Base):
+    __tablename__ = "browser_collection_items"
+    __table_args__ = (
+        UniqueConstraint("run_id", "target_key", name="uq_browser_collection_item_target"),
+        CheckConstraint(
+            "target_type IN ('STORE', 'PRODUCT')",
+            name="ck_browser_collection_items_target_type",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'PARTIAL', 'FAILED', 'NEEDS_VERIFICATION', 'SKIPPED')",
+            name="ck_browser_collection_items_status",
+        ),
+        Index("ix_browser_collection_items_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("browser_collection_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    target_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    store_id: Mapped[int | None] = mapped_column(
+        ForeignKey("stores.id", ondelete="CASCADE"), index=True
+    )
+    product_id: Mapped[int | None] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), index=True
+    )
+    target_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_type: Mapped[str | None] = mapped_column(String(128))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    snapshot_id: Mapped[int | None] = mapped_column(
+        ForeignKey("product_snapshots.id", ondelete="SET NULL")
+    )
+
+    run: Mapped[BrowserCollectionRun] = relationship(back_populates="items")
+    store: Mapped[Store | None] = relationship()
+    product: Mapped[Product | None] = relationship()
+    snapshot: Mapped[ProductSnapshot | None] = relationship()
+
+
 class ProductDailyMetric(Base):
     __tablename__ = "product_daily_metrics"
     __table_args__ = (
