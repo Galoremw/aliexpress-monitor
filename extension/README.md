@@ -47,4 +47,10 @@ Render 部署时，Frontend 的 `VITE_API_BASE_URL` 也必须填写同一个 Bac
 使用前请在 Chrome 中重新加载本目录扩展，并保持店小秘已登录。若页面要求确认采集协议或重新登录，
 任务会停在“待人工确认”；完成正常操作后，在监控台点击“人工确认后重新排队”。
 
+如果不希望任务使用日常 Chrome，可以双击项目根目录的
+`setup-dianxiaomi-worker.bat`。它会创建独立的
+`%LOCALAPPDATA%\AliExpressMonitor\DianxiaomiProfile` 配置并自动加载扩展。
+首次在该窗口登录监控台、店小秘并确认协议；之后使用
+`start-dianxiaomi-worker.bat`，任务会在该独立配置中最小化运行。
+
 扩展也监听本地或托管监控台中的“采集到店小秘”按钮。它会根据实际点击的监控台自动选择本地或云端 Backend，并立即唤醒同一地址的队列，通常无需等待下一次定时轮询。首次切换到另一个 Backend 时，在扩展弹窗登录一次对应的监控台账号。更新扩展后请在 `chrome://extensions` 点击“重新加载”。
