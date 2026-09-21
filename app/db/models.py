@@ -27,6 +27,41 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (Index("ix_users_username", "username", unique=True),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    sessions: Mapped[list[AuthSession]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+    __table_args__ = (
+        Index("ix_auth_sessions_token_hash", "token_hash", unique=True),
+        Index("ix_auth_sessions_expires_at", "expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    user: Mapped[User] = relationship(back_populates="sessions")
+
+
 class Store(Base):
     __tablename__ = "stores"
     __table_args__ = (
@@ -311,6 +346,43 @@ class BrowserCollectionItem(Base):
     store: Mapped[Store | None] = relationship()
     product: Mapped[Product | None] = relationship()
     snapshot: Mapped[ProductSnapshot | None] = relationship()
+
+
+class DianxiaomiHandoff(Base):
+    __tablename__ = "dianxiaomi_handoffs"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "product_id", name="uq_dianxiaomi_handoff_batch_product"),
+        CheckConstraint(
+            "status IN ('QUEUED', 'CLAIMED', 'OPENED', 'FILLED', 'COLLECTING', 'SUCCEEDED', 'FAILED', 'NEEDS_CONFIRMATION', 'CANCELED')",
+            name="ck_dianxiaomi_handoffs_status",
+        ),
+        Index("ix_dianxiaomi_handoffs_status_requested", "status", "requested_at"),
+        Index("ix_dianxiaomi_handoffs_batch", "batch_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False
+    )
+    store_id: Mapped[int] = mapped_column(
+        ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="QUEUED", index=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    error_type: Mapped[str | None] = mapped_column(String(128))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    product: Mapped[Product] = relationship()
+    store: Mapped[Store] = relationship()
 
 
 class ProductDailyMetric(Base):

@@ -181,3 +181,44 @@ API 使用 `estimated_sales`、`estimate_type=estimated`、`data_basis=public_ob
 业务层只依赖 `Collector` 协议。MVP 默认实现为 `HTTPCollector`，优先读取页面里的 JSON/JSON-LD。`PlaywrightCollector` 目前是明确禁用的扩展位；如后续启用，也应仅渲染无需登录的公开页面，并继续遵守平台规则。
 
 现有本机 `aliexpress-selection-workflow` skill 可在后续“关键词发现商品”阶段产生候选商品链接，但不参与本 MVP 的快照采集和销量计算核心链路。
+# 云端数据与登录
+
+监控台现在支持把本地 PostgreSQL 数据迁移到 Render、Supabase 或其他 PostgreSQL 云数据库，并通过账号登录保护 Dashboard、API 和 Chrome 扩展。
+
+## 首次配置
+
+复制 `.env.example` 为 `.env`，至少设置：
+
+```env
+AUTH_REQUIRED=true
+AUTH_SESSION_SECRET=一段足够长的随机字符串
+AUTH_ADMIN_USERNAME=你的管理员账号
+AUTH_ADMIN_PASSWORD=你的管理员密码
+AUTH_COOKIE_SECURE=false
+AUTH_COOKIE_SAMESITE=lax
+```
+
+首次启动时，如果数据库中还没有用户，Backend 会用这两个管理员环境变量创建第一个账号。密码只保存为 scrypt 哈希；启动完成后可以从 `.env` 删除 `AUTH_ADMIN_PASSWORD`，避免明文长期留在环境文件中。
+
+如果 Backend 已经启动但还没有管理员，也可以双击项目根目录的 `setup-auth.bat`。它会构建最新 Backend、应用迁移、隐藏输入密码、创建管理员并重启服务，不会把密码写进仓库。
+
+Render 生产环境应设置 `AUTH_COOKIE_SECURE=true`、`AUTH_COOKIE_SAMESITE=none`，并为 `AUTH_SESSION_SECRET` 设置新的随机值。`render.yaml` 已声明这些变量，部署时在 Render Environment 中填写 `sync: false` 的项目。
+
+## 本地数据迁移到云端
+
+从 Render PostgreSQL 的 External Database URL 或其他云数据库控制台复制完整 PostgreSQL 连接串，然后在 PowerShell 中执行：
+
+```powershell
+.\scripts\sync-local-to-cloud.ps1 -CloudDatabaseUrl "postgresql://用户名:密码@主机:5432/数据库名?sslmode=require" -ConfirmOverwrite
+```
+
+这是覆盖式迁移，会用本地监控数据替换云端同名表；执行前应确认云端没有需要保留的独立数据。脚本不会迁移旧登录会话，迁移完成后重新登录即可。执行前先启动本地数据库：`docker compose up -d postgres`。
+
+迁移后，把 Render Backend 的 `DATABASE_URL` 设置为同一个云端连接串，重新部署 Backend；所有电脑访问同一个 Hosted Frontend 和 Backend，就会看到同一套店铺、商品、快照与销量历史。
+
+## 多电脑使用
+
+1. 在云端 Backend 和 Frontend 使用同一个账号登录。
+2. 每台需要采集的电脑安装并重新加载 `extension/` 扩展。
+3. 扩展的 `extension/config.js` 指向云端 Backend URL，而不是 `127.0.0.1`。
+4. 在扩展弹窗登录同一个账号；AliExpress 和店小秘的登录状态仍属于各自电脑的 Chrome，不会上传到监控系统。

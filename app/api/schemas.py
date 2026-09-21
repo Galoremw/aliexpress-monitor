@@ -328,3 +328,46 @@ class StoreTopProductsRead(BaseModel):
     estimate_scope: str = "discovered_monitored_products"
     data_basis: str = "public_observable_data"
     products: list[TopProductRead]
+
+
+class DianxiaomiHandoffCreate(BaseModel):
+    product_ids: list[int] = Field(min_length=1, max_length=100)
+
+
+class DianxiaomiHandoffClaimRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+
+
+class DianxiaomiHandoffStatusRequest(BaseModel):
+    status: str = Field(
+        pattern="^(OPENED|FILLED|COLLECTING|SUCCEEDED|FAILED|NEEDS_CONFIRMATION|CANCELED)$"
+    )
+    worker_id: str | None = Field(default=None, max_length=128)
+    error_type: str | None = Field(default=None, max_length=128)
+    error_message: str | None = Field(default=None, max_length=2000)
+
+
+class DianxiaomiHandoffRead(BaseModel):
+    id: int
+    batch_id: str
+    product_id: int
+    store_id: int
+    product_title: str | None
+    platform_product_id: str | None
+    target_url: str
+    status: str
+    requested_at: datetime
+    claimed_at: datetime | None
+    opened_at: datetime | None
+    completed_at: datetime | None
+    worker_id: str | None
+    error_type: str | None
+    error_message: str | None
+
+
+class DianxiaomiHandoffBatchRead(BaseModel):
+    batch_id: str
+    total_count: int
+    queued_count: int
+    reused_count: int
+    items: list[DianxiaomiHandoffRead]

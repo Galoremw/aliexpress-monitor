@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -14,6 +14,11 @@ from app.api.schemas import (
     BrowserCollectionRunEnsureRequest,
     BrowserCollectionRunRead,
     BrowserExtensionCollectionRequest,
+    DianxiaomiHandoffBatchRead,
+    DianxiaomiHandoffClaimRequest,
+    DianxiaomiHandoffCreate,
+    DianxiaomiHandoffRead,
+    DianxiaomiHandoffStatusRequest,
     BrowserStoreDiscoveryRead,
     BrowserStoreDiscoveryRequest,
     CollectionAttemptRead,
@@ -39,6 +44,7 @@ from app.collectors.base import Collector, CollectorResult
 from app.collectors.dependencies import get_collector
 from app.collectors.store_dependencies import get_store_discovery_collector
 from app.collectors.store_discovery import StoreDiscoveryCollector
+from app.core.auth import require_authenticated
 from app.core.config import get_settings
 from app.api.utils import (
     canonical_product_url,
@@ -50,6 +56,7 @@ from app.db.models import (
     BrowserCollectionItem,
     BrowserCollectionRun,
     CollectionAttempt,
+    DianxiaomiHandoff,
     ManualCollectionTask,
     Product,
     ProductDailyMetric,
@@ -77,8 +84,22 @@ from app.services.browser_collection import (
     serialize_item,
     serialize_run,
 )
+from app.services.dianxiaomi import (
+    ACTIVE_HANDOFF_STATUSES,
+    claim_next_handoff,
+    create_handoff_batch,
+    serialize_handoff,
+    update_handoff,
+)
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", dependencies=[Depends(require_authenticated)])
+
+
+def _handoff_or_404(db: Session, handoff_id: int) -> DianxiaomiHandoff:
+    handoff = db.get(DianxiaomiHandoff, handoff_id)
+    if handoff is None:
+        raise HTTPException(status_code=404, detail="Dianxiaomi handoff not found")
+    return handoff
 
 
 def _find_extension_product(db: Session, payload: BrowserExtensionCollectionRequest) -> Product:
@@ -443,6 +464,177 @@ def list_collection_attempts(
     if product_id is not None:
         statement = statement.where(CollectionAttempt.product_id == product_id)
     return list(db.scalars(statement))
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs",
+    response_model=DianxiaomiHandoffBatchRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_dianxiaomi_handoffs(
+    payload: DianxiaomiHandoffCreate,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch_id, rows = create_handoff_batch(db, payload.product_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    requested_count = len(dict.fromkeys(payload.product_ids))
+    return {
+        "batch_id": batch_id,
+        "total_count": requested_count,
+        "queued_count": len(rows),
+        "reused_count": requested_count - len(rows),
+        "items": [serialize_handoff(row) for row in rows],
+    }
+
+
+@router.get(
+    "/integrations/dianxiaomi/handoffs",
+    response_model=list[DianxiaomiHandoffRead],
+)
+def list_dianxiaomi_handoffs(
+    batch_id: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    statement = select(DianxiaomiHandoff).order_by(
+        DianxiaomiHandoff.requested_at.desc(), DianxiaomiHandoff.id.desc()
+    ).limit(limit)
+    if batch_id:
+        statement = statement.where(DianxiaomiHandoff.batch_id == batch_id)
+    return [serialize_handoff(row) for row in db.scalars(statement)]
+
+
+@router.get("/integrations/dianxiaomi/status")
+def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
+    rows = list(
+        db.scalars(
+            select(DianxiaomiHandoff)
+            .order_by(DianxiaomiHandoff.requested_at.desc(), DianxiaomiHandoff.id.desc())
+            .limit(500)
+        )
+    )
+    counts = {
+        "queued": 0,
+        "processing": 0,
+        "submitted": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "needs_confirmation": 0,
+    }
+    for row in rows:
+        if row.status == "QUEUED":
+            counts["queued"] += 1
+        elif row.status == "COLLECTING":
+            counts["submitted"] += 1
+            counts["processing"] += 1
+        elif row.status in {"CLAIMED", "OPENED", "FILLED"}:
+            counts["processing"] += 1
+        elif row.status == "SUCCEEDED":
+            counts["succeeded"] += 1
+        elif row.status == "FAILED":
+            counts["failed"] += 1
+        elif row.status == "NEEDS_CONFIRMATION":
+            counts["needs_confirmation"] += 1
+    return {
+        **counts,
+        "latest_at": rows[0].requested_at if rows else None,
+        "latest": [serialize_handoff(row) for row in rows[:10]],
+    }
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/claim-next",
+    response_model=DianxiaomiHandoffRead | None,
+)
+def claim_next_dianxiaomi_handoff(
+    payload: DianxiaomiHandoffClaimRequest,
+    db: Session = Depends(get_db),
+) -> dict | None:
+    row = claim_next_handoff(db, payload.worker_id)
+    return serialize_handoff(row) if row else None
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/claim",
+    response_model=DianxiaomiHandoffRead,
+)
+def claim_dianxiaomi_handoff(
+    handoff_id: int,
+    payload: DianxiaomiHandoffClaimRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    if row.status != "QUEUED":
+        raise HTTPException(status_code=409, detail="该店小秘任务已被领取或已完成")
+    row.status = "CLAIMED"
+    row.claimed_at = datetime.now(timezone.utc)
+    row.worker_id = payload.worker_id
+    db.commit()
+    db.refresh(row)
+    return serialize_handoff(row)
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/status",
+    response_model=DianxiaomiHandoffRead,
+)
+def update_dianxiaomi_handoff_status(
+    handoff_id: int,
+    payload: DianxiaomiHandoffStatusRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    if row.status not in ACTIVE_HANDOFF_STATUSES and payload.status != "CANCELED":
+        raise HTTPException(status_code=409, detail="该店小秘任务已结束")
+    if row.worker_id and payload.worker_id and row.worker_id != payload.worker_id:
+        raise HTTPException(status_code=409, detail="店小秘任务不属于当前扩展实例")
+    return serialize_handoff(
+        update_handoff(
+            db,
+            row,
+            payload.status,
+            error_type=payload.error_type,
+            error_message=payload.error_message,
+            worker_id=payload.worker_id,
+        )
+    )
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/cancel",
+    response_model=DianxiaomiHandoffRead,
+)
+def cancel_dianxiaomi_handoff(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    if row.status in {"SUCCEEDED", "FAILED", "CANCELED"}:
+        raise HTTPException(status_code=409, detail="该店小秘任务已结束")
+    return serialize_handoff(update_handoff(db, row, "CANCELED"))
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/resume",
+    response_model=DianxiaomiHandoffRead,
+)
+def resume_dianxiaomi_handoff(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    if row.status not in {"NEEDS_CONFIRMATION", "FAILED"}:
+        raise HTTPException(status_code=409, detail="该店小秘任务当前不能重新排队")
+    row.status = "QUEUED"
+    row.worker_id = None
+    row.error_type = None
+    row.error_message = None
+    row.completed_at = None
+    db.commit()
+    db.refresh(row)
+    return serialize_handoff(row)
 
 
 @router.get("/collection/status/today", response_model=CollectionStatusRead)

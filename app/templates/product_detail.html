@@ -3,7 +3,7 @@
 {% block content %}
 <section class="page-heading compact">
   <div><p class="eyebrow">PRODUCT {{ product.aliexpress_product_id }}</p><h1>{{ product.title or "未采集商品标题" }}</h1><p><a href="/dashboard/stores/{{ store.id }}">{{ store.name }}</a> · 公开数据快照与估算趋势</p></div>
-  <div class="action-group"><a class="button primary" href="{{ product.url }}#monitor_product_id={{ product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品链接</a>{% if product.status == "active" %}<button class="button danger deactivate-product" type="button" data-product-id="{{ product.id }}">删除监控</button>{% endif %}</div>
+  <div class="action-group"><a class="button primary" href="{{ product.url }}#monitor_product_id={{ product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品链接</a>{% if product.status == "active" %}<button class="button dianxiaomi-product" type="button" data-product-id="{{ product.id }}">采集到店小秘</button><button class="button danger deactivate-product" type="button" data-product-id="{{ product.id }}">删除监控</button>{% endif %}</div>
 </section>
 <section class="trend-band">
   <div class="section-heading"><h2>日销量估算趋势</h2><span>非真实后台订单量</span></div>

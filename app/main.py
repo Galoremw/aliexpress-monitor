@@ -1,11 +1,16 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 
 from app.api.router import router
+from app.api.auth import router as auth_router
 from app.core.config import get_settings
+from app.db.session import get_session_factory
+from app.core.auth import ensure_bootstrap_admin
 from app.scheduler import create_scheduler
 from app.dashboard.router import router as dashboard_router
 
@@ -17,6 +22,8 @@ allowed_frontend_origins = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    with get_session_factory()() as db:
+        ensure_bootstrap_admin(db)
     scheduler = create_scheduler(settings)
     app.state.scheduler = scheduler
     if settings.scheduler_enabled:
@@ -29,16 +36,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+templates = Jinja2Templates(directory="app/templates")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_frontend_origins + ["http://127.0.0.1:8000", "http://localhost:8000"],
     allow_origin_regex=settings.extension_allowed_origin_regex,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=True,
 )
 app.include_router(router)
+app.include_router(auth_router)
 app.include_router(dashboard_router)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+
+@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+def login_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(request, "login.html")
 
 
 @app.get("/health", tags=["system"])

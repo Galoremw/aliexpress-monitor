@@ -4,8 +4,10 @@ const API_BASE = globalThis.ALIEXPRESS_MONITOR_API_BASE || "http://127.0.0.1:800
 const POLL_ALARM = "aliexpress-monitor-browser-collection";
 const NOTIFICATION_ID = "aliexpress-monitor-verification";
 const FIRST_PRODUCT_NOTIFICATION_ID = "aliexpress-monitor-first-product";
+const DIANXIAOMI_URL = "https://www.dianxiaomi.com/web/productCrawl/dataAcquisition";
 const tabProductIds = new Map();
 let automationBusy = false;
+let dianxiaomiBusy = false;
 
 function productIdFromUrl(url) {
   try {
@@ -53,10 +55,24 @@ function isAutomationBootstrap(url) {
   }
 }
 
+function isDianxiaomiPage(url) {
+  try {
+    const parsed = new URL(url);
+    return /(?:^|\.)dianxiaomi\.com$/i.test(parsed.hostname)
+      && /\/web\/productCrawl\/dataAcquisition/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
 async function api(path, options = {}) {
+  const { apiAccessToken } = await chrome.storage.local.get("apiAccessToken");
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (apiAccessToken) headers.Authorization = `Bearer ${apiAccessToken}`;
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    credentials: "include",
+    headers,
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.detail || `本地监控台请求失败 (${response.status})`);
@@ -74,6 +90,16 @@ async function injectCollector(tabId) {
     });
   } catch {
     // Navigation may still be replacing the document; the completion event retries it.
+  }
+}
+
+async function injectDianxiaomiBridge(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!isDianxiaomiPage(tab.url)) return;
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["dianxiaomi_bridge.js"] });
+  } catch {
+    // The tab may still be loading; the next alarm retries without touching credentials.
   }
 }
 
@@ -314,20 +340,79 @@ async function pollAutomation() {
   }
 }
 
+async function sendDianxiaomiMessage(tabId, urls) {
+  let lastError;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      return await chrome.tabs.sendMessage(tabId, { type: "dianxiaomi-submit-links", urls });
+    } catch (error) {
+      lastError = error;
+      await injectDianxiaomiBridge(tabId);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+    }
+  }
+  throw lastError || new Error("店小秘页面尚未准备好");
+}
+
+async function pollDianxiaomiHandoffs() {
+  if (dianxiaomiBusy) return;
+  dianxiaomiBusy = true;
+  const workerId = `chrome-${chrome.runtime.id}`;
+  try {
+    const handoff = await api("/api/integrations/dianxiaomi/handoffs/claim-next", {
+      method: "POST",
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    if (!handoff) return;
+    let tabs = await chrome.tabs.query({ url: ["https://www.dianxiaomi.com/*", "https://dianxiaomi.com/*"] });
+    let tab = tabs.find((candidate) => isDianxiaomiPage(candidate.url));
+    if (!tab) tab = await chrome.tabs.create({ url: DIANXIAOMI_URL, active: true });
+    await api(`/api/integrations/dianxiaomi/handoffs/${handoff.id}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status: "OPENED", worker_id: workerId }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const result = await sendDianxiaomiMessage(tab.id, [handoff.target_url]);
+    const status = result?.state === "submitted"
+      ? "COLLECTING"
+      : result?.state === "needs_confirmation" ? "NEEDS_CONFIRMATION" : "FAILED";
+    await api(`/api/integrations/dianxiaomi/handoffs/${handoff.id}/status`, {
+      method: "POST",
+      body: JSON.stringify({
+        status,
+        worker_id: workerId,
+        error_type: status === "FAILED" ? "page_operation_failed" : status === "NEEDS_CONFIRMATION" ? "manual_confirmation_required" : null,
+        error_message: status === "COLLECTING" ? null : result?.message || null,
+      }),
+    });
+    if (result?.state === "needs_confirmation") {
+      await chrome.windows.update(tab.windowId, { focused: true, state: "normal" }).catch(() => undefined);
+      await chrome.tabs.update(tab.id, { active: true }).catch(() => undefined);
+    }
+  } catch {
+    // The dashboard may be offline. The claimed item can be reclaimed after its lease expires.
+  } finally {
+    dianxiaomiBusy = false;
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   void ensureAlarm();
   void injectOpenAliExpressTabs();
   void pollAutomation();
+  void pollDianxiaomiHandoffs();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void ensureAlarm();
   void injectOpenAliExpressTabs();
   setTimeout(() => void pollAutomation(), 1500);
+  setTimeout(() => void pollDianxiaomiHandoffs(), 2000);
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === POLL_ALARM) void pollAutomation();
+  if (alarm.name === POLL_ALARM) void pollDianxiaomiHandoffs();
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -342,11 +427,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       }
     });
   }
+  if (changeInfo.status === "complete" && isDianxiaomiPage(tab.url)) void injectDianxiaomiBridge(tabId);
 });
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (tab && isAliExpressPage(tab.url)) void injectCollector(tabId);
+  if (tab && isDianxiaomiPage(tab.url)) void injectDianxiaomiBridge(tabId);
 });
 
 chrome.webNavigation.onCommitted.addListener(({ tabId, url }) => {
@@ -377,6 +464,11 @@ chrome.notifications.onClicked.addListener(async (notificationId) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "dianxiaomi-handoff-created") {
+    void pollDianxiaomiHandoffs();
+    sendResponse({ ok: true });
+    return false;
+  }
   if (message?.type !== "sync-product-snapshot") return false;
   const monitoredProductId = sender?.tab?.id ? tabProductIds.get(sender.tab.id) : null;
   const payload = {
@@ -397,3 +489,4 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 void ensureAlarm();
 setTimeout(() => void pollAutomation(), 1500);
+setTimeout(() => void pollDianxiaomiHandoffs(), 2000);

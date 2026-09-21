@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>登录 · AliExpress 竞品监控</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+  </head>
+  <body>
+    <main class="auth-page">
+      <section class="auth-panel">
+        <p class="eyebrow">PRIVATE MONITOR</p>
+        <h1>登录监控台</h1>
+        <p class="auth-hint">登录后访问你的店铺、商品和历史快照数据。</p>
+        <form id="login-form">
+          <label>账号<input name="username" autocomplete="username" required></label>
+          <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+          <button class="button primary" type="submit">登录</button>
+        </form>
+        <p id="login-error" class="warning-text" hidden></p>
+      </section>
+    </main>
+    <script>
+      const form = document.querySelector("#login-form");
+      const error = document.querySelector("#login-error");
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        error.hidden = true;
+        const payload = Object.fromEntries(new FormData(form));
+        const response = await fetch("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify(payload),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          error.textContent = body.detail || "登录失败";
+          error.hidden = false;
+          return;
+        }
+        location.href = "/";
+      });
+    </script>
+  </body>
+</html>

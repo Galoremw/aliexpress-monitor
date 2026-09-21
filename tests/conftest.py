@@ -1,7 +1,10 @@
 from collections.abc import Generator
+import os
 from pathlib import Path
 
 import pytest
+
+os.environ.setdefault("AUTH_REQUIRED", "false")
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -33,4 +36,3 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
-

@@ -22,6 +22,20 @@ services:
         sync: false
       - key: FRONTEND_ALLOWED_ORIGINS
         sync: false
+      - key: AUTH_REQUIRED
+        value: "true"
+      - key: AUTH_SESSION_SECRET
+        sync: false
+      - key: AUTH_SESSION_TTL_HOURS
+        value: "168"
+      - key: AUTH_COOKIE_SECURE
+        value: "true"
+      - key: AUTH_COOKIE_SAMESITE
+        value: "none"
+      - key: AUTH_ADMIN_USERNAME
+        sync: false
+      - key: AUTH_ADMIN_PASSWORD
+        sync: false
 
   - type: web
     name: aliexpress-monitor-frontend

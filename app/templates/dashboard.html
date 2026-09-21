@@ -69,15 +69,29 @@
   </div>
 </section>
 
+<section id="dianxiaomi-status" class="data-section dianxiaomi-band" data-status-endpoint="/api/integrations/dianxiaomi/status">
+  <div class="section-heading"><h2>店小秘采集队列</h2><span>通过已登录 Chrome 的正常页面提交</span></div>
+  <div class="status-grid dianxiaomi-progress-grid">
+    <span><small>待发送</small><b data-dianxiaomi-value="queued">0</b></span>
+    <span><small>处理中</small><b data-dianxiaomi-value="processing">0</b></span>
+    <span><small>已提交</small><b data-dianxiaomi-value="submitted">0</b></span>
+    <span><small>失败</small><b data-dianxiaomi-value="failed">0</b></span>
+    <span><small>待人工确认</small><b data-dianxiaomi-value="needs_confirmation">0</b></span>
+  </div>
+  <p id="dianxiaomi-latest" class="muted-value">尚未提交店小秘采集任务。</p>
+  <button id="dianxiaomi-retry" class="button" type="button" hidden>人工确认后重新排队</button>
+</section>
+
 <section id="active-stores" class="data-section anchor-section">
   <div class="section-heading"><h2>活跃店铺</h2><span>展开店铺查看商品日销</span></div>
   <div class="store-accordion">
     {% for panel in store_panels %}
     <details class="store-monitor" {% if loop.first %}open{% endif %}>
       <summary>
-        <span><strong>{{ panel.store.name }}</strong><small>店铺 {{ panel.store.aliexpress_store_id or panel.store.id }}</small></span>
+        <span class="store-summary-title"><strong>{{ panel.store.name }}</strong><button class="icon-button edit-store-name" type="button" data-store-id="{{ panel.store.id }}" title="编辑店铺名称" aria-label="编辑 {{ panel.store.name }} 的名称">✎</button><form class="store-rename-form inline-rename" data-store-id="{{ panel.store.id }}" hidden><input name="name" value="{{ panel.store.name }}" maxlength="255" aria-label="店铺名称" required><button class="link-button" type="submit">保存</button><button class="link-button cancel-store-name" type="button">取消</button></form><small>店铺 {{ panel.store.aliexpress_store_id or panel.store.id }}</small></span>
         <span class="store-summary-metric"><b>{{ panel.rows|length }}</b><small>监控商品</small></span>
         <span class="store-summary-metric"><b>{% if panel.latest_metric and panel.latest_metric.estimable_products %}{{ panel.latest_metric.estimated_sales }}{% else %}—{% endif %}</b><small>最近估算日销</small></span>
+        <span class="store-summary-actions"><button class="link-button dianxiaomi-store" type="button" data-store-id="{{ panel.store.id }}" data-product-ids="{% for row in panel.rows %}{{ row.product.id }}{% if not loop.last %},{% endif %}{% endfor %}">采集到店小秘</button></span>
       </summary>
       <div class="table-wrap">
         <table class="monitor-table">
@@ -90,17 +104,13 @@
               <td>{% if row.seven_day_total is not none %}<strong class="number">{{ row.seven_day_total }}</strong><small>{{ row.coverage }} / 7 天可估算</small>{% else %}<span class="muted-value">—</span>{% endif %}</td>
               <td><div class="sales-strip" aria-label="最近 7 天估算销量">{% for item in row.history %}<span title="{{ item.date }}"><small>{{ item.date.strftime("%m-%d") }}</small><b>{{ item.value if item.value is not none else "—" }}</b></span>{% endfor %}</div></td>
               <td><span class="status {{ row.collection_status_class }}" data-collection-status>{{ row.collection_status_label }}</span>{% if row.collection_captured_at %}<small data-collection-time>{{ row.collection_captured_at.strftime("%m-%d %H:%M") }}</small>{% endif %}</td>
-              <td class="row-actions"><a class="link-button" href="{{ row.product.url }}#monitor_product_id={{ row.product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品页</a><button class="link-button danger deactivate-product" type="button" data-product-id="{{ row.product.id }}" aria-label="删除 {{ row.product.title or row.product.aliexpress_product_id }} 的监控">删除监控</button></td>
+              <td class="row-actions"><a class="link-button" href="{{ row.product.url }}#monitor_product_id={{ row.product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品页</a><button class="link-button dianxiaomi-product" type="button" data-product-id="{{ row.product.id }}">采集到店小秘</button><button class="link-button danger deactivate-product" type="button" data-product-id="{{ row.product.id }}" aria-label="删除 {{ row.product.title or row.product.aliexpress_product_id }} 的监控">删除监控</button></td>
             </tr>
           {% else %}<tr><td colspan="6" class="empty">该店铺还没有监控商品。</td></tr>{% endfor %}
           </tbody>
         </table>
       </div>
       <div class="store-actions">
-        <form class="store-rename-form" data-store-id="{{ panel.store.id }}">
-          <label>店铺名称<input name="name" value="{{ panel.store.name }}" maxlength="255" required></label>
-          <button class="button" type="submit">保存名称</button>
-        </form>
         <div class="store-links"><a href="/dashboard/stores/{{ panel.store.id }}">进入店铺详情</a><a href="{{ panel.store.url }}" target="_blank" rel="noreferrer">公开店铺页</a></div>
       </div>
     </details>

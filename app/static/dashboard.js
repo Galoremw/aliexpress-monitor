@@ -48,18 +48,41 @@ document.querySelector("#product-form")?.addEventListener("submit", async (event
   } catch (error) { notify(error.message, true); }
 });
 
+document.querySelectorAll(".edit-store-name").forEach((button) => {
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const form = document.querySelector(`.store-rename-form[data-store-id="${button.dataset.storeId}"]`);
+    if (!form) return;
+    form.hidden = false;
+    button.hidden = true;
+    form.querySelector("input")?.focus();
+    form.querySelector("input")?.select();
+  });
+});
+
+document.querySelectorAll(".cancel-store-name").forEach((button) => {
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const form = button.closest(".store-rename-form");
+    if (!form) return;
+    form.hidden = true;
+    document.querySelector(`.edit-store-name[data-store-id="${form.dataset.storeId}"]`)?.removeAttribute("hidden");
+  });
+});
+
 document.querySelectorAll(".store-rename-form").forEach((form) => {
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const button = form.querySelector("button[type='submit']");
+    event.stopPropagation();
+    const submit = form.querySelector("button[type='submit']");
     const name = String(new FormData(form).get("name") || "").trim();
     if (!name) {
       notify("店铺名称不能为空", true);
       return;
     }
-    button.disabled = true;
-    const oldText = button.textContent;
-    button.textContent = "保存中…";
+    submit.disabled = true;
     try {
       await jsonRequest(`/api/stores/${form.dataset.storeId}`, {
         method: "PATCH",
@@ -69,10 +92,89 @@ document.querySelectorAll(".store-rename-form").forEach((form) => {
       window.location.reload();
     } catch (error) {
       notify(error.message, true);
-      button.disabled = false;
-      button.textContent = oldText;
+      submit.disabled = false;
     }
   });
+});
+
+async function submitDianxiaomi(productIds, button) {
+  const ids = [...new Set(productIds.map((value) => Number(value)).filter(Boolean))];
+  if (!ids.length) {
+    notify("没有可发送的有效监控商品", true);
+    return;
+  }
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = "加入队列…";
+  try {
+    const result = await jsonRequest("/api/integrations/dianxiaomi/handoffs", {
+      method: "POST",
+      body: JSON.stringify({ product_ids: ids }),
+    });
+    const reused = result.reused_count ? `，${result.reused_count} 个已在队列中` : "";
+    notify(`已加入店小秘队列：${result.queued_count} 个${reused}`);
+    await refreshDianxiaomiStatus();
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = oldText;
+  }
+}
+
+document.querySelectorAll(".dianxiaomi-product").forEach((button) => {
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void submitDianxiaomi([button.dataset.productId], button);
+  });
+});
+
+document.querySelectorAll(".dianxiaomi-store").forEach((button) => {
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void submitDianxiaomi((button.dataset.productIds || "").split(","), button);
+  });
+});
+
+async function refreshDianxiaomiStatus() {
+  const section = document.querySelector("#dianxiaomi-status");
+  if (!section) return;
+  try {
+    const status = await jsonRequest(section.dataset.statusEndpoint);
+    Object.keys(status).forEach((key) => {
+      const target = section.querySelector(`[data-dianxiaomi-value="${key}"]`);
+      if (target) target.textContent = status[key];
+    });
+    const latest = section.querySelector("#dianxiaomi-latest");
+    const retry = section.querySelector("#dianxiaomi-retry");
+    const item = status.latest?.[0];
+    if (latest && item) latest.textContent = `${item.product_title || item.platform_product_id || "商品"} · ${item.status}${item.error_message ? ` · ${item.error_message}` : ""}`;
+    if (retry) {
+      retry.hidden = !item || !["NEEDS_CONFIRMATION", "FAILED"].includes(item.status);
+      retry.dataset.handoffId = item?.id || "";
+    }
+  } catch {
+    // The integration is optional; a temporary API restart should not affect the dashboard.
+  }
+}
+
+void refreshDianxiaomiStatus();
+window.setInterval(refreshDianxiaomiStatus, 5000);
+document.querySelector("#dianxiaomi-retry")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  if (!button.dataset.handoffId) return;
+  button.disabled = true;
+  try {
+    await jsonRequest(`/api/integrations/dianxiaomi/handoffs/${button.dataset.handoffId}/resume`, { method: "POST" });
+    notify("店小秘任务已重新排队");
+    await refreshDianxiaomiStatus();
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 document.querySelector("#collect-all")?.addEventListener("click", async (event) => {

@@ -3,6 +3,10 @@ const pageStatus = document.querySelector("#page-status");
 const result = document.querySelector("#result");
 const collectButton = document.querySelector("#collect");
 const heading = document.querySelector("#heading");
+const loginPanel = document.querySelector("#login-panel");
+const collectorPanel = document.querySelector("#collector-panel");
+const loginForm = document.querySelector("#login-form");
+const loginResult = document.querySelector("#login-result");
 
 function showResult(message, isError = false) {
   result.textContent = message;
@@ -42,6 +46,50 @@ async function loadActiveTab() {
   collectButton.disabled = false;
   return { tab, storePage };
 }
+
+async function monitorApi(path, options = {}) {
+  const { apiAccessToken } = await chrome.storage.local.get("apiAccessToken");
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (apiAccessToken) headers.Authorization = `Bearer ${apiAccessToken}`;
+  const response = await fetch(`${API_BASE}${path}`, { ...options, credentials: "include", headers });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || `监控台请求失败 (${response.status})`);
+  return body;
+}
+
+async function initializeAuth() {
+  try {
+    await monitorApi("/api/auth/me");
+    loginPanel.hidden = true;
+    collectorPanel.hidden = false;
+    await loadActiveTab();
+  } catch (error) {
+    loginPanel.hidden = false;
+    collectorPanel.hidden = true;
+    loginResult.textContent = error.message.includes("401") ? "请登录监控台账号" : error.message;
+    loginResult.className = error.message.includes("401") ? "" : "error";
+  }
+}
+
+loginForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  loginResult.textContent = "登录中…";
+  loginResult.className = "";
+  try {
+    const body = await monitorApi("/api/auth/extension-login", {
+      method: "POST",
+      body: JSON.stringify(Object.fromEntries(new FormData(loginForm))),
+    });
+    await chrome.storage.local.set({ apiAccessToken: body.access_token });
+    loginResult.textContent = "登录成功";
+    loginPanel.hidden = true;
+    collectorPanel.hidden = false;
+    await loadActiveTab();
+  } catch (error) {
+    loginResult.textContent = error.message || "登录失败";
+    loginResult.className = "error";
+  }
+});
 
 async function collectVisiblePage(tabId, targetType) {
   try {
@@ -93,4 +141,4 @@ collectButton.addEventListener("click", async () => {
   }
 });
 
-loadActiveTab().catch((error) => showResult(error.message || "无法读取当前标签页", true));
+initializeAuth();

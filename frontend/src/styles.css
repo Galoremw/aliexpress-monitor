@@ -31,10 +31,21 @@ h2 { margin: 0; font-size: 22px; }
 .button { display: inline-block; padding: 11px 16px; border: 1px solid #cad8cc; color: #285a43; text-decoration: none; font-weight: 700; }
 .button.primary { border-color: #39715a; color: #fff; background: #39715a; }
 .button.danger { border-color: #e4b9b4; color: #b42318; background: #fff; cursor: pointer; }
+.nav-logout { padding: 4px 8px; border: 1px solid #718077; color: #dbe7dd; background: transparent; cursor: pointer; }
+.auth-page { display: grid; place-items: center; min-height: 70vh; }
+.auth-panel { width: min(420px, 100%); padding: 32px; background: #fff; box-shadow: 0 12px 36px #17221d14; }
+.auth-panel h1 { font-size: 36px; }
+.auth-hint { color: #647269; line-height: 1.6; }
+.auth-panel form { display: grid; gap: 14px; }
+.auth-panel label { display: grid; gap: 6px; color: #647269; font-size: 13px; font-weight: 700; }
+.auth-panel input { width: 100%; padding: 11px; border: 1px solid #cad8cc; font: inherit; }
 .row-actions { display: flex !important; align-items: center; gap: 8px; }
 .list { display: grid; gap: 10px; }
 .row { display: flex; justify-content: space-between; gap: 20px; padding: 20px; background: #fff; }
 .row div { display: grid; gap: 6px; }
+.store-name-line { display: inline-flex; align-items: center; gap: 8px; }
+.icon-button { display: inline-grid; place-items: center; width: 25px; height: 25px; padding: 0; border: 1px solid #cad8cc; border-radius: 50%; color: #285a43; background: #fff; cursor: pointer; }
+.dianxiaomi-band { border-left: 3px solid #d7a133; padding-left: 16px; }
 .row span { color: #647269; font-size: 13px; }
 .row b { color: #875b12; }
 .row a { color: #285a43; text-decoration: none; }

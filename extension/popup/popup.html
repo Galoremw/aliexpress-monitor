@@ -8,10 +8,22 @@
   </head>
   <body>
     <main>
+      <section id="login-panel" hidden>
+        <h1>连接监控台</h1>
+        <p>首次使用或更换电脑时，请登录同一个监控台账号。</p>
+        <form id="login-form">
+          <input name="username" autocomplete="username" placeholder="账号" required>
+          <input name="password" type="password" autocomplete="current-password" placeholder="密码" required>
+          <button type="submit">登录扩展</button>
+        </form>
+        <p id="login-result" role="status"></p>
+      </section>
+      <section id="collector-panel" hidden>
       <h1 id="heading">AliExpress 采集助手</h1>
       <p id="page-status">检查当前标签页…</p>
       <button id="collect" type="button" disabled>采集当前商品</button>
       <p id="result" role="status" aria-live="polite"></p>
+      </section>
     </main>
     <script src="../config.js"></script>
     <script src="popup.js"></script>

@@ -5,5 +5,7 @@ h1 { margin: 0 0 8px; font-size: 16px; }
 p { margin: 8px 0; color: #66716d; font-size: 12px; line-height: 1.5; }
 button { width: 100%; min-height: 38px; border: 0; border-radius: 5px; background: #087f5b; color: white; font: inherit; font-weight: 700; cursor: pointer; }
 button:disabled { opacity: .45; cursor: not-allowed; }
+input { width: 100%; min-height: 34px; margin: 5px 0; padding: 0 8px; border: 1px solid #c9d5cf; box-sizing: border-box; font: inherit; }
+#login-result.error { color: #b42318; }
 #result { min-height: 18px; color: #086344; }
 #result.error { color: #b42318; }

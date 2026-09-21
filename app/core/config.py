@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     frontend_allowed_origins: str = (
         "https://galoremw.github.io,http://127.0.0.1:3000,http://localhost:3000"
     )
+    auth_required: bool = True
+    auth_session_secret: str = "change-this-session-secret"
+    auth_session_ttl_hours: int = Field(default=168, ge=1, le=8760)
+    auth_cookie_name: str = "aliexpress_monitor_session"
+    auth_cookie_secure: bool = False
+    auth_cookie_samesite: str = Field(default="lax", pattern="^(lax|strict|none)$")
+    auth_admin_username: str | None = None
+    auth_admin_password: str | None = None
 
 
 @lru_cache

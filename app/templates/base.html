@@ -13,11 +13,18 @@
         <a href="/">监控台</a>
         <a href="/manual">人工处理</a>
         <a href="/docs">API 文档</a>
+        <button id="logout" class="nav-logout" type="button">退出登录</button>
       </nav>
     </header>
     <main>{% block content %}{% endblock %}</main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <script src="/static/dashboard.js" defer></script>
+    <script>
+      document.querySelector("#logout")?.addEventListener("click", async () => {
+        await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
+        location.href = "/login";
+      });
+    </script>
     {% block scripts %}{% endblock %}
   </body>
 </html>

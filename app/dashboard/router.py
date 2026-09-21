@@ -17,6 +17,7 @@ from app.db.models import (
     StoreDailyMetric,
     StoreSnapshot,
 )
+from app.core.auth import require_page_auth
 from app.db.session import get_db
 from app.core.config import get_settings
 from app.services.store_discovery import store_top_products
@@ -27,7 +28,7 @@ from app.services.collection_progress import (
 )
 from app.services.browser_collection import get_today_run, serialize_run
 
-router = APIRouter(include_in_schema=False)
+router = APIRouter(include_in_schema=False, dependencies=[Depends(require_page_auth)])
 templates = Jinja2Templates(directory="app/templates")
 
 

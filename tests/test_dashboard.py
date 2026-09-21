@@ -186,7 +186,8 @@ def test_dashboard_css_and_store_detail_are_available(client, db_session):
     assert detail.status_code == 200
     assert "仅覆盖" in detail.text
     assert "已监控商品求和" in detail.text
-    assert 'class="store-rename-form compact-rename"' in detail.text
+    assert 'class="store-rename-form inline-rename"' in detail.text
+    assert "编辑店铺名称" in detail.text
 
 
 def test_manual_processing_page_has_stable_alias(client):
@@ -208,4 +209,5 @@ def test_dashboard_exposes_store_rename_control(client, db_session):
     assert dashboard.status_code == 200
     assert f'data-store-id="{store.id}"' in dashboard.text
     assert 'value="Original Name"' in dashboard.text
-    assert "保存名称" in dashboard.text
+    assert "编辑店铺名称" in dashboard.text
+    assert "采集到店小秘" in dashboard.text

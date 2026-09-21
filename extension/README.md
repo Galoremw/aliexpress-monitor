@@ -33,3 +33,18 @@ POST <BACKEND_URL>/api/collection/browser-extension
 编辑 `config.js`，把 `globalThis.ALIEXPRESS_MONITOR_API_BASE` 改成托管 FastAPI 的 HTTPS origin；同时在 `manifest.json` 的 `host_permissions` 中加入同一 origin 的精确匹配，例如 `https://monitor-api.example.com/*`。重新加载扩展后，人工补采和每日浏览器采集都会写入云端 Backend。
 
 Render 部署时，Frontend 的 `VITE_API_BASE_URL` 也必须填写同一个 Backend HTTPS origin。扩展和 Frontend 必须指向同一个 Backend，否则会出现“商品尚未加入监控”或看不到历史快照。
+
+## 店小秘链接交接
+
+监控台的“采集到店小秘”按钮会创建交接队列。扩展只在已登录的
+`https://www.dianxiaomi.com/web/productCrawl/dataAcquisition` 页面中，使用页面可见的
+“链接采集”文本框和“开始采集”按钮提交商品链接。
+
+这不是店小秘官方 API，也不会调用或修改第三方“店小秘助手”扩展。扩展不会读取 Cookie、密码或 Token，
+不会绕过登录、协议确认、验证码或平台访问限制。提交后监控台显示“采集中”，表示链接已交给店小秘页面，
+不等同于店小秘已经完成商品资料采集。
+
+使用前请在 Chrome 中重新加载本目录扩展，并保持店小秘已登录。若页面要求确认采集协议或重新登录，
+任务会停在“待人工确认”；完成正常操作后，在监控台点击“人工确认后重新排队”。
+
+扩展也监听本地或托管监控台中的“采集到店小秘”按钮。按钮创建任务后会立即唤醒队列，通常无需等待下一次定时轮询。更新扩展后请在 `chrome://extensions` 点击“重新加载”。

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AliExpress 竞品监控采集助手",
-  "version": "0.2.1",
+  "version": "0.3.1",
   "description": "按日读取已监控 AliExpress 店铺和商品的公开可见信息，并同步到本地监控台。",
   "permissions": ["activeTab", "scripting", "tabs", "webNavigation", "alarms", "notifications", "storage"],
   "host_permissions": [
@@ -9,7 +9,9 @@
     "https://*.aliexpress.com/*",
     "https://aliexpress-monitor-api.onrender.com/*",
     "http://127.0.0.1:8000/*",
-    "http://localhost:8000/*"
+    "http://localhost:8000/*",
+    "https://www.dianxiaomi.com/*",
+    "https://dianxiaomi.com/*"
   ],
   "action": {
     "default_title": "采集当前商品",
@@ -31,6 +33,25 @@
         "https://*.aliexpress.com/store/*"
       ],
       "js": ["page_collector.js", "content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://www.dianxiaomi.com/web/productCrawl/*",
+        "https://dianxiaomi.com/web/productCrawl/*"
+      ],
+      "js": ["dianxiaomi_bridge.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1:3000/*",
+        "http://localhost:3000/*",
+        "http://127.0.0.1:8000/*",
+        "https://galoremw.github.io/*",
+        "https://*.onrender.com/*"
+      ],
+      "js": ["dashboard_bridge.js"],
       "run_at": "document_idle"
     }
   ]
