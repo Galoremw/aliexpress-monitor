@@ -32,7 +32,15 @@
 
   function checkReady() {
     if (!isCollectionPage()) return { state: "failed", message: "当前不是店小秘数据采集页" };
-    if (pageNeedsLogin()) return { state: "needs_confirmation", message: "请先在店小秘页面完成登录" };
+    if (pageNeedsLogin()) {
+      const text = document.body?.innerText || "";
+      return {
+        state: "needs_confirmation",
+        message: /验证码|安全验证|人机验证/.test(text)
+          ? "店小秘需要人工完成验证"
+          : "请先在店小秘页面完成登录",
+      };
+    }
     const box = findUrlBox();
     const start = findStartButton();
     if (!box || !start) return { state: "failed", message: "没有找到店小秘链接采集控件" };

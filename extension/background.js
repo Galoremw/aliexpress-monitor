@@ -4,6 +4,7 @@ const API_BASE = globalThis.ALIEXPRESS_MONITOR_API_BASE || "http://127.0.0.1:800
 const POLL_ALARM = "aliexpress-monitor-browser-collection";
 const NOTIFICATION_ID = "aliexpress-monitor-verification";
 const FIRST_PRODUCT_NOTIFICATION_ID = "aliexpress-monitor-first-product";
+const DIANXIAOMI_NOTIFICATION_ID = "aliexpress-monitor-dianxiaomi-confirmation";
 const DIANXIAOMI_URL = "https://www.dianxiaomi.com/web/productCrawl/dataAcquisition";
 const tabProductIds = new Map();
 let automationBusy = false;
@@ -189,6 +190,17 @@ async function notifyFirstProduct(item) {
     title: "AliExpress 首个商品已打开",
     message: `${item.title || "第一个商品"}已显示。如平台要求验证，请正常完成；通过后会自动继续采集。`,
     priority: 1,
+  }).catch(() => undefined);
+}
+
+async function notifyDianxiaomiConfirmation(message) {
+  await chrome.notifications.create(DIANXIAOMI_NOTIFICATION_ID, {
+    type: "basic",
+    iconUrl: "icon.svg",
+    title: "店小秘采集已暂停",
+    message: `${message || "店小秘需要人工确认"}，完成后任务会自动继续。`,
+    priority: 2,
+    requireInteraction: true,
   }).catch(() => undefined);
 }
 
@@ -442,8 +454,12 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
       ? "COLLECTING"
       : result?.state === "needs_confirmation" ? "NEEDS_CONFIRMATION" : "FAILED";
     await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, result);
+    if (result?.state === "submitted") {
+      await chrome.notifications.clear(DIANXIAOMI_NOTIFICATION_ID).catch(() => undefined);
+    }
     if (result?.state === "needs_confirmation") {
       await chrome.storage.local.set({ dianxiaomiNeedsConfirmation: true });
+      await notifyDianxiaomiConfirmation(result.message);
       await chrome.windows.update(tab.windowId, { focused: true, state: "normal" }).catch(() => undefined);
       await chrome.tabs.update(tab.id, { active: true }).catch(() => undefined);
     }
