@@ -417,6 +417,10 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
   let handoffs = [];
   try {
     if (requestedBaseUrl) await chrome.storage.local.set({ activeApiBase: requestedBaseUrl });
+    const existing = await api("/api/integrations/dianxiaomi/handoffs?limit=50", {}, baseUrl);
+    if (existing.some((item) => item.status === "NEEDS_CONFIRMATION" && item.worker_id === workerId)) {
+      await chrome.storage.local.set({ dianxiaomiNeedsConfirmation: true });
+    }
     const workerStorage = await chrome.storage.local.get("dianxiaomiNeedsConfirmation");
     let resumeConfirmed = false;
     if (workerStorage.dianxiaomiNeedsConfirmation) {
