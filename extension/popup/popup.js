@@ -1,4 +1,4 @@
-const API_BASE = globalThis.ALIEXPRESS_MONITOR_API_BASE || "http://127.0.0.1:8000";
+const DEFAULT_API_BASE = globalThis.ALIEXPRESS_MONITOR_API_BASE || "http://127.0.0.1:8000";
 const pageStatus = document.querySelector("#page-status");
 const result = document.querySelector("#result");
 const collectButton = document.querySelector("#collect");
@@ -48,10 +48,12 @@ async function loadActiveTab() {
 }
 
 async function monitorApi(path, options = {}) {
-  const { apiAccessToken } = await chrome.storage.local.get("apiAccessToken");
+  const stored = await chrome.storage.local.get(["apiAccessToken", "apiAccessTokens", "activeApiBase"]);
+  const apiBase = stored.activeApiBase || DEFAULT_API_BASE;
+  const apiAccessToken = stored.apiAccessTokens?.[apiBase] || stored.apiAccessToken;
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (apiAccessToken) headers.Authorization = `Bearer ${apiAccessToken}`;
-  const response = await fetch(`${API_BASE}${path}`, { ...options, credentials: "include", headers });
+  const response = await fetch(`${apiBase}${path}`, { ...options, credentials: "include", headers });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.detail || `监控台请求失败 (${response.status})`);
   return body;
@@ -80,7 +82,12 @@ loginForm.addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify(Object.fromEntries(new FormData(loginForm))),
     });
-    await chrome.storage.local.set({ apiAccessToken: body.access_token });
+    const stored = await chrome.storage.local.get(["apiAccessTokens", "activeApiBase"]);
+    const apiBase = stored.activeApiBase || DEFAULT_API_BASE;
+    await chrome.storage.local.set({
+      apiAccessToken: body.access_token,
+      apiAccessTokens: { ...(stored.apiAccessTokens || {}), [apiBase]: body.access_token },
+    });
     loginResult.textContent = "登录成功";
     loginPanel.hidden = true;
     collectorPanel.hidden = false;
