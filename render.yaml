@@ -15,38 +15,12 @@ services:
       - key: TIMEZONE
         value: Asia/Shanghai
       - key: SCHEDULER_ENABLED
-        value: "false"
+        value: "true"
       - key: FIRECRAWL_ENABLED
         value: "true"
       - key: FIRECRAWL_API_KEY
         sync: false
       - key: FRONTEND_ALLOWED_ORIGINS
-        sync: false
-
-  - type: worker
-    name: aliexpress-monitor-scheduler
-    runtime: docker
-    region: singapore
-    plan: free
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    dockerCommand: sh -c "alembic upgrade head && python -m app.scheduler_worker"
-    envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: aliexpress-monitor-db
-          property: connectionString
-      - key: TIMEZONE
-        value: Asia/Shanghai
-      - key: SCHEDULER_ENABLED
-        value: "true"
-      - key: SCHEDULER_HOUR
-        value: "2"
-      - key: SCHEDULER_MINUTE
-        value: "0"
-      - key: FIRECRAWL_ENABLED
-        value: "true"
-      - key: FIRECRAWL_API_KEY
         sync: false
 
   - type: web
