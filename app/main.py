@@ -15,9 +15,21 @@ from app.scheduler import create_scheduler
 from app.dashboard.router import router as dashboard_router
 
 settings = get_settings()
-allowed_frontend_origins = [
+# Keep the first-party local and Pages entry points available even when a
+# deployment still has an older FRONTEND_ALLOWED_ORIGINS secret configured.
+configured_frontend_origins = [
     origin.strip() for origin in settings.frontend_allowed_origins.split(",") if origin.strip()
 ]
+allowed_frontend_origins = list(
+    dict.fromkeys(
+        configured_frontend_origins
+        + [
+            "https://galoremw.github.io",
+            "http://127.0.0.1:3000",
+            "http://localhost:3000",
+        ]
+    )
+)
 
 
 @asynccontextmanager
