@@ -11,6 +11,15 @@ function dashboardApiBase() {
   return null;
 }
 
+function notifyDashboardContext() {
+  const apiBaseUrl = dashboardApiBase();
+  if (apiBaseUrl) {
+    chrome.runtime.sendMessage({ type: "dashboard-context", api_base_url: apiBaseUrl }).catch(() => undefined);
+  }
+}
+
+notifyDashboardContext();
+
 document.addEventListener("click", (event) => {
   const button = event.target.closest?.(".dianxiaomi-product, .dianxiaomi-store");
   if (!button) return;

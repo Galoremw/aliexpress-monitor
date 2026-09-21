@@ -468,6 +468,11 @@ chrome.notifications.onClicked.addListener(async (notificationId) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "dashboard-context") {
+    void pollDianxiaomiHandoffs(message.api_base_url || null);
+    sendResponse({ ok: true });
+    return false;
+  }
   if (message?.type === "dianxiaomi-handoff-created") {
     void pollDianxiaomiHandoffs(message.api_base_url || null);
     sendResponse({ ok: true });
