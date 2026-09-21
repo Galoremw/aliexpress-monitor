@@ -20,6 +20,9 @@ set "PROFILE_DIR=%LOCALAPPDATA%\AliExpressMonitor\DianxiaomiProfile"
 if not exist "%PROFILE_DIR%" mkdir "%PROFILE_DIR%"
 set "EXTENSION_DIR=%~dp0extension"
 
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$profile=$env:PROFILE_DIR; Get-CimInstance Win32_Process -Filter 'Name = ''chrome.exe''' | Where-Object { $_.CommandLine -and $_.CommandLine -like ('*' + $profile + '*') -and $_.CommandLine -notmatch '--type=' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+timeout /t 1 /nobreak >nul
+
 start "AliExpress Monitor Dianxiaomi Worker Setup" "%CHROME_EXE%" --user-data-dir="%PROFILE_DIR%" --profile-directory="Default" --load-extension="%EXTENSION_DIR%" --new-window "http://127.0.0.1:3000/?dianxiaomi_worker=1"
 echo.
 echo Dedicated Dianxiaomi Chrome profile started.
