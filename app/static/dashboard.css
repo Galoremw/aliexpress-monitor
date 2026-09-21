@@ -147,6 +147,7 @@ tr:last-child td { border-bottom: 0; }
 .dianxiaomi-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dianxiaomi-item-meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .dianxiaomi-item-meta a { color: inherit; }
+.dianxiaomi-item-hint { color: #8b6510; font-size: 12px; }
 .dianxiaomi-item-side { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .dianxiaomi-status { color: #8b6510; font-size: 12px; white-space: nowrap; }
 .dianxiaomi-status.success { color: var(--accent-strong); }

@@ -52,6 +52,7 @@ h2 { margin: 0; font-size: 22px; }
 .dianxiaomi-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dianxiaomi-item-meta { color: #647269; font-size: 12px; overflow-wrap: anywhere; }
 .dianxiaomi-item-meta a { color: inherit; }
+.dianxiaomi-item-hint { color: #8b6510; font-size: 12px; }
 .dianxiaomi-item-side { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .dianxiaomi-status { color: #8b6510; font-size: 12px; white-space: nowrap; }
 .dianxiaomi-status.success { color: #267b5b; }

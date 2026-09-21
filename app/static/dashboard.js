@@ -165,12 +165,23 @@ const dianxiaomiStatusLabels = {
   COLLECTING: "店小秘采集中",
   SUCCEEDED: "店小秘已完成",
   FAILED: "失败",
-  NEEDS_CONFIRMATION: "需要人工处理",
+  NEEDS_CONFIRMATION: "需人工确认",
   CANCELED: "已取消",
 };
 
 function escapeDianxiaomiHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]));
+}
+
+function dianxiaomiNextAction(item) {
+  if (item.status === "NEEDS_CONFIRMATION") {
+    const message = String(item.error_message || "");
+    if (message.includes("协议")) return "请在店小秘页面勾选采集协议后点击“重新排队”";
+    if (message.includes("登录")) return "请在店小秘页面登录后点击“重新排队”";
+    return "请处理店小秘页面提示后点击“重新排队”";
+  }
+  if (item.status === "FAILED") return "请检查店小秘页面后点击“重新排队”";
+  return "";
 }
 
 function renderDianxiaomiItem(item) {
@@ -185,7 +196,8 @@ function renderDianxiaomiItem(item) {
   const store = escapeDianxiaomiHtml(item.store_name || `店铺 #${item.store_id}`);
   const url = escapeDianxiaomiHtml(item.target_url);
   const error = item.error_message ? ` · ${escapeDianxiaomiHtml(item.error_message)}` : "";
-  return `<article class="dianxiaomi-item"><div class="dianxiaomi-item-main"><strong class="dianxiaomi-item-title">${label}</strong><span class="dianxiaomi-item-meta">${store} · <a href="${url}" target="_blank" rel="noreferrer">${url}</a></span><span class="dianxiaomi-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(item.requested_at))}${error}</span></div><div class="dianxiaomi-item-side"><span class="dianxiaomi-status ${statusClass}">${status}</span><span class="dianxiaomi-item-actions">${action}</span></div></article>`;
+  const nextAction = dianxiaomiNextAction(item);
+  return `<article class="dianxiaomi-item"><div class="dianxiaomi-item-main"><strong class="dianxiaomi-item-title">${label}</strong><span class="dianxiaomi-item-meta">${store} · <a href="${url}" target="_blank" rel="noreferrer">${url}</a></span><span class="dianxiaomi-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(item.requested_at))}${error}</span>${nextAction ? `<span class="dianxiaomi-item-hint">${escapeDianxiaomiHtml(nextAction)}</span>` : ""}</div><div class="dianxiaomi-item-side"><span class="dianxiaomi-status ${statusClass}">${status}</span><span class="dianxiaomi-item-actions">${action}</span></div></article>`;
 }
 
 function formatDashboardDate(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—"; }

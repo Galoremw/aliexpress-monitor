@@ -14,7 +14,12 @@ function dashboardApiBase() {
 function notifyDashboardContext() {
   const apiBaseUrl = dashboardApiBase();
   if (apiBaseUrl) {
-    chrome.runtime.sendMessage({ type: "dashboard-context", api_base_url: apiBaseUrl }).catch(() => undefined);
+    const current = new URL(location.href);
+    chrome.runtime.sendMessage({
+      type: "dashboard-context",
+      api_base_url: apiBaseUrl,
+      worker_mode: current.searchParams.get("dianxiaomi_worker") === "1",
+    }).catch(() => undefined);
   }
 }
 

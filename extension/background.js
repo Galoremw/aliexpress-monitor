@@ -134,7 +134,7 @@ async function rememberAutomationWindow(tab) {
 
 async function ensureAlarm() {
   const alarm = await chrome.alarms.get(POLL_ALARM);
-  if (!alarm) chrome.alarms.create(POLL_ALARM, { periodInMinutes: 1 });
+  if (!alarm) chrome.alarms.create(POLL_ALARM, { periodInMinutes: 0.5 });
 }
 
 async function sendCollectMessage(tabId, targetType) {
@@ -405,6 +405,8 @@ async function updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, res
 
 async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
   if (dianxiaomiBusy) return;
+  const workerState = await chrome.storage.local.get("dianxiaomiWorkerMode");
+  if (!workerState.dianxiaomiWorkerMode) return;
   dianxiaomiBusy = true;
   const workerId = `chrome-${chrome.runtime.id}`;
   let baseUrl = requestedBaseUrl || (await chrome.storage.local.get("activeApiBase")).activeApiBase || API_BASE;
@@ -508,7 +510,10 @@ chrome.notifications.onClicked.addListener(async (notificationId) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "dashboard-context") {
-    void pollDianxiaomiHandoffs(message.api_base_url || null);
+    void chrome.storage.local.set({
+      dianxiaomiWorkerMode: message.worker_mode === true,
+      ...(message.api_base_url ? { activeApiBase: message.api_base_url } : {}),
+    }).then(() => pollDianxiaomiHandoffs(message.api_base_url || null));
     sendResponse({ ok: true });
     return false;
   }
