@@ -342,11 +342,11 @@ async function pollAutomation() {
   }
 }
 
-async function sendDianxiaomiMessage(tabId, urls) {
+async function sendDianxiaomiMessage(tabId, urls, type = "dianxiaomi-submit-links") {
   let lastError;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
-      return await chrome.tabs.sendMessage(tabId, { type: "dianxiaomi-submit-links", urls });
+      return await chrome.tabs.sendMessage(tabId, { type, urls });
     } catch (error) {
       lastError = error;
       await injectDianxiaomiBridge(tabId);
@@ -354,6 +354,10 @@ async function sendDianxiaomiMessage(tabId, urls) {
     }
   }
   throw lastError || new Error("店小秘页面尚未准备好");
+}
+
+async function checkDianxiaomiReady(tabId) {
+  return sendDianxiaomiMessage(tabId, [], "dianxiaomi-check-ready");
 }
 
 async function waitForDianxiaomiTab(tabId) {
@@ -413,9 +417,18 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
   let handoffs = [];
   try {
     if (requestedBaseUrl) await chrome.storage.local.set({ activeApiBase: requestedBaseUrl });
+    const workerStorage = await chrome.storage.local.get("dianxiaomiNeedsConfirmation");
+    let resumeConfirmed = false;
+    if (workerStorage.dianxiaomiNeedsConfirmation) {
+      const { tab } = await ensureDianxiaomiTab();
+      const ready = await checkDianxiaomiReady(tab.id);
+      if (ready?.state !== "ready") return;
+      resumeConfirmed = true;
+      await chrome.storage.local.remove("dianxiaomiNeedsConfirmation");
+    }
     handoffs = await api("/api/integrations/dianxiaomi/handoffs/claim-batch", {
       method: "POST",
-      body: JSON.stringify({ worker_id: workerId, limit: 20 }),
+      body: JSON.stringify({ worker_id: workerId, limit: 20, resume_confirmed: resumeConfirmed }),
     }, baseUrl);
     if (!handoffs?.length) return;
     const { tab } = await ensureDianxiaomiTab();
@@ -426,6 +439,7 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
       : result?.state === "needs_confirmation" ? "NEEDS_CONFIRMATION" : "FAILED";
     await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, result);
     if (result?.state === "needs_confirmation") {
+      await chrome.storage.local.set({ dianxiaomiNeedsConfirmation: true });
       await chrome.windows.update(tab.windowId, { focused: true, state: "normal" }).catch(() => undefined);
       await chrome.tabs.update(tab.id, { active: true }).catch(() => undefined);
     }

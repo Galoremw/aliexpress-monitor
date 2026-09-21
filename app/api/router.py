@@ -566,7 +566,12 @@ def claim_dianxiaomi_handoff_batch(
     payload: DianxiaomiHandoffClaimRequest,
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    rows = claim_handoff_batch(db, payload.worker_id, limit=payload.limit)
+    rows = claim_handoff_batch(
+        db,
+        payload.worker_id,
+        limit=payload.limit,
+        resume_confirmed=payload.resume_confirmed,
+    )
     return [serialize_handoff(row) for row in rows]
 
 

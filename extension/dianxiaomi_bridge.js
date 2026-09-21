@@ -30,7 +30,7 @@
     return /登录|重新登录|账号登录|验证码/.test(text) && !/数据采集/.test(text);
   }
 
-  async function submitLinks(urls) {
+  function checkReady() {
     if (!isCollectionPage()) return { state: "failed", message: "当前不是店小秘数据采集页" };
     if (pageNeedsLogin()) return { state: "needs_confirmation", message: "请先在店小秘页面完成登录" };
     const box = findUrlBox();
@@ -43,6 +43,14 @@
     if (!agreement && /采集请遵守平台相关规范/.test(document.body?.innerText || "")) {
       return { state: "needs_confirmation", message: "请在店小秘页面确认采集协议" };
     }
+    return { state: "ready" };
+  }
+
+  async function submitLinks(urls) {
+    const ready = checkReady();
+    if (ready.state !== "ready") return ready;
+    const box = findUrlBox();
+    const start = findStartButton();
     const cleanUrls = [...new Set(urls.filter((url) => /^https?:\/\//i.test(url)))];
     if (!cleanUrls.length) return { state: "failed", message: "没有有效商品链接" };
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
@@ -56,8 +64,11 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type !== "dianxiaomi-submit-links") return false;
-    submitLinks(Array.isArray(message.urls) ? message.urls : [])
+    if (!["dianxiaomi-submit-links", "dianxiaomi-check-ready"].includes(message?.type)) return false;
+    const operation = message.type === "dianxiaomi-check-ready"
+      ? Promise.resolve(checkReady())
+      : submitLinks(Array.isArray(message.urls) ? message.urls : []);
+    operation
       .then(sendResponse)
       .catch((error) => sendResponse({ state: "failed", message: error.message || "店小秘页面操作失败" }));
     return true;

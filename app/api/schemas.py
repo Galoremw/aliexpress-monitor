@@ -337,6 +337,7 @@ class DianxiaomiHandoffCreate(BaseModel):
 class DianxiaomiHandoffClaimRequest(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
     limit: int = Field(default=20, ge=1, le=50)
+    resume_confirmed: bool = False
 
 
 class DianxiaomiHandoffStatusRequest(BaseModel):

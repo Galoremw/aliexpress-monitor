@@ -144,3 +144,38 @@ def test_dianxiaomi_manual_confirmation_can_resume(client):
     resumed = client.post(f"/api/integrations/dianxiaomi/handoffs/{handoff_id}/resume")
     assert resumed.status_code == 200
     assert resumed.json()["status"] == "QUEUED"
+
+
+def test_dianxiaomi_worker_resumes_its_paused_batch_after_page_is_ready(client):
+    store, first = create_store_product(client, product_id="100500887")
+    second = client.post(
+        "/api/products",
+        json={"store_id": store["id"], "aliexpress_product_id": "100500888"},
+    ).json()
+    created = client.post(
+        "/api/integrations/dianxiaomi/handoffs",
+        json={"product_ids": [first["id"], second["id"]]},
+    ).json()
+    claimed = client.post(
+        "/api/integrations/dianxiaomi/handoffs/claim-batch",
+        json={"worker_id": "isolated-worker", "limit": 20},
+    )
+    assert {item["status"] for item in claimed.json()} == {"CLAIMED"}
+    for item in claimed.json():
+        response = client.post(
+            f"/api/integrations/dianxiaomi/handoffs/{item['id']}/status",
+            json={
+                "status": "NEEDS_CONFIRMATION",
+                "worker_id": "isolated-worker",
+                "error_message": "请先勾选店小秘采集协议",
+            },
+        )
+        assert response.status_code == 200
+
+    resumed = client.post(
+        "/api/integrations/dianxiaomi/handoffs/claim-batch",
+        json={"worker_id": "isolated-worker", "limit": 20, "resume_confirmed": True},
+    )
+    assert resumed.status_code == 200
+    assert len(resumed.json()) == 2
+    assert {item["status"] for item in resumed.json()} == {"CLAIMED"}

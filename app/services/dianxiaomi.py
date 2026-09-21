@@ -79,9 +79,27 @@ def claim_next_handoff(db: Session, worker_id: str) -> DianxiaomiHandoff | None:
 
 
 def claim_handoff_batch(
-    db: Session, worker_id: str, *, limit: int = 20
+    db: Session, worker_id: str, *, limit: int = 20, resume_confirmed: bool = False
 ) -> list[DianxiaomiHandoff]:
     now = _now()
+    if resume_confirmed:
+        paused = list(
+            db.scalars(
+                select(DianxiaomiHandoff).where(
+                    DianxiaomiHandoff.status == "NEEDS_CONFIRMATION",
+                    DianxiaomiHandoff.worker_id == worker_id,
+                )
+            )
+        )
+        for row in paused:
+            row.status = "QUEUED"
+            row.worker_id = None
+            row.claimed_at = None
+            row.error_type = None
+            row.error_message = None
+            row.completed_at = None
+        if paused:
+            db.flush()
     expired = list(
         db.scalars(
             select(DianxiaomiHandoff).where(
