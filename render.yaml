@@ -6,6 +6,7 @@ services:
     plan: free
     dockerfilePath: ./Dockerfile
     dockerContext: .
+    autoDeployTrigger: commit
     healthCheckPath: /health
     envVars:
       - key: DATABASE_URL
@@ -40,6 +41,7 @@ services:
   - type: web
     name: aliexpress-monitor-frontend
     runtime: static
+    autoDeployTrigger: commit
     buildCommand: cd frontend && npm ci && npm run build
     staticPublishPath: frontend/dist
     envVars:
