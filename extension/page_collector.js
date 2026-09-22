@@ -19,6 +19,20 @@
     return null;
   }
 
+  function productSummaryText(title, fallback) {
+    const heading = document.querySelector("h1");
+    if (!heading || !visible(heading)) return fallback;
+    let node = heading;
+    let best = null;
+    for (let depth = 0; node && depth < 10; depth += 1, node = node.parentElement) {
+      const text = clean(node.innerText || node.textContent) || "";
+      if (text.length < 80 || text.length > 12000 || !text.includes(title)) continue;
+      if (!/(?:sold|orders?|已售|销量)/i.test(text)) continue;
+      if (!best || text.length < best.length) best = text;
+    }
+    return best || fallback;
+  }
+
   function isChallengePage() {
     const url = location.href.toLowerCase();
     const text = clean(document.body?.innerText)?.toLowerCase() || "";
@@ -274,16 +288,17 @@
     const title = clean(document.querySelector("h1")?.innerText)
       || clean(jsonLd?.name)
       || clean(document.title)?.replace(/\s*[-|].*$/, "");
+    const productText = productSummaryText(title, bodyText);
     const soldCount = numberFrom(
       [/(\d[\d,.]*\s*[KM]?)\s*(?:sold|orders?)/i, /已售\s*(\d[\d,.]*\s*[KM]?)/i],
-      bodyText,
+      productText,
     );
     const reviewCount = numberFrom(
       [/(\d[\d,.]*\s*[KM]?)\s*(?:reviews?|ratings?)/i, /(\d[\d,.]*\s*[KM]?)\s*条评价/i],
-      bodyText,
+      productText,
     );
-    const ratingMatch = bodyText.match(/(?:rating|评分)\s*[:：]?\s*([0-5](?:\.\d+)?)/i);
-    const priceMatch = bodyText.match(/(?:US\$|USD|\$)\s*([\d,.]+)/i);
+    const ratingMatch = productText.match(/(?:rating|评分)\s*[:：]?\s*([0-5](?:\.\d+)?)/i);
+    const priceMatch = productText.match(/(?:US\$|USD|\$)\s*([\d,.]+)/i);
     const monitoredProductId = monitoredProductIdFromPage();
     const historical = readVisibleHistory();
     const payload = {
@@ -298,6 +313,7 @@
       raw_data: {
         extractor_version: "extension-content-0.4.1",
         page_title: clean(document.title),
+        product_text_scope: productText === bodyText ? "page_fallback" : "h1_ancestor",
         visible_text_excerpt: bodyText.slice(0, 1200),
         history_source: historical.points.length ? "visible_dom_table" : "visible_chart_tooltip_pending",
         history_observed_rows: historical.observed_rows,
