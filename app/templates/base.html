@@ -3,12 +3,13 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}AliExpress 竞品监控{% endblock %}</title>
-    <link rel="stylesheet" href="/static/dashboard.css?v=601d2ce">
+    <title>{% block title %}AliExpress 竞品监控{% endblock %}{% if request.query_params.get("dianxiaomi_worker") == "1" %} · 隔离 Chrome 工作模式{% endif %}</title>
+    <link rel="stylesheet" href="/static/dashboard.css?v=0614fbb">
   </head>
   <body>
     <header class="topbar">
       <a class="brand" href="/">AliExpress 竞品监控</a>
+      {% if request.query_params.get("dianxiaomi_worker") == "1" %}<span class="worker-mode-badge">隔离 Chrome 工作模式</span>{% endif %}
       <nav aria-label="主导航">
         <a href="/">监控台</a>
         <a href="/manual">人工处理</a>
@@ -18,7 +19,7 @@
     </header>
     <main>{% block content %}{% endblock %}</main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/dashboard.js?v=601d2ce" defer></script>
+    <script src="/static/dashboard.js?v=0614fbb" defer></script>
     <script>
       document.querySelector("#logout")?.addEventListener("click", async () => {
         await fetch("/api/auth/logout", { method: "POST", credentials: "include" });

@@ -17,6 +17,7 @@ a { color: var(--accent-dark); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .topbar { height: 58px; padding: 0 max(24px, calc((100vw - 1440px) / 2)); display: flex; align-items: center; justify-content: space-between; background: #17201d; color: white; }
 .brand { color: white; font-size: 16px; font-weight: 700; }
+.worker-mode-badge { padding: 4px 8px; border: 1px solid #9bc7ad; color: #d9f1df; background: #226247; font-size: 12px; white-space: nowrap; }
 .topbar nav { display: flex; gap: 22px; }
 .topbar nav a { color: #dce5e1; font-size: 13px; }
 .nav-logout { padding: 4px 8px; border: 1px solid #718077; color: #dce5e1; background: transparent; cursor: pointer; }
