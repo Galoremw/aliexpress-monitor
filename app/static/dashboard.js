@@ -138,6 +138,32 @@ document.querySelectorAll(".dianxiaomi-store").forEach((button) => {
   });
 });
 
+let dianxiaomiItems = [];
+let dianxiaomiActiveFilter = null;
+
+const dianxiaomiFilterStatuses = {
+  queued: ["QUEUED"],
+  processing: ["CLAIMED", "OPENED", "FILLED"],
+  submitted: ["COLLECTING"],
+  succeeded: ["SUCCEEDED"],
+  failed: ["FAILED"],
+  needs_confirmation: ["NEEDS_CONFIRMATION"],
+};
+
+function renderDianxiaomiFilter() {
+  const section = document.querySelector("#dianxiaomi-status");
+  const list = section?.querySelector("#dianxiaomi-items");
+  if (!list) return;
+  if (!dianxiaomiActiveFilter) {
+    list.innerHTML = '<p class="muted-value">点击上方状态查看对应商品。</p>';
+    return;
+  }
+  const statuses = dianxiaomiFilterStatuses[dianxiaomiActiveFilter] || [];
+  const filteredItems = dianxiaomiItems.filter((item) => statuses.includes(item.status));
+  const label = section.querySelector(`[data-dianxiaomi-filter="${dianxiaomiActiveFilter}"] small`)?.textContent || "该状态";
+  list.innerHTML = filteredItems.map(renderDianxiaomiItem).join("") || `<p class="muted-value">当前没有${escapeDianxiaomiHtml(label)}商品。</p>`;
+}
+
 async function refreshDianxiaomiStatus() {
   const section = document.querySelector("#dianxiaomi-status");
   if (!section) return;
@@ -147,11 +173,8 @@ async function refreshDianxiaomiStatus() {
       const target = section.querySelector(`[data-dianxiaomi-value="${key}"]`);
       if (target) target.textContent = status[key];
     });
-    const latest = section.querySelector("#dianxiaomi-latest");
-    const item = status.items?.[0] || status.latest?.[0];
-    if (latest && item) latest.textContent = `商品 ID ${item.platform_product_id || item.product_id || "—"} · ${item.status}${item.error_message ? ` · ${item.error_message}` : ""}`;
-    const list = section.querySelector("#dianxiaomi-items");
-    if (list) list.innerHTML = (status.items || []).map(renderDianxiaomiItem).join("") || '<p class="muted-value">当前没有店小秘任务。</p>';
+    dianxiaomiItems = status.items || [];
+    renderDianxiaomiFilter();
   } catch {
     // The integration is optional; a temporary API restart should not affect the dashboard.
   }
@@ -204,6 +227,17 @@ function formatDashboardDate(value) { return value ? new Date(value).toLocaleStr
 
 void refreshDianxiaomiStatus();
 window.setInterval(refreshDianxiaomiStatus, 5000);
+document.querySelector("#dianxiaomi-status")?.addEventListener("click", (event) => {
+  const filter = event.target.closest("[data-dianxiaomi-filter]");
+  if (!filter) return;
+  dianxiaomiActiveFilter = filter.dataset.dianxiaomiFilter;
+  document.querySelectorAll("[data-dianxiaomi-filter]").forEach((button) => {
+    const selected = button === filter;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+  });
+  renderDianxiaomiFilter();
+});
 document.querySelector("#dianxiaomi-items")?.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-dianxiaomi-action]");
   if (!button) return;

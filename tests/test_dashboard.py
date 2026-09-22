@@ -16,11 +16,20 @@ def test_dashboard_renders_empty_state(client):
 
 
 def test_dianxiaomi_queue_uses_product_id_instead_of_product_title(client):
+    dashboard = client.get("/")
     script = client.get("/static/dashboard.js")
 
+    assert dashboard.status_code == 200
+    assert 'role="tablist"' in dashboard.text
+    assert 'data-dianxiaomi-filter="queued"' in dashboard.text
+    assert 'data-dianxiaomi-filter="failed"' in dashboard.text
+    assert 'data-dianxiaomi-filter="succeeded"' in dashboard.text
+    assert "点击上方状态查看对应商品" in dashboard.text
     assert script.status_code == 200
-    assert "商品 ID ${item.platform_product_id || item.product_id" in script.text
+    assert 'item.platform_product_id || item.product_id ||' in script.text
     assert 'item.product_title || item.platform_product_id' not in script.text
+    assert 'failed: ["FAILED"]' in script.text
+    assert 'queued: ["QUEUED"]' in script.text
 
 
 def test_dashboard_renders_product_and_failed_snapshot(client, db_session):

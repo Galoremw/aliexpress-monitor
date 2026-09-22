@@ -75,15 +75,15 @@
     <span class="dianxiaomi-summary-hint">通过已登录 Chrome 的正常页面提交</span>
   </summary>
   <div class="dianxiaomi-content">
-    <div class="status-grid dianxiaomi-progress-grid">
-      <span><small>待发送</small><b data-dianxiaomi-value="queued">0</b></span>
-      <span><small>处理中</small><b data-dianxiaomi-value="processing">0</b></span>
-      <span><small>已提交</small><b data-dianxiaomi-value="submitted">0</b></span>
-      <span><small>失败</small><b data-dianxiaomi-value="failed">0</b></span>
-      <span><small>待人工确认</small><b data-dianxiaomi-value="needs_confirmation">0</b></span>
+    <div class="dianxiaomi-filter-grid" role="tablist" aria-label="按状态查看店小秘任务">
+      <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="queued"><small>待发送</small><b data-dianxiaomi-value="queued">0</b></button>
+      <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="processing"><small>处理中</small><b data-dianxiaomi-value="processing">0</b></button>
+      <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="submitted"><small>已提交</small><b data-dianxiaomi-value="submitted">0</b></button>
+      <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="succeeded"><small>已完成</small><b data-dianxiaomi-value="succeeded">0</b></button>
+      <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="failed"><small>失败</small><b data-dianxiaomi-value="failed">0</b></button>
+      <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="needs_confirmation"><small>待人工确认</small><b data-dianxiaomi-value="needs_confirmation">0</b></button>
     </div>
-    <p id="dianxiaomi-latest" class="muted-value">尚未提交店小秘采集任务。</p>
-    <div id="dianxiaomi-items" class="dianxiaomi-items" aria-live="polite"></div>
+    <div id="dianxiaomi-items" class="dianxiaomi-items" role="tabpanel" aria-live="polite"><p class="muted-value">点击上方状态查看对应商品。</p></div>
   </div>
 </details>
 
