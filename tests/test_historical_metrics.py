@@ -76,3 +76,41 @@ def test_cumulative_history_requires_consecutive_non_decreasing_points(client, d
     assert len(imported) == 1
     assert imported[0].metric_date == date(2026, 9, 20)
     assert imported[0].estimated_sales == 11
+
+
+def test_later_cumulative_point_uses_previous_snapshot_as_baseline(client, db_session):
+    product = create_product(client, "100500762")
+    first = client.post(
+        "/api/collection/browser-extension",
+        json={
+            "platform_product_id": "100500762",
+            "url": "https://www.aliexpress.com/item/100500762.html",
+            "sold_count": 111,
+            "captured_at": "2026-09-22T10:00:00+08:00",
+            "historical_sales": [
+                {"date": "2026-09-20", "value": 100, "value_type": "cumulative_total"},
+                {"date": "2026-09-21", "value": 111, "value_type": "cumulative_total"},
+            ],
+        },
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/api/collection/browser-extension",
+        json={
+            "platform_product_id": "100500762",
+            "url": "https://www.aliexpress.com/item/100500762.html",
+            "sold_count": 125,
+            "captured_at": "2026-09-23T10:00:00+08:00",
+            "historical_sales": [
+                {"date": "2026-09-22", "value": 125, "value_type": "cumulative_total"},
+            ],
+        },
+    )
+    assert second.status_code == 201
+
+    metric = db_session.query(ProductDailyMetric).filter_by(
+        product_id=product["id"], metric_date=date(2026, 9, 22)
+    ).one()
+    assert metric.estimated_sales == 14
+    assert metric.calculation_method == "ixspy_visible_cumulative_delta"

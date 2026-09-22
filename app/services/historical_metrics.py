@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.schemas import HistoricalSalesPoint
-from app.db.models import ProductDailyMetric
+from app.db.models import ProductDailyMetric, ProductSnapshot
 
 
 def _upsert_imported_metric(
@@ -71,17 +71,38 @@ def import_historical_sales(
             )
             touched.add(point.date)
 
-    cumulative = [point for point in ordered if point.value_type == "cumulative_total"]
-    for previous, current in zip(cumulative, cumulative[1:]):
-        if (current.date - previous.date).days != 1:
+    # Keep the last visible cumulative values in raw snapshots as a durable
+    # baseline. This lets the next run submit only the newly observed date.
+    known_cumulative: dict[date, int] = {}
+    previous_payloads = db.scalars(
+        select(ProductSnapshot.raw_data)
+        .where(ProductSnapshot.product_id == product_id)
+        .order_by(ProductSnapshot.captured_at.desc(), ProductSnapshot.id.desc())
+    ).all()
+    for raw_data in previous_payloads:
+        if not isinstance(raw_data, dict):
             continue
-        if current.value < previous.value:
+        for raw_point in raw_data.get("historical_sales", []):
+            if not isinstance(raw_point, dict) or raw_point.get("value_type") != "cumulative_total":
+                continue
+            try:
+                raw_date = date.fromisoformat(str(raw_point["date"]))
+                raw_value = int(raw_point["value"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            known_cumulative.setdefault(raw_date, raw_value)
+
+    cumulative = [point for point in ordered if point.value_type == "cumulative_total"]
+    for current in cumulative:
+        previous = known_cumulative.get(current.date - timedelta(days=1))
+        known_cumulative[current.date] = current.value
+        if previous is None or current.value < previous:
             continue
         _upsert_imported_metric(
             db,
             product_id=product_id,
             metric_date=current.date,
-            value=current.value - previous.value,
+            value=current.value - previous,
             snapshot_id=snapshot_id,
             reason="ixspy_visible_cumulative_delta",
             calculation_method="ixspy_visible_cumulative_delta",
