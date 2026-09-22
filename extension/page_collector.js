@@ -158,6 +158,55 @@
     };
   }
 
+  async function selectChartMode(button, expectedType) {
+    if (!button || !visible(button)) return false;
+    if (button.classList.contains("btn-active")) return true;
+    button.click();
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await nextPaint();
+      if (button.classList.contains("btn-active")) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return document.querySelector(
+      expectedType === "daily_increment" ? ".trade-inc-button.btn-active" : ".trade-total-button.btn-active",
+    ) !== null;
+  }
+
+  async function readVisibleChartHistories() {
+    const totalButton = document.querySelector(".trade-total-button");
+    const incrementButton = document.querySelector(".trade-inc-button");
+    const originalType = incrementButton?.classList.contains("btn-active")
+      ? "daily_increment"
+      : totalButton?.classList.contains("btn-active") ? "cumulative_total" : null;
+    const results = [];
+    const current = await readVisibleChartHistory();
+    if (current.points.length) results.push(current);
+
+    if (incrementButton && originalType !== "daily_increment") {
+      if (await selectChartMode(incrementButton, "daily_increment")) {
+        const increment = await readVisibleChartHistory();
+        if (increment.points.length) results.push(increment);
+      }
+    }
+
+    if (originalType === "cumulative_total" && totalButton) {
+      await selectChartMode(totalButton, "cumulative_total");
+    }
+
+    const points = new Map();
+    for (const result of results) {
+      for (const point of result.points) {
+        const existing = points.get(point.date);
+        if (!existing || point.value_type === "daily_increment") points.set(point.date, point);
+      }
+    }
+    return {
+      points: [...points.values()].sort((left, right) => left.date.localeCompare(right.date)),
+      source: results.length > 1 ? "visible_chart_tooltip_total_and_increment" : "visible_chart_tooltip",
+      sampled_positions: results.reduce((sum, result) => sum + result.sampled_positions, 0),
+    };
+  }
+
   async function collectHistoricalHistory(timeoutMs = 10000) {
     const fromTable = readVisibleHistory();
     if (fromTable.points.length) {
@@ -169,7 +218,7 @@
     }
 
     const chart = document.querySelector("#trade_chart canvas");
-    if (chart && visible(chart)) return readVisibleChartHistory();
+    if (chart && visible(chart)) return readVisibleChartHistories();
 
     return new Promise((resolve) => {
       let settled = false;
@@ -198,7 +247,7 @@
         }
         const visibleCanvas = document.querySelector("#trade_chart canvas");
         if (visibleCanvas && visible(visibleCanvas)) {
-          await finish(await readVisibleChartHistory());
+          await finish(await readVisibleChartHistories());
           checking = false;
           return;
         }
@@ -209,7 +258,7 @@
         void check();
       });
       observer.observe(document.documentElement, { childList: true, subtree: true });
-      const deadline = setTimeout(() => void finish(readVisibleChartHistory()), timeoutMs);
+      const deadline = setTimeout(() => void finish(readVisibleChartHistories()), timeoutMs);
       void check();
     });
   }
@@ -393,6 +442,7 @@
               ...result.payload.raw_data,
               history_source: history.source,
               history_sampled_positions: history.sampled_positions,
+              history_value_types: [...new Set(history.points.map((point) => point.value_type))],
             },
           },
         });
