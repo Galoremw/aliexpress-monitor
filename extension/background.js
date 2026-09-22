@@ -82,6 +82,53 @@ async function api(path, options = {}, requestedBaseUrl = null) {
   return body;
 }
 
+async function refreshApiTokenFromDashboard(baseUrl) {
+  const stored = await chrome.storage.local.get(["apiAccessToken", "apiAccessTokens"]);
+  if (stored.apiAccessTokens?.[baseUrl] || stored.apiAccessToken) return true;
+  const tabs = await chrome.tabs.query({
+    url: [
+      "http://127.0.0.1:3000/*",
+      "http://localhost:3000/*",
+      "http://127.0.0.1:8000/*",
+      "http://localhost:8000/*",
+      "https://galoremw.github.io/*",
+      "https://*.onrender.com/*",
+    ],
+  });
+  const dashboard = tabs.find((tab) => tab.url?.includes("dianxiaomi_worker=1")) || tabs[0];
+  if (!dashboard?.id) return false;
+  try {
+    const [injected] = await chrome.scripting.executeScript({
+      target: { tabId: dashboard.id },
+      world: "MAIN",
+      args: [baseUrl],
+      func: async (apiBase) => {
+        try {
+          const response = await fetch(`${apiBase}/api/auth/extension-token`, {
+            credentials: "include",
+          });
+          if (!response.ok) return null;
+          return await response.json();
+        } catch {
+          return null;
+        }
+      },
+    });
+    const token = injected?.result?.access_token;
+    if (!token) return false;
+    await chrome.storage.local.set({
+      apiAccessToken: token,
+      apiAccessTokens: {
+        ...(stored.apiAccessTokens || {}),
+        [baseUrl]: token,
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function injectCollector(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -121,6 +168,28 @@ async function automationState() {
     "challengePaused",
     "firstProductPresentedRunId",
   ]);
+}
+
+async function dedicatedWorkerEnabled() {
+  const state = await chrome.storage.local.get("dianxiaomiWorkerMode");
+  return state.dianxiaomiWorkerMode === true;
+}
+
+async function syncDedicatedWorkerMode() {
+  const tabs = await chrome.tabs.query({
+    url: [
+      "http://127.0.0.1:3000/*",
+      "http://localhost:3000/*",
+      "http://127.0.0.1:8000/*",
+      "http://localhost:8000/*",
+      "https://galoremw.github.io/*",
+      "https://*.onrender.com/*",
+    ],
+  });
+  const enabled = tabs.some((tab) => /[?&]dianxiaomi_worker=1(?:&|$)/.test(tab.url || ""));
+  await chrome.storage.local.set({ dianxiaomiWorkerMode: enabled });
+  if (!enabled) await closeAutomationWindow();
+  return enabled;
 }
 
 async function clearAutomationItem() {
@@ -253,6 +322,7 @@ async function processAutomationTabInternal(tabId) {
 }
 
 async function processAutomationTab(tabId) {
+  if (!(await dedicatedWorkerEnabled())) return;
   if (automationBusy) return;
   automationBusy = true;
   try {
@@ -303,6 +373,7 @@ async function openAutomationItem(item) {
 }
 
 async function pollAutomation() {
+  if (!(await dedicatedWorkerEnabled())) return;
   if (automationBusy) return;
   automationBusy = true;
   try {
@@ -414,7 +485,7 @@ async function updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, res
       status,
       worker_id: workerId,
       error_type: status === "FAILED" ? "page_operation_failed" : status === "NEEDS_CONFIRMATION" ? "manual_confirmation_required" : null,
-      error_message: status === "COLLECTING" ? null : result?.message || null,
+      error_message: ["COLLECTING", "SUCCEEDED"].includes(status) ? null : result?.message || null,
     }),
   }, baseUrl).catch(() => undefined)));
 }
@@ -429,6 +500,7 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
   let handoffs = [];
   try {
     if (requestedBaseUrl) await chrome.storage.local.set({ activeApiBase: requestedBaseUrl });
+    await refreshApiTokenFromDashboard(baseUrl);
     const existing = await api("/api/integrations/dianxiaomi/handoffs?limit=50", {}, baseUrl);
     if (existing.some((item) => item.status === "NEEDS_CONFIRMATION" && item.worker_id === workerId)) {
       await chrome.storage.local.set({ dianxiaomiNeedsConfirmation: true });
@@ -444,13 +516,15 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
     }
     handoffs = await api("/api/integrations/dianxiaomi/handoffs/claim-batch", {
       method: "POST",
-      body: JSON.stringify({ worker_id: workerId, limit: 20, resume_confirmed: resumeConfirmed }),
+      body: JSON.stringify({ worker_id: workerId, limit: 1, resume_confirmed: resumeConfirmed }),
     }, baseUrl);
     if (!handoffs?.length) return;
     const { tab } = await ensureDianxiaomiTab();
     await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, "OPENED");
     const result = await sendDianxiaomiMessage(tab.id, handoffs.map((handoff) => handoff.target_url));
-    const status = result?.state === "submitted"
+    const status = result?.state === "succeeded"
+      ? "SUCCEEDED"
+      : result?.state === "submitted"
       ? "COLLECTING"
       : result?.state === "needs_confirmation" ? "NEEDS_CONFIRMATION" : "FAILED";
     await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, result);
@@ -462,6 +536,8 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
       await notifyDianxiaomiConfirmation(result.message);
       await chrome.windows.update(tab.windowId, { focused: true, state: "normal" }).catch(() => undefined);
       await chrome.tabs.update(tab.id, { active: true }).catch(() => undefined);
+    } else if (["succeeded", "failed"].includes(result?.state)) {
+      setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
     }
   } catch (error) {
     if (handoffs.length) {
@@ -476,6 +552,7 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+  void syncDedicatedWorkerMode();
   void ensureAlarm();
   void injectOpenAliExpressTabs();
   void pollAutomation();
@@ -483,6 +560,7 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  void syncDedicatedWorkerMode();
   void ensureAlarm();
   void injectOpenAliExpressTabs();
   setTimeout(() => void pollAutomation(), 1500);
@@ -499,7 +577,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   void rememberAutomationWindow(tab);
   if (changeInfo.status === "complete" && isAliExpressPage(tab.url)) {
     void injectCollector(tabId);
-    void automationState().then((state) => {
+    void dedicatedWorkerEnabled().then((enabled) => enabled ? automationState() : null).then((state) => {
+      if (!state) return;
       if (state.automationTabId === tabId) {
         if (state.challengePaused) void pollAutomation();
         else void processAutomationTab(tabId);
@@ -526,7 +605,8 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(({ tabId, url }) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabProductIds.delete(tabId);
-  void automationState().then((state) => {
+  void dedicatedWorkerEnabled().then((enabled) => enabled ? automationState() : null).then((state) => {
+    if (!state) return;
     if (state.automationTabId === tabId && !state.challengePaused) {
       void finishAutomationFailure(state, "browser_tab_closed", "自动采集标签页被关闭");
     }
@@ -544,10 +624,27 @@ chrome.notifications.onClicked.addListener(async (notificationId) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "dashboard-context") {
-    void chrome.storage.local.set({
-      dianxiaomiWorkerMode: message.worker_mode === true,
-      ...(message.api_base_url ? { activeApiBase: message.api_base_url } : {}),
-    }).then(() => pollDianxiaomiHandoffs(message.api_base_url || null));
+    void (async () => {
+      const stored = await chrome.storage.local.get("apiAccessTokens");
+      const workerMode = message.worker_mode === true;
+      const nextState = {
+        dianxiaomiWorkerMode: workerMode,
+        ...(message.api_base_url ? { activeApiBase: message.api_base_url } : {}),
+      };
+      if (message.api_access_token && message.api_base_url) {
+        nextState.apiAccessToken = message.api_access_token;
+        nextState.apiAccessTokens = {
+          ...(stored.apiAccessTokens || {}),
+          [message.api_base_url]: message.api_access_token,
+        };
+      }
+      await chrome.storage.local.set(nextState);
+      if (!workerMode) {
+        await closeAutomationWindow();
+        return;
+      }
+      await pollDianxiaomiHandoffs(message.api_base_url || null);
+    })();
     sendResponse({ ok: true });
     return false;
   }
@@ -575,5 +672,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 void ensureAlarm();
+void syncDedicatedWorkerMode();
 setTimeout(() => void pollAutomation(), 1500);
 setTimeout(() => void pollDianxiaomiHandoffs(), 2000);

@@ -71,6 +71,25 @@ def me(user: User | None = Depends(require_authenticated)) -> User | None:
     return user
 
 
+@router.get("/extension-token")
+def extension_token(
+    user: User | None = Depends(require_authenticated),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Issue a scoped bearer session for the installed browser extension.
+
+    The dashboard bridge calls this same-origin endpoint with the user's
+    existing dashboard cookie. The token is then handed to the extension
+    service worker without reading cookies or browser storage.
+    """
+    if user is None:
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录监控台")
+    token, _ = issue_session(db, user)
+    return {"access_token": token, "user": UserRead(id=user.id, username=user.username)}
+
+
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(request: Request, response: Response, db: Session = Depends(get_db)) -> None:
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()

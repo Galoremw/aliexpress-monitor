@@ -1,6 +1,17 @@
 (function () {
+  if (globalThis.__ALIEXPRESS_MONITOR_DIANXIAOMI_BRIDGE__) return;
+  globalThis.__ALIEXPRESS_MONITOR_DIANXIAOMI_BRIDGE__ = true;
+
   function textOf(node) {
     return (node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function productIdFromUrl(url) {
+    try {
+      return new URL(url).pathname.match(/\/item\/(\d+)/i)?.[1] || null;
+    } catch {
+      return null;
+    }
   }
 
   function isCollectionPage() {
@@ -18,11 +29,14 @@
   }
 
   function agreementCheckbox() {
-    const marker = [...document.querySelectorAll("label, section, div")].find((node) =>
-      /采集请遵守平台相关规范/.test(textOf(node)) && node.querySelector("input[type='checkbox']")
-    );
-    if (marker) return marker.querySelector("input[type='checkbox']");
-    return null;
+    const checkboxes = [...document.querySelectorAll("input[type='checkbox']")];
+    return checkboxes.find((checkbox) => {
+      let node = checkbox.parentElement;
+      for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
+        if (/采集请遵守平台相关规范/.test(textOf(node))) return true;
+      }
+      return false;
+    }) || null;
   }
 
   function pageNeedsLogin() {
@@ -54,9 +68,79 @@
     return { state: "ready" };
   }
 
+  function resultLinkExists(url) {
+    const productId = productIdFromUrl(url);
+    if (!productId) return false;
+    return [...document.links].some((link) => productIdFromUrl(link.href) === productId);
+  }
+
+  function hasExplicitFailure() {
+    const nodes = [...document.querySelectorAll(
+      '[role="alert"], [class*="message"], [class*="Message"], [class*="toast"], [class*="Toast"], [class*="alert"], [class*="Alert"], [class*="error"], [class*="Error"]'
+    )];
+    return nodes.some((node) => /采集失败|链接无效|商品不存在|无法采集|不支持该平台/.test(textOf(node)));
+  }
+
+  function visible(node) {
+    const style = getComputedStyle(node);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }
+
+  function resultDialogs() {
+    return [...document.querySelectorAll("[role='dialog'], .ant-modal, .modal")]
+      .filter((node) => visible(node));
+  }
+
+  async function closeExistingResultModal() {
+    const dialog = resultDialogs().find((node) => /自动采集/.test(textOf(node)) && /状态：/.test(textOf(node)));
+    if (!dialog) return;
+    const close = [...dialog.querySelectorAll("button")].find((button) => textOf(button) === "关闭");
+    close?.click();
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      if (!resultDialogs().some((node) => /自动采集/.test(textOf(node)) && /状态：/.test(textOf(node)))) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  function collectionResult() {
+    const dialog = resultDialogs().find((node) => /自动采集/.test(textOf(node)) && /状态：采集完成/.test(textOf(node)));
+    if (!dialog) return null;
+    const text = textOf(dialog);
+    const counts = text.match(/已执行\s*(\d+)条，成功[:：]\s*(\d+)，跳过[:：]\s*(\d+)，失败[:：]\s*(\d+)/);
+    if (!counts) return null;
+    const [, executed, success, skipped, failed] = counts.map(Number);
+    if (failed > 0) {
+      return { state: "failed", message: `店小秘报告采集失败（${failed} 条）` };
+    }
+    if (success > 0 || skipped > 0) {
+      return { state: "succeeded", message: `店小秘已处理 ${executed} 条链接` };
+    }
+    return null;
+  }
+
+  async function waitForCollection(url, timeoutMs = 60000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const ready = checkReady();
+      if (ready.state === "needs_confirmation") return ready;
+      if (ready.state === "failed") return ready;
+      const modalResult = collectionResult();
+      if (modalResult) return modalResult;
+      if (resultLinkExists(url)) {
+        return { state: "succeeded", message: "店小秘已出现对应商品链接" };
+      }
+      if (hasExplicitFailure()) {
+        return { state: "failed", message: "店小秘页面报告采集失败或链接无效" };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    return { state: "failed", message: "等待店小秘采集结果超时" };
+  }
+
   async function submitLinks(urls) {
     const ready = checkReady();
     if (ready.state !== "ready") return ready;
+    await closeExistingResultModal();
     const box = findUrlBox();
     const start = findStartButton();
     const cleanUrls = [...new Set(urls.filter((url) => /^https?:\/\//i.test(url)))];
@@ -67,8 +151,8 @@
     box.dispatchEvent(new Event("input", { bubbles: true }));
     box.dispatchEvent(new Event("change", { bubbles: true }));
     start.click();
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    return { state: "submitted", count: cleanUrls.length, message: `已提交 ${cleanUrls.length} 条商品链接` };
+    const result = await waitForCollection(cleanUrls[0]);
+    return { ...result, count: cleanUrls.length };
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
