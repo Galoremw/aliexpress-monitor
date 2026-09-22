@@ -296,7 +296,7 @@
       review_count: Number.isFinite(reviewCount) ? reviewCount : null,
       historical_sales: historical.points,
       raw_data: {
-        extractor_version: "extension-content-0.4.0",
+        extractor_version: "extension-content-0.4.1",
         page_title: clean(document.title),
         visible_text_excerpt: bodyText.slice(0, 1200),
         history_source: historical.points.length ? "visible_dom_table" : "visible_chart_tooltip_pending",
