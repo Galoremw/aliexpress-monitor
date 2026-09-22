@@ -169,25 +169,48 @@
     }
 
     const chart = document.querySelector("#trade_chart canvas");
-    if (chart) return readVisibleChartHistory();
+    if (chart && visible(chart)) return readVisibleChartHistory();
 
     return new Promise((resolve) => {
       let settled = false;
-      const finish = async () => {
+      let checking = false;
+      let retryTimer;
+      const finish = async (result) => {
         if (settled) return;
         settled = true;
         observer.disconnect();
         clearTimeout(deadline);
-        resolve(await readVisibleChartHistory());
+        clearTimeout(retryTimer);
+        resolve(result || await readVisibleChartHistory());
+      };
+      const check = async () => {
+        if (settled || checking) return;
+        checking = true;
+        const table = readVisibleHistory();
+        if (table.points.length) {
+          await finish({
+            points: table.points,
+            source: "visible_dom_table",
+            sampled_positions: 0,
+          });
+          checking = false;
+          return;
+        }
+        const visibleCanvas = document.querySelector("#trade_chart canvas");
+        if (visibleCanvas && visible(visibleCanvas)) {
+          await finish(await readVisibleChartHistory());
+          checking = false;
+          return;
+        }
+        checking = false;
+        retryTimer = setTimeout(() => void check(), 250);
       };
       const observer = new MutationObserver(() => {
-        if (document.querySelector("#trade_chart canvas")
-          || document.querySelector(".sales-180 table")) {
-          void finish();
-        }
+        void check();
       });
       observer.observe(document.documentElement, { childList: true, subtree: true });
-      const deadline = setTimeout(() => void finish(), timeoutMs);
+      const deadline = setTimeout(() => void finish(readVisibleChartHistory()), timeoutMs);
+      void check();
     });
   }
 
