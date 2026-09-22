@@ -76,22 +76,23 @@
   </summary>
   <div class="dianxiaomi-content">
     <div class="dianxiaomi-filter-grid" role="tablist" aria-label="按状态查看店小秘任务">
-      <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="queued"><small>待发送</small><b data-dianxiaomi-value="queued">0</b></button>
+      <button class="dianxiaomi-filter active" type="button" role="tab" aria-selected="true" data-dianxiaomi-filter="queued"><small>待发送</small><b data-dianxiaomi-value="queued">0</b></button>
       <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="processing"><small>处理中</small><b data-dianxiaomi-value="processing">0</b></button>
       <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="submitted"><small>已提交</small><b data-dianxiaomi-value="submitted">0</b></button>
       <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="succeeded"><small>已完成</small><b data-dianxiaomi-value="succeeded">0</b></button>
       <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="failed"><small>失败</small><b data-dianxiaomi-value="failed">0</b></button>
       <button class="dianxiaomi-filter" type="button" role="tab" aria-selected="false" data-dianxiaomi-filter="needs_confirmation"><small>待人工确认</small><b data-dianxiaomi-value="needs_confirmation">0</b></button>
     </div>
-    <div id="dianxiaomi-items" class="dianxiaomi-items" role="tabpanel" aria-live="polite"><p class="muted-value">点击上方状态查看对应商品。</p></div>
+    <div class="dianxiaomi-list-heading"><strong id="dianxiaomi-list-title">待发送商品</strong><span id="dianxiaomi-list-caption">只显示待发送状态的队列商品</span></div>
+    <div id="dianxiaomi-items" class="dianxiaomi-items" role="tabpanel" aria-labelledby="dianxiaomi-list-title" aria-live="polite"><p class="muted-value">正在读取待发送商品…</p></div>
   </div>
 </details>
 
-<section id="active-stores" class="data-section anchor-section">
-  <div class="section-heading"><h2>活跃店铺</h2><span>展开店铺查看商品日销</span></div>
+<section id="active-stores" class="data-section anchor-section monitor-library">
+  <div class="section-heading"><h2>监控商品库</h2><span>不属于店小秘队列 · 按店铺展开查看</span></div>
   <div class="store-accordion">
     {% for panel in store_panels %}
-    <details class="store-monitor" {% if loop.first %}open{% endif %}>
+    <details class="store-monitor">
       <summary>
         <span class="store-summary-title"><strong>{{ panel.store.name }}</strong><button class="icon-button edit-store-name" type="button" data-store-id="{{ panel.store.id }}" title="编辑店铺名称" aria-label="编辑 {{ panel.store.name }} 的名称">✎</button><form class="store-rename-form inline-rename" data-store-id="{{ panel.store.id }}" hidden><input name="name" value="{{ panel.store.name }}" maxlength="255" aria-label="店铺名称" required><button class="link-button" type="submit">保存</button><button class="link-button cancel-store-name" type="button">取消</button></form><small>店铺 {{ panel.store.aliexpress_store_id or panel.store.id }}</small></span>
         <span class="store-summary-metric"><b>{{ panel.rows|length }}</b><small>监控商品</small></span>
@@ -180,8 +181,11 @@
       </table>
     </div>
   </div>
-  <div class="data-section">
-    <div class="section-heading"><h2>最近采集</h2><span>原始快照状态</span></div>
+  <details class="data-section recent-snapshots">
+    <summary class="section-heading recent-snapshots-summary">
+      <span><h2>最近采集</h2><small>原始快照状态 · {{ recent_snapshot_rows|length }} 条</small></span>
+      <span>按需展开</span>
+    </summary>
     <div class="table-wrap">
       <table>
         <thead><tr><th>商品</th><th>状态</th><th>累计 sold</th><th>时间</th></tr></thead>
@@ -192,7 +196,7 @@
         </tbody>
       </table>
     </div>
-  </div>
+  </details>
 </section>
 
 {% endblock %}

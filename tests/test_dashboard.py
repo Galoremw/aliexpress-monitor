@@ -24,12 +24,19 @@ def test_dianxiaomi_queue_uses_product_id_instead_of_product_title(client):
     assert 'data-dianxiaomi-filter="queued"' in dashboard.text
     assert 'data-dianxiaomi-filter="failed"' in dashboard.text
     assert 'data-dianxiaomi-filter="succeeded"' in dashboard.text
-    assert "点击上方状态查看对应商品" in dashboard.text
+    assert 'data-dianxiaomi-filter="queued"><small>待发送</small>' in dashboard.text
+    assert "只显示待发送状态的队列商品" in dashboard.text
+    assert "监控商品库" in dashboard.text
+    assert "不属于店小秘队列" in dashboard.text
+    assert '<details class="store-monitor" open>' not in dashboard.text
+    assert '<details class="data-section recent-snapshots">' in dashboard.text
+    assert '<details class="data-section recent-snapshots" open>' not in dashboard.text
     assert script.status_code == 200
     assert 'item.platform_product_id || item.product_id ||' in script.text
     assert 'item.product_title || item.platform_product_id' not in script.text
     assert 'failed: ["FAILED"]' in script.text
     assert 'queued: ["QUEUED"]' in script.text
+    assert 'let dianxiaomiActiveFilter = "queued"' in script.text
 
 
 def test_dashboard_renders_product_and_failed_snapshot(client, db_session):

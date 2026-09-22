@@ -139,7 +139,7 @@ document.querySelectorAll(".dianxiaomi-store").forEach((button) => {
 });
 
 let dianxiaomiItems = [];
-let dianxiaomiActiveFilter = null;
+let dianxiaomiActiveFilter = "queued";
 
 const dianxiaomiFilterStatuses = {
   queued: ["QUEUED"],
@@ -154,13 +154,13 @@ function renderDianxiaomiFilter() {
   const section = document.querySelector("#dianxiaomi-status");
   const list = section?.querySelector("#dianxiaomi-items");
   if (!list) return;
-  if (!dianxiaomiActiveFilter) {
-    list.innerHTML = '<p class="muted-value">点击上方状态查看对应商品。</p>';
-    return;
-  }
   const statuses = dianxiaomiFilterStatuses[dianxiaomiActiveFilter] || [];
   const filteredItems = dianxiaomiItems.filter((item) => statuses.includes(item.status));
   const label = section.querySelector(`[data-dianxiaomi-filter="${dianxiaomiActiveFilter}"] small`)?.textContent || "该状态";
+  const title = section.querySelector("#dianxiaomi-list-title");
+  const caption = section.querySelector("#dianxiaomi-list-caption");
+  if (title) title.textContent = `${label}商品 · ${filteredItems.length}`;
+  if (caption) caption.textContent = `只显示${label}状态的队列商品`;
   list.innerHTML = filteredItems.map(renderDianxiaomiItem).join("") || `<p class="muted-value">当前没有${escapeDianxiaomiHtml(label)}商品。</p>`;
 }
 
