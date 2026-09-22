@@ -9,6 +9,7 @@ const DIANXIAOMI_URL = "https://www.dianxiaomi.com/web/productCrawl/dataAcquisit
 const tabProductIds = new Map();
 let automationBusy = false;
 let dianxiaomiBusy = false;
+let workerModeReady = false;
 
 function productIdFromUrl(url) {
   try {
@@ -171,11 +172,13 @@ async function automationState() {
 }
 
 async function dedicatedWorkerEnabled() {
+  if (!workerModeReady) return false;
   const state = await chrome.storage.local.get("dianxiaomiWorkerMode");
   return state.dianxiaomiWorkerMode === true;
 }
 
 async function syncDedicatedWorkerMode() {
+  workerModeReady = false;
   const tabs = await chrome.tabs.query({
     url: [
       "http://127.0.0.1:3000/*",
@@ -188,6 +191,7 @@ async function syncDedicatedWorkerMode() {
   });
   const enabled = tabs.some((tab) => /[?&]dianxiaomi_worker=1(?:&|$)/.test(tab.url || ""));
   await chrome.storage.local.set({ dianxiaomiWorkerMode: enabled });
+  workerModeReady = true;
   if (!enabled) await closeAutomationWindow();
   return enabled;
 }
@@ -627,6 +631,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void (async () => {
       const stored = await chrome.storage.local.get("apiAccessTokens");
       const workerMode = message.worker_mode === true;
+      workerModeReady = true;
       const nextState = {
         dianxiaomiWorkerMode: workerMode,
         ...(message.api_base_url ? { activeApiBase: message.api_base_url } : {}),
