@@ -10,6 +10,17 @@ def test_dashboard_renders_empty_state(client):
     assert "竞品监控台" in response.text
     assert "还没有活跃店铺" in response.text
     assert "非真实后台订单量" not in response.text
+    assert '<details id="dianxiaomi-status"' in response.text
+    assert '<summary class="section-heading dianxiaomi-summary">' in response.text
+    assert '<details id="dianxiaomi-status" class="data-section dianxiaomi-band" data-status-endpoint="/api/integrations/dianxiaomi/status" open' not in response.text
+
+
+def test_dianxiaomi_queue_uses_product_id_instead_of_product_title(client):
+    script = client.get("/static/dashboard.js")
+
+    assert script.status_code == 200
+    assert "商品 ID ${item.platform_product_id || item.product_id" in script.text
+    assert 'item.product_title || item.platform_product_id' not in script.text
 
 
 def test_dashboard_renders_product_and_failed_snapshot(client, db_session):

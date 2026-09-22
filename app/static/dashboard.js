@@ -149,7 +149,7 @@ async function refreshDianxiaomiStatus() {
     });
     const latest = section.querySelector("#dianxiaomi-latest");
     const item = status.items?.[0] || status.latest?.[0];
-    if (latest && item) latest.textContent = `${item.product_title || item.platform_product_id || "商品"} · ${item.status}${item.error_message ? ` · ${item.error_message}` : ""}`;
+    if (latest && item) latest.textContent = `商品 ID ${item.platform_product_id || item.product_id || "—"} · ${item.status}${item.error_message ? ` · ${item.error_message}` : ""}`;
     const list = section.querySelector("#dianxiaomi-items");
     if (list) list.innerHTML = (status.items || []).map(renderDianxiaomiItem).join("") || '<p class="muted-value">当前没有店小秘任务。</p>';
   } catch {
@@ -192,7 +192,7 @@ function renderDianxiaomiItem(item) {
     : ["QUEUED", "CLAIMED", "OPENED", "FILLED", "COLLECTING"].includes(item.status)
       ? `<button class="link-button danger" type="button" data-dianxiaomi-action="cancel" data-handoff-id="${item.id}">取消</button>`
       : "";
-  const label = escapeDianxiaomiHtml(item.product_title || item.platform_product_id || `商品 #${item.product_id}`);
+  const label = `商品 ID ${escapeDianxiaomiHtml(item.platform_product_id || item.product_id || "—")}`;
   const store = escapeDianxiaomiHtml(item.store_name || `店铺 #${item.store_id}`);
   const url = escapeDianxiaomiHtml(item.target_url);
   const error = item.error_message ? ` · ${escapeDianxiaomiHtml(item.error_message)}` : "";

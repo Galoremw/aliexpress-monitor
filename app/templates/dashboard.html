@@ -69,18 +69,23 @@
   </div>
 </section>
 
-<section id="dianxiaomi-status" class="data-section dianxiaomi-band" data-status-endpoint="/api/integrations/dianxiaomi/status">
-  <div class="section-heading"><h2>店小秘采集队列</h2><span>通过已登录 Chrome 的正常页面提交</span></div>
-  <div class="status-grid dianxiaomi-progress-grid">
-    <span><small>待发送</small><b data-dianxiaomi-value="queued">0</b></span>
-    <span><small>处理中</small><b data-dianxiaomi-value="processing">0</b></span>
-    <span><small>已提交</small><b data-dianxiaomi-value="submitted">0</b></span>
-    <span><small>失败</small><b data-dianxiaomi-value="failed">0</b></span>
-    <span><small>待人工确认</small><b data-dianxiaomi-value="needs_confirmation">0</b></span>
+<details id="dianxiaomi-status" class="data-section dianxiaomi-band" data-status-endpoint="/api/integrations/dianxiaomi/status">
+  <summary class="section-heading dianxiaomi-summary">
+    <span class="dianxiaomi-summary-title"><h2>店小秘采集队列</h2><small>点击展开队列详情</small></span>
+    <span class="dianxiaomi-summary-hint">通过已登录 Chrome 的正常页面提交</span>
+  </summary>
+  <div class="dianxiaomi-content">
+    <div class="status-grid dianxiaomi-progress-grid">
+      <span><small>待发送</small><b data-dianxiaomi-value="queued">0</b></span>
+      <span><small>处理中</small><b data-dianxiaomi-value="processing">0</b></span>
+      <span><small>已提交</small><b data-dianxiaomi-value="submitted">0</b></span>
+      <span><small>失败</small><b data-dianxiaomi-value="failed">0</b></span>
+      <span><small>待人工确认</small><b data-dianxiaomi-value="needs_confirmation">0</b></span>
+    </div>
+    <p id="dianxiaomi-latest" class="muted-value">尚未提交店小秘采集任务。</p>
+    <div id="dianxiaomi-items" class="dianxiaomi-items" aria-live="polite"></div>
   </div>
-  <p id="dianxiaomi-latest" class="muted-value">尚未提交店小秘采集任务。</p>
-  <div id="dianxiaomi-items" class="dianxiaomi-items" aria-live="polite"></div>
-</section>
+</details>
 
 <section id="active-stores" class="data-section anchor-section">
   <div class="section-heading"><h2>活跃店铺</h2><span>展开店铺查看商品日销</span></div>

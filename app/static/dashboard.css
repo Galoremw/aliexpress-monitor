@@ -140,8 +140,18 @@ tr:last-child td { border-bottom: 0; }
 .toast.show { opacity: 1; transform: translateY(0); }
 .toast.error { background: var(--danger); }
 .discovery-note { margin: -10px 0 24px; color: var(--muted); font-size: 12px; }
-.dianxiaomi-progress-grid { margin-top: 12px; }
 .dianxiaomi-band { border-left: 3px solid #d7a133; }
+.dianxiaomi-summary { cursor: pointer; list-style: none; transition: background .15s ease; }
+.dianxiaomi-summary::-webkit-details-marker { display: none; }
+.dianxiaomi-summary:hover { background: #fffdf7; }
+.dianxiaomi-summary:focus-visible { outline: 2px solid #9bd8c3; outline-offset: -2px; }
+.dianxiaomi-summary::after { content: "展开"; min-width: 36px; color: #8b6510; font-size: 12px; font-weight: 700; text-align: right; }
+.dianxiaomi-band[open] .dianxiaomi-summary::after { content: "收起"; }
+.dianxiaomi-summary-title { display: grid; gap: 3px; }
+.dianxiaomi-summary-title small, .dianxiaomi-summary-hint { color: var(--muted); font-size: 11px; }
+.dianxiaomi-content { padding: 12px 0 14px; border-top: 1px solid var(--line); }
+.dianxiaomi-progress-grid { margin: 0; }
+.dianxiaomi-content > .muted-value { margin: 12px 14px 0; }
 .dianxiaomi-items { display: grid; gap: 8px; margin-top: 14px; }
 .dianxiaomi-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 11px 12px; border: 1px solid var(--line); background: #fffdf7; }
 .dianxiaomi-item-main { min-width: 0; display: grid; gap: 4px; }
@@ -190,6 +200,7 @@ tr:last-child td { border-bottom: 0; }
   .dianxiaomi-item { grid-template-columns: 1fr; }
   .dianxiaomi-item-side { justify-content: flex-start; flex-wrap: wrap; }
   .dianxiaomi-item-title { white-space: normal; }
+  .dianxiaomi-summary-hint { display: none; }
   .status-grid > *:nth-child(3n) { border-right: 1px solid var(--line); }
   .status-grid > *:nth-child(2n) { border-right: 0; }
   .browser-progress-grid { grid-template-columns: repeat(2, 1fr); }
