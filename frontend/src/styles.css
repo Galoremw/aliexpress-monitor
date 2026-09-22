@@ -3,6 +3,7 @@
 body { margin: 0; min-width: 320px; }
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px clamp(20px, 5vw, 72px); background: #17221d; color: #fff; }
 .brand { color: #fff; font-weight: 800; text-decoration: none; }
+.worker-mode-badge { padding: 4px 8px; border: 1px solid #9bc7ad; color: #d9f1df; background: #226247; font-size: 12px; white-space: nowrap; }
 nav { display: flex; gap: 20px; }
 nav a { color: #dbe7dd; text-decoration: none; font-size: 14px; }
 main { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 56px 0 80px; }

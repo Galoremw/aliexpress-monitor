@@ -58,6 +58,12 @@
     const box = findUrlBox();
     const start = findStartButton();
     if (!box || !start) return { state: "failed", message: "没有找到店小秘链接采集控件" };
+    if (/您还未安装采集插件/.test(document.body?.innerText || "")) {
+      return {
+        state: "needs_confirmation",
+        message: "隔离 Chrome 尚未安装店小秘采集插件，请在该窗口的 chrome://extensions 加载店小秘助手",
+      };
+    }
     const agreement = agreementCheckbox();
     if (agreement && !agreement.checked) {
       return { state: "needs_confirmation", message: "请先勾选店小秘采集协议" };

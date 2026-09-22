@@ -49,8 +49,10 @@ Render 部署时，Frontend 的 `VITE_API_BASE_URL` 也必须填写同一个 Bac
 
 如果不希望任务使用日常 Chrome，可以双击项目根目录的
 `setup-dianxiaomi-worker.bat`。它会创建独立的
-`%LOCALAPPDATA%\AliExpressMonitor\DianxiaomiProfile` 配置并自动加载扩展。
-首次在该窗口登录监控台、店小秘并确认协议；之后使用
+`%LOCALAPPDATA%\AliExpressMonitor\DianxiaomiProfile` 配置并只加载本项目扩展。
+店小秘官方的“店小秘助手”需要在这个隔离窗口的 `chrome://extensions`
+中单独加载或安装一次，不能直接复用日常 Chrome 的扩展安装状态。
+首次在该窗口登录监控台、店小秘、加载店小秘助手并确认协议；之后使用
 `start-dianxiaomi-worker.bat`，脚本只会重启自己的隔离配置并在后台最小化运行，
 不会关闭普通 Chrome。
 普通 Chrome 中的扩展不会领取店小秘队列；只有带有
