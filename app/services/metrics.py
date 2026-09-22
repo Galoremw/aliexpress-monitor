@@ -38,6 +38,12 @@ def _upsert_product_metric(
             ProductDailyMetric.metric_date == metric_date,
         )
     )
+    if (
+        metric is not None
+        and metric.is_estimable
+        and metric.calculation_method.startswith("ixspy_")
+    ):
+        return metric
     if metric is None:
         metric = ProductDailyMetric(product_id=product_id, metric_date=metric_date)
         db.add(metric)

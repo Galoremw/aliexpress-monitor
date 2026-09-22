@@ -70,6 +70,7 @@ from app.services.snapshots import collect_product_snapshot
 from app.services.snapshots import save_external_snapshot, save_store_product_snapshot
 from app.services.collection_runs import run_collection_cycle
 from app.services.metrics import calculate_product_daily_metrics, calculate_store_daily_metric
+from app.services.historical_metrics import import_historical_sales
 from app.services.store_discovery import discover_store_products, store_top_products
 from app.services.collection_progress import build_collection_progress, manual_completed_product_ids
 from app.services.browser_collection import (
@@ -158,6 +159,11 @@ def _save_channel_observation(
     product = expected_product or _find_extension_product(db, payload)
     captured_at = payload.captured_at or datetime.now(ZoneInfo(get_settings().timezone))
     parse_status = "success" if payload.sold_count is not None else "partial"
+    raw_data = dict(payload.raw_data)
+    if payload.historical_sales:
+        raw_data["historical_sales"] = [
+            point.model_dump(mode="json") for point in payload.historical_sales
+        ]
     result = CollectorResult(
         collected_at=captured_at,
         collector_name=source.lower(),
@@ -169,24 +175,31 @@ def _save_channel_observation(
         review_count=payload.review_count,
         title=payload.title,
         source_http_status=200,
-        raw_payload=payload.raw_data,
+        raw_payload=raw_data,
         raw_content=None,
         error_type=None if payload.sold_count is not None else "missing_sold_count",
         error_message=None if payload.sold_count is not None else "公开页面未提供累计销量",
     )
     snapshot = save_external_snapshot(db, product, result, source, commit=False)
+    imported_dates = import_historical_sales(
+        db,
+        product.id,
+        snapshot.id,
+        payload.historical_sales,
+        commit=False,
+    )
     metrics = calculate_product_daily_metrics(
         db,
         product.id,
         timezone_name=get_settings().timezone,
         commit=False,
     )
+    metric_dates = set(imported_dates)
     if metrics:
+        metric_dates.add(metrics[-1].metric_date)
+    for metric_date in metric_dates:
         calculate_store_daily_metric(
-            db,
-            product.store_id,
-            metrics[-1].metric_date,
-            commit=False,
+            db, product.store_id, metric_date, commit=False
         )
     if commit:
         db.commit()

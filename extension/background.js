@@ -678,5 +678,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 void ensureAlarm();
 void syncDedicatedWorkerMode();
+void injectOpenAliExpressTabs();
 setTimeout(() => void pollAutomation(), 1500);
 setTimeout(() => void pollDianxiaomiHandoffs(), 2000);

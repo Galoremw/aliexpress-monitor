@@ -42,6 +42,155 @@
       || null;
   }
 
+  function visible(element) {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none"
+      && style.visibility !== "hidden"
+      && Number(style.opacity || 1) > 0
+      && rect.width > 0
+      && rect.height > 0;
+  }
+
+  function fullDateFromText(value) {
+    const match = String(value || "").match(/\b(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\b/);
+    if (!match) return null;
+    const month = String(Number(match[2])).padStart(2, "0");
+    const day = String(Number(match[3])).padStart(2, "0");
+    return `${match[1]}-${month}-${day}`;
+  }
+
+  function readVisibleHistory() {
+    const salesPanel = [...document.querySelectorAll(".sales-180")]
+      .find((panel) => visible(panel) && /近一年销量趋势图|sales|orders/i.test(panel.innerText || ""))
+      || [...document.querySelectorAll("table")]
+        .find((table) => visible(table) && /销量|订单|sales|orders/i.test(table.innerText || ""));
+    if (!salesPanel) return { points: [], observed_rows: 0, value_type: null };
+
+    const modeRoot = salesPanel.closest(".sales-180") || document;
+    const totalButton = modeRoot.querySelector(".trade-total-button")
+      || document.querySelector(".trade-total-button");
+    const incrementButton = modeRoot.querySelector(".trade-inc-button")
+      || document.querySelector(".trade-inc-button");
+    const valueType = incrementButton?.classList.contains("btn-active")
+      ? "daily_increment"
+      : totalButton?.classList.contains("btn-active") ? "cumulative_total" : null;
+    if (!valueType) return { points: [], observed_rows: 0, value_type: null };
+
+    const rows = [...salesPanel.querySelectorAll("table tr, [data-history-date][data-history-value]")]
+      .filter(visible);
+    const points = [];
+    for (const row of rows) {
+      const dateText = row.getAttribute("data-history-date") || row.innerText || "";
+      const metricDate = fullDateFromText(dateText);
+      if (!metricDate) continue;
+      const rawValue = row.getAttribute("data-history-value")
+        || [...row.querySelectorAll("th,td")].slice(1).map((cell) => cell.innerText).join(" ");
+      const valueMatch = String(rawValue).replace(/,/g, "").match(/\b\d+(?:\.\d+)?\b/);
+      if (!valueMatch) continue;
+      points.push({
+        date: metricDate,
+        value: Math.max(0, Math.round(Number(valueMatch[0]))),
+        value_type: valueType,
+      });
+    }
+    const unique = [...new Map(points.map((point) => [point.date, point])).values()];
+    return { points: unique, observed_rows: rows.length, value_type: valueType };
+  }
+
+  function nextPaint() {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  }
+
+  function readVisibleChartTooltip(valueType) {
+    const candidates = [...document.querySelectorAll("body *")]
+      .filter((element) => visible(element))
+      .map((element) => clean(element.innerText || element.textContent) || "")
+      .filter((text) => text.length > 0 && text.length <= 400)
+      .filter((text) => fullDateFromText(text) && /近一年销量|sales|orders/i.test(text))
+      .sort((left, right) => left.length - right.length);
+    for (const text of candidates) {
+      const metricDate = fullDateFromText(text);
+      const valueMatch = text.match(/(?:近一年销量|sales|orders?)\s*[:：]?\s*([\d,.]+\s*[KM]?)/i);
+      if (!metricDate || !valueMatch) continue;
+      const value = parseCount(valueMatch[1]);
+      if (value === null) continue;
+      return { date: metricDate, value, value_type: valueType };
+    }
+    return null;
+  }
+
+  async function readVisibleChartHistory() {
+    const chart = document.querySelector("#trade_chart");
+    const canvas = chart?.querySelector("canvas");
+    if (!canvas || !visible(canvas)) {
+      return { points: [], source: "visible_dom_only", sampled_positions: 0 };
+    }
+    const totalButton = document.querySelector(".trade-total-button");
+    const incrementButton = document.querySelector(".trade-inc-button");
+    const valueType = incrementButton?.classList.contains("btn-active")
+      ? "daily_increment"
+      : totalButton?.classList.contains("btn-active") ? "cumulative_total" : null;
+    if (!valueType) return { points: [], source: "visible_chart_tooltip", sampled_positions: 0 };
+
+    const rect = canvas.getBoundingClientRect();
+    const sampleCount = Math.min(120, Math.max(24, Math.floor(rect.width / 4)));
+    const points = new Map();
+    for (let index = 0; index <= sampleCount; index += 1) {
+      const x = rect.left + (rect.width * index) / sampleCount;
+      const y = rect.top + rect.height * 0.45;
+      canvas.dispatchEvent(new MouseEvent("mousemove", {
+        bubbles: true,
+        clientX: x,
+        clientY: y,
+        view: window,
+      }));
+      await nextPaint();
+      const point = readVisibleChartTooltip(valueType);
+      if (point) points.set(point.date, point);
+    }
+    canvas.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, view: window }));
+    return {
+      points: [...points.values()],
+      source: "visible_chart_tooltip",
+      sampled_positions: sampleCount + 1,
+    };
+  }
+
+  async function collectHistoricalHistory(timeoutMs = 10000) {
+    const fromTable = readVisibleHistory();
+    if (fromTable.points.length) {
+      return {
+        points: fromTable.points,
+        source: "visible_dom_table",
+        sampled_positions: 0,
+      };
+    }
+
+    const chart = document.querySelector("#trade_chart canvas");
+    if (chart) return readVisibleChartHistory();
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = async () => {
+        if (settled) return;
+        settled = true;
+        observer.disconnect();
+        clearTimeout(deadline);
+        resolve(await readVisibleChartHistory());
+      };
+      const observer = new MutationObserver(() => {
+        if (document.querySelector("#trade_chart canvas")
+          || document.querySelector(".sales-180 table")) {
+          void finish();
+        }
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      const deadline = setTimeout(() => void finish(), timeoutMs);
+    });
+  }
+
   function readProduct() {
     if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
     const productId = productIdFromPage();
@@ -64,6 +213,7 @@
     const ratingMatch = bodyText.match(/(?:rating|评分)\s*[:：]?\s*([0-5](?:\.\d+)?)/i);
     const priceMatch = bodyText.match(/(?:US\$|USD|\$)\s*([\d,.]+)/i);
     const monitoredProductId = monitoredProductIdFromPage();
+    const historical = readVisibleHistory();
     const payload = {
       platform_product_id: productId,
       url: location.href,
@@ -72,10 +222,14 @@
       price: priceMatch ? Number(priceMatch[1].replace(/,/g, "")) : null,
       rating: ratingMatch ? Number(ratingMatch[1]) : null,
       review_count: Number.isFinite(reviewCount) ? reviewCount : null,
+      historical_sales: historical.points,
       raw_data: {
-        extractor_version: "extension-content-0.2.0",
+        extractor_version: "extension-content-0.4.0",
         page_title: clean(document.title),
         visible_text_excerpt: bodyText.slice(0, 1200),
+        history_source: historical.points.length ? "visible_dom_table" : "visible_chart_tooltip_pending",
+        history_observed_rows: historical.observed_rows,
+        history_value_type: historical.value_type,
         ...(monitoredProductId ? { monitored_product_id: monitoredProductId } : {}),
       },
     };
@@ -187,6 +341,7 @@
   function collectProduct(timeoutMs = 45000) {
     return new Promise((resolve) => {
       let settled = false;
+      let collecting = false;
       const finish = (result) => {
         if (settled) return;
         settled = true;
@@ -194,9 +349,30 @@
         clearTimeout(deadline);
         resolve(result);
       };
-      const check = () => {
+      const check = async () => {
+        if (settled || collecting) return;
         const result = readProduct();
-        if (result.state === "ready" || result.state === "challenge") finish(result);
+        if (result.state === "challenge") {
+          finish(result);
+          return;
+        }
+        if (result.state !== "ready") return;
+        collecting = true;
+        const history = result.payload.historical_sales?.length
+          ? { points: result.payload.historical_sales, source: "visible_dom_table", sampled_positions: 0 }
+          : await collectHistoricalHistory();
+        finish({
+          ...result,
+          payload: {
+            ...result.payload,
+            historical_sales: history.points,
+            raw_data: {
+              ...result.payload.raw_data,
+              history_source: history.source,
+              history_sampled_positions: history.sampled_positions,
+            },
+          },
+        });
       };
       const observer = new MutationObserver(check);
       observer.observe(document.documentElement, {
@@ -208,7 +384,7 @@
         const result = readProduct();
         finish(result.payload ? { ...result, state: "partial" } : { state: "failed", message: result.message });
       }, timeoutMs);
-      check();
+      void check();
     });
   }
 

@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -92,6 +92,14 @@ class ProductSnapshotRead(BaseModel):
     raw_data: dict[str, Any]
 
 
+class HistoricalSalesPoint(BaseModel):
+    """A dated sales value explicitly observed from an allowed public source."""
+
+    date: date
+    value: int = Field(ge=0)
+    value_type: Literal["daily_increment", "cumulative_total"]
+
+
 class BrowserExtensionCollectionRequest(BaseModel):
     platform_product_id: str = Field(min_length=1, max_length=128)
     url: str = Field(min_length=1, max_length=2048)
@@ -101,6 +109,7 @@ class BrowserExtensionCollectionRequest(BaseModel):
     rating: Decimal | None = Field(default=None, ge=0, le=5)
     review_count: int | None = Field(default=None, ge=0)
     captured_at: datetime | None = None
+    historical_sales: list[HistoricalSalesPoint] = Field(default_factory=list, max_length=366)
     raw_data: dict[str, Any] = Field(default_factory=dict)
 
 
