@@ -4,6 +4,11 @@ cd /d "%~dp0"
 set "OPEN_DASHBOARD=1"
 if /i "%~1"=="--no-open" set "OPEN_DASHBOARD=0"
 
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\register-monitor-protocol.ps1"
+if errorlevel 1 echo Could not register the dedicated Chrome launcher protocol.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\register-browser-collector-protocol.ps1"
+if errorlevel 1 echo Could not register the browser collector launcher protocol.
+
 where docker >nul 2>nul
 if errorlevel 1 (
   if exist "%LOCALAPPDATA%\Programs\DockerDesktop\resources\bin\docker.exe" (
@@ -48,13 +53,13 @@ if errorlevel 1 (
 )
 
 echo Waiting for the dashboard...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline=(Get-Date).AddSeconds(120); do { try { $response=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:3000/ -TimeoutSec 3; if ($response.StatusCode -eq 200) { exit 0 } } catch { } Start-Sleep -Seconds 2 } while ((Get-Date) -lt $deadline); exit 1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline=(Get-Date).AddSeconds(120); do { try { $response=Invoke-WebRequest -UseBasicParsing http://127.0.0.1:3000/health -TimeoutSec 3; if ($response.StatusCode -eq 200) { exit 0 } } catch { } Start-Sleep -Seconds 2 } while ((Get-Date) -lt $deadline); exit 1"
 if errorlevel 1 (
   echo Services started but dashboard check timed out. Run: docker compose -p aliexpress-monitor ps
   if "%OPEN_DASHBOARD%"=="1" pause
   exit /b 1
 )
 
-if "%OPEN_DASHBOARD%"=="1" start "" "http://127.0.0.1:3000"
+if "%OPEN_DASHBOARD%"=="1" start "" "http://127.0.0.1:3000/"
 echo AliExpress Monitor is running at http://127.0.0.1:3000
 endlocal

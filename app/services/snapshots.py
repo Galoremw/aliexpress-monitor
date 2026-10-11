@@ -1,13 +1,13 @@
-from datetime import datetime, timezone
-
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.collectors.base import Collector, CollectorResult, CollectorTarget
+from app.api.schemas import HistoricalSalesPoint
 from app.db.models import CollectionAttempt, ManualCollectionTask, Product, ProductSnapshot
+from app.services.product_presentation import clean_product_title
 
 
 def snapshot_status(parse_status: str) -> str:
@@ -80,8 +80,10 @@ def _save_snapshot_result(
         status=status,
     )
     db.add(snapshot)
-    if result.title and not product.title:
-        product.title = result.title
+    if product.title:
+        product.title = clean_product_title(product.title)
+    elif result.title:
+        product.title = clean_product_title(result.title)
     db.flush()
     attempt = CollectionAttempt(
         product_id=product.id,
@@ -148,25 +150,65 @@ def save_store_product_snapshot(
     collector_name: str,
     collector_version: str,
     raw_payload: dict[str, Any],
+    historical_sales: list[HistoricalSalesPoint] | None = None,
+    history_target_date: date | None = None,
+    history_source: str | None = None,
     commit: bool = False,
 ) -> ProductSnapshot:
-    """Persist the public cumulative sales observed on a store listing page.
-
-    Store pages generally expose only a subset of product fields.  A sold count
-    is enough for the daily delta calculation, while missing counts remain a
-    suspect snapshot and can be sent to the product-page fallback queue.
-    """
-    has_sold_count = sold_count is not None
+    """Persist store-page metadata and only explicitly read IXSPY daily points."""
+    _ = sold_count  # Accepted for compatibility; cumulative totals are no longer stored.
+    expected_dates = (
+        {history_target_date - timedelta(days=offset) for offset in range(1, 8)}
+        if history_target_date
+        else set()
+    )
+    points_by_date = {
+        point.date: point
+        for point in historical_sales or []
+        if point.value_type == "daily_increment" and point.date in expected_dates
+    }
+    complete = (
+        bool(expected_dates)
+        and history_source == "ixspy_visible_daily_increment"
+        and set(points_by_date) == expected_dates
+    )
+    extension_metadata = raw_payload.get("extension_raw_data")
+    payload = {
+        **raw_payload,
+        "historical_sales": [
+            point.model_dump(mode="json")
+            for _, point in sorted(points_by_date.items())
+        ],
+        "history_source": (
+            "ixspy_visible_daily_increment"
+            if points_by_date and history_source == "ixspy_visible_daily_increment"
+            else "ixspy_daily_increment_unavailable"
+        ),
+        "history_target_date": history_target_date.isoformat() if history_target_date else None,
+        "history_expected_dates": sorted(value.isoformat() for value in expected_dates),
+        "history_missing_dates": sorted(
+            value.isoformat() for value in expected_dates - set(points_by_date)
+        ),
+        "history_daily_capture_complete": complete,
+        "history_sampling_strategy": "store_card_increment_chart_latest_7_dates",
+        "history_collector_version": (
+            extension_metadata.get("history_collector_version")
+            if isinstance(extension_metadata, dict)
+            else None
+        ),
+    }
     result = CollectorResult(
         collected_at=captured_at,
         collector_name=collector_name,
         collector_version=collector_version,
-        parse_status="success" if has_sold_count else "partial",
-        cumulative_sold=sold_count,
-        title=title,
+        parse_status="success" if complete else "partial",
+        cumulative_sold=None,
+        title=clean_product_title(title),
         source_http_status=200,
-        raw_payload=raw_payload,
-        error_type=None if has_sold_count else "missing_sold_count",
-        error_message=None if has_sold_count else "店铺页未提供累计销量",
+        raw_payload=payload,
+        error_type=None if complete else "ixspy_daily_increment_unavailable",
+        error_message=None if complete else (
+            f"店铺页 IXSPY 最近 7 日仅读取到 {len(points_by_date)}/7 天日增量"
+        ),
     )
     return _save_snapshot_result(db, product, result, source, commit=commit)

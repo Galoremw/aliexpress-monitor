@@ -6,7 +6,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.models import DianxiaomiHandoff, Product, Store
+from app.db.models import DianxiaomiHandoff, DianxiaomiQueueControl, Product, Store
 
 
 ACTIVE_HANDOFF_STATUSES = {
@@ -22,6 +22,59 @@ LEASED_HANDOFF_STATUSES = {"CLAIMED", "OPENED", "FILLED", "COLLECTING"}
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _queue_control(db: Session) -> DianxiaomiQueueControl:
+    control = db.get(DianxiaomiQueueControl, 1)
+    if control is None:
+        control = DianxiaomiQueueControl(id=1)
+        db.add(control)
+        db.flush()
+    return control
+
+
+def pause_dianxiaomi_queue(
+    db: Session, reason: str = "manual_pause"
+) -> DianxiaomiQueueControl:
+    control = _queue_control(db)
+    control.is_paused = True
+    control.paused_at = _now()
+    control.paused_reason = reason
+    db.commit()
+    db.refresh(control)
+    return control
+
+
+def resume_dianxiaomi_queue(db: Session) -> DianxiaomiQueueControl:
+    control = _queue_control(db)
+    control.is_paused = False
+    control.paused_at = None
+    control.paused_reason = None
+    db.commit()
+    db.refresh(control)
+    return control
+
+
+def record_dianxiaomi_heartbeat(
+    db: Session, worker_id: str
+) -> DianxiaomiQueueControl:
+    control = _queue_control(db)
+    now = _now()
+    control.last_heartbeat_at = now
+    control.worker_id = worker_id
+    active = list(
+        db.scalars(
+            select(DianxiaomiHandoff).where(
+                DianxiaomiHandoff.worker_id == worker_id,
+                DianxiaomiHandoff.status.in_(LEASED_HANDOFF_STATUSES),
+            )
+        )
+    )
+    for row in active:
+        row.claimed_at = now
+    db.commit()
+    db.refresh(control)
+    return control
 
 
 def create_handoff_batch(db: Session, product_ids: list[int]) -> tuple[str, list[DianxiaomiHandoff]]:
@@ -82,6 +135,12 @@ def claim_handoff_batch(
     db: Session, worker_id: str, *, limit: int = 20, resume_confirmed: bool = False
 ) -> list[DianxiaomiHandoff]:
     now = _now()
+    control = _queue_control(db)
+    if control.is_paused and not (
+        resume_confirmed and control.paused_reason == "needs_confirmation"
+    ):
+        db.commit()
+        return []
     if resume_confirmed:
         paused = list(
             db.scalars(
@@ -100,6 +159,10 @@ def claim_handoff_batch(
             row.completed_at = None
         if paused:
             db.flush()
+        if control.paused_reason == "needs_confirmation":
+            control.is_paused = False
+            control.paused_at = None
+            control.paused_reason = None
     expired = list(
         db.scalars(
             select(DianxiaomiHandoff).where(
@@ -132,6 +195,8 @@ def claim_handoff_batch(
         row.status = "CLAIMED"
         row.claimed_at = now
         row.worker_id = worker_id
+    control.last_heartbeat_at = now
+    control.worker_id = worker_id
     db.commit()
     for row in rows:
         db.refresh(row)
@@ -153,6 +218,14 @@ def update_handoff(
     row.error_message = error_message
     if worker_id:
         row.worker_id = worker_id
+    if status in LEASED_HANDOFF_STATUSES:
+        row.claimed_at = now
+    if status == "NEEDS_CONFIRMATION":
+        control = _queue_control(db)
+        if not control.is_paused:
+            control.is_paused = True
+            control.paused_at = now
+            control.paused_reason = "needs_confirmation"
     if status == "OPENED":
         row.opened_at = row.opened_at or now
     if status in {"SUCCEEDED", "FAILED", "CANCELED"}:

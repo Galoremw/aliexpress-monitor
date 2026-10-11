@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -91,6 +92,10 @@ class Product(Base):
     __tablename__ = "products"
     __table_args__ = (
         CheckConstraint("status IN ('active', 'inactive')", name="ck_products_status"),
+        CheckConstraint(
+            "business_role IN ('SELF', 'COMPETITOR', 'UNCLASSIFIED')",
+            name="ck_products_business_role",
+        ),
         UniqueConstraint("store_id", "aliexpress_product_id", name="uq_product_store_external"),
         Index("ix_products_store_status", "store_id", "status"),
     )
@@ -101,6 +106,7 @@ class Product(Base):
     url: Mapped[str] = mapped_column(String(2048), unique=True)
     title: Mapped[str | None] = mapped_column(String(1024))
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    business_role: Mapped[str] = mapped_column(String(16), default="UNCLASSIFIED", index=True)
     discovery_source: Mapped[str] = mapped_column(String(32), default="manual")
     discovery_rank: Mapped[int | None] = mapped_column(Integer)
     discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -120,6 +126,80 @@ class Product(Base):
     manual_collection_tasks: Mapped[list[ManualCollectionTask]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
     )
+    reviews: Mapped[list[ProductReview]] = relationship(
+        back_populates="product", cascade="all, delete-orphan"
+    )
+    review_collection_tasks: Mapped[list[ReviewCollectionTask]] = relationship(
+        back_populates="product", cascade="all, delete-orphan"
+    )
+
+
+class ProductReview(Base):
+    __tablename__ = "product_reviews"
+    __table_args__ = (
+        UniqueConstraint("product_id", "identity_hash", name="uq_product_review_identity"),
+        Index("ix_product_reviews_product_date", "product_id", "review_date"),
+        Index("ix_product_reviews_product_seen", "product_id", "first_seen_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    platform_review_id: Mapped[str | None] = mapped_column(String(160))
+    identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    review_text: Mapped[str] = mapped_column(Text, nullable=False)
+    rating: Mapped[Decimal | None] = mapped_column(Numeric(3, 2))
+    review_date: Mapped[date | None] = mapped_column(Date)
+    country_region: Mapped[str | None] = mapped_column(String(128))
+    variant: Mapped[str | None] = mapped_column(String(512))
+    has_media: Mapped[bool | None] = mapped_column(Boolean)
+    verified_purchase: Mapped[bool | None] = mapped_column(Boolean)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    raw_data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    product: Mapped[Product] = relationship(back_populates="reviews")
+
+
+class ReviewCollectionTask(Base):
+    __tablename__ = "review_collection_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'PARTIAL', 'FAILED', 'NEEDS_VERIFICATION')",
+            name="ck_review_collection_tasks_status",
+        ),
+        CheckConstraint("max_new_reviews BETWEEN 1 AND 100", name="ck_review_collection_tasks_limit"),
+        Index("ix_review_collection_tasks_status_created", "status", "created_at"),
+        Index("ix_review_collection_tasks_product_created", "product_id", "created_at"),
+        Index(
+            "uq_review_collection_active_product",
+            "product_id",
+            unique=True,
+            sqlite_where=text("status IN ('PENDING', 'RUNNING', 'NEEDS_VERIFICATION')"),
+            postgresql_where=text("status IN ('PENDING', 'RUNNING', 'NEEDS_VERIFICATION')"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    max_new_reviews: Mapped[int] = mapped_column(Integer, default=100)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    scanned_count: Mapped[int] = mapped_column(Integer, default=0)
+    saved_count: Mapped[int] = mapped_column(Integer, default=0)
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_type: Mapped[str | None] = mapped_column(String(128))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+    product: Mapped[Product] = relationship(back_populates="review_collection_tasks")
 
 
 class StoreSnapshot(Base):
@@ -263,6 +343,27 @@ class ManualCollectionTask(Base):
     last_attempt: Mapped[CollectionAttempt | None] = relationship(foreign_keys=[last_attempt_id])
 
 
+class BrowserCollectionControl(Base):
+    __tablename__ = "browser_collection_controls"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_browser_collection_controls_singleton"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    selected_worker_id: Mapped[str | None] = mapped_column(String(128))
+    selected_worker_label: Mapped[str | None] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class BrowserCollectionWorker(Base):
+    __tablename__ = "browser_collection_workers"
+
+    worker_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    extension_version: Mapped[str | None] = mapped_column(String(64))
+    last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class BrowserCollectionRun(Base):
     __tablename__ = "browser_collection_runs"
     __table_args__ = (
@@ -272,7 +373,7 @@ class BrowserCollectionRun(Base):
             name="ck_browser_collection_runs_trigger",
         ),
         CheckConstraint(
-            "status IN ('PENDING', 'RUNNING', 'NEEDS_VERIFICATION', 'COMPLETED', 'PARTIAL', 'FAILED')",
+            "status IN ('PENDING', 'RUNNING', 'NEEDS_VERIFICATION', 'PAUSED', 'COMPLETED', 'PARTIAL', 'FAILED')",
             name="ck_browser_collection_runs_status",
         ),
         CheckConstraint(
@@ -296,6 +397,9 @@ class BrowserCollectionRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paused_reason: Mapped[str | None] = mapped_column(String(128))
+    dispatch_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
 
     items: Mapped[list[BrowserCollectionItem]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
@@ -335,6 +439,8 @@ class BrowserCollectionItem(Base):
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_worker_id: Mapped[str | None] = mapped_column(String(128))
+    claim_token: Mapped[str | None] = mapped_column(String(128))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_type: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(Text)
@@ -346,6 +452,23 @@ class BrowserCollectionItem(Base):
     store: Mapped[Store | None] = relationship()
     product: Mapped[Product | None] = relationship()
     snapshot: Mapped[ProductSnapshot | None] = relationship()
+
+
+class DianxiaomiQueueControl(Base):
+    __tablename__ = "dianxiaomi_queue_control"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_dianxiaomi_queue_control_singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    is_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paused_reason: Mapped[str | None] = mapped_column(String(32))
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    worker_id: Mapped[str | None] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class DianxiaomiHandoff(Base):

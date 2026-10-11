@@ -1,22 +1,43 @@
 {% extends "base.html" %}
-{% block title %}{{ product.title or product.aliexpress_product_id }} · 商品监控{% endblock %}
+{% block title %}{{ clean_product_title(product.title) or product.aliexpress_product_id }} · 商品监控{% endblock %}
 {% block content %}
 <section class="page-heading compact">
-  <div><p class="eyebrow">PRODUCT {{ product.aliexpress_product_id }}</p><h1>{{ product.title or "未采集商品标题" }}</h1><p><a href="/dashboard/stores/{{ store.id }}">{{ store.name }}</a> · 公开数据快照与估算趋势</p></div>
+  <div><p class="eyebrow">PRODUCT {{ product.aliexpress_product_id }}</p><h1>{{ clean_product_title(product.title) or "未采集商品标题" }}</h1><p><a href="/dashboard/stores/{{ store.id }}">{{ store.name }}</a> · IXSPY 页面可见日增量</p></div>
   <div class="action-group"><a class="button primary" href="{{ product.url }}#monitor_product_id={{ product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品链接</a>{% if product.status == "active" %}<button class="button dianxiaomi-product" type="button" data-product-id="{{ product.id }}">采集到店小秘</button><button class="button danger deactivate-product" type="button" data-product-id="{{ product.id }}">删除监控</button>{% endif %}</div>
 </section>
+<section class="data-section review-product-controls" data-product-id="{{ product.id }}">
+  <div class="section-heading"><h2>评论采集与归属</h2><a href="/reviews/insights">评论洞察</a></div>
+  <div class="review-control-row">
+    <label for="product-business-role">商品归属</label>
+    <select id="product-business-role" data-product-id="{{ product.id }}">
+      <option value="UNCLASSIFIED"{% if product.business_role == "UNCLASSIFIED" %} selected{% endif %}>未分类</option>
+      <option value="SELF"{% if product.business_role == "SELF" %} selected{% endif %}>自有商品</option>
+      <option value="COMPETITOR"{% if product.business_role == "COMPETITOR" %} selected{% endif %}>同行商品</option>
+    </select>
+    {% if product.status == "active" %}<button class="button primary collect-reviews" type="button" data-product-id="{{ product.id }}">采集公开评论</button>{% endif %}
+    <span class="muted-value">已保存 {{ review_count }} 条</span>
+  </div>
+  <p id="review-collection-state" class="review-task-state" data-task-id="{{ review_task.id if review_task else '' }}" data-task-status="{{ review_task.status if review_task else '' }}" aria-live="polite">
+    {% if review_task %}最近任务：{{ review_task.status }}{% if review_task.error_message %} · {{ review_task.error_message }}{% endif %}{% else %}尚未采集评论。任务会在每日销量任务空闲后由专用 Chrome 顺序执行。{% endif %}
+  </p>
+  <div class="review-preview-list">
+    {% for review in reviews %}
+      <article class="review-preview"><div><strong>{{ review.rating if review.rating is not none else "评分未知" }}</strong><time>{{ review.review_date or "日期未知" }}</time></div><p>{{ review.review_text }}</p><small>{{ review.country_region or "地区未知" }}{% if review.verified_purchase %} · 页面明确标记已验证购买{% endif %}</small></article>
+    {% else %}<p class="empty">暂无公开评论数据。</p>{% endfor %}
+  </div>
+</section>
 <section class="trend-band">
-  <div class="section-heading"><h2>日销量估算趋势</h2><span>非真实后台订单量</span></div>
+  <div class="section-heading history-heading"><div><h2>IXSPY 日增量历史</h2><span>只显示图表中直接读取的数值；未读到的日期保持空缺</span></div><div class="history-periods" role="group" aria-label="日增量范围">{% for days in [7, 30, 90, 365] %}<button class="button{% if days == 30 %} primary{% endif %}" type="button" data-history-days="{{ days }}" aria-pressed="{{ 'true' if days == 30 else 'false' }}">{{ "近一年" if days == 365 else "近 " ~ days ~ " 天" }}</button>{% endfor %}</div></div>
   <div class="trend-list">
     {% for metric in metrics|reverse %}
-      <div class="trend-row"><time>{{ metric.metric_date }}</time><div class="bar-track"><span style="width: {{ ((metric.estimated_sales or 0) / max_estimate * 100) if max_estimate else 0 }}%"></span></div><strong>{{ metric.estimated_sales if metric.is_estimable else "不可估算" }}</strong></div>
-    {% else %}<p class="empty">暂无趋势数据。</p>{% endfor %}
+      <div class="trend-row" data-history-date="{{ metric.metric_date.isoformat() }}"><time>{{ metric.metric_date }}</time><div class="bar-track"><span style="width: {{ ((metric.estimated_sales or 0) / max_estimate * 100) if max_estimate else 0 }}%"></span></div><strong>{{ metric.estimated_sales if metric.is_estimable else "不可估算" }}</strong></div>
+    {% else %}<p class="empty">暂无 IXSPY 日增量记录。完成商品页采集后才会写入图表可见数据。</p>{% endfor %}
   </div>
 </section>
 <section class="data-section">
   <div class="section-heading"><h2>原始快照历史</h2><span>只追加，不覆盖</span></div>
-  <div class="table-wrap"><table><thead><tr><th>采集时间</th><th>来源</th><th>状态</th><th>累计 sold</th><th>价格</th><th>评价数</th><th>采集器</th><th>错误</th></tr></thead><tbody>
-  {% for snapshot in snapshots %}<tr><td>{{ (snapshot.captured_at or snapshot.collected_at).strftime("%Y-%m-%d %H:%M") }}</td><td>{{ snapshot.source or "AUTO" }}</td><td><span class="status {{ snapshot.status or snapshot.parse_status }}">{{ snapshot.status or snapshot.parse_status }}</span></td><td>{{ snapshot.sold_count if snapshot.sold_count is not none else snapshot.cumulative_sold if snapshot.cumulative_sold is not none else "—" }}</td><td>{% if snapshot.price is not none %}{{ snapshot.price }} {{ snapshot.price_currency or "" }}{% elif snapshot.price_amount is not none %}{{ snapshot.price_amount }} {{ snapshot.price_currency or "" }}{% else %}—{% endif %}</td><td>{{ snapshot.review_count if snapshot.review_count is not none else "—" }}</td><td>{{ snapshot.collector_name }} {{ snapshot.collector_version }}</td><td>{{ snapshot.error_message or snapshot.error_type or "—" }}</td></tr>
+  <div class="table-wrap"><table><thead><tr><th>采集时间</th><th>来源</th><th>状态</th><th>价格</th><th>评价数</th><th>IXSPY 日增量覆盖</th><th>采集器</th><th>错误</th></tr></thead><tbody>
+  {% for snapshot in snapshots %}{% set raw_data = snapshot.raw_data if snapshot.raw_data is mapping else {} %}{% set points = raw_data.get("historical_sales", []) %}<tr><td>{{ (snapshot.captured_at or snapshot.collected_at).strftime("%Y-%m-%d %H:%M") }}</td><td>{{ snapshot.source or "AUTO" }}</td><td><span class="status {{ snapshot.status or snapshot.parse_status }}">{{ snapshot.status or snapshot.parse_status }}</span></td><td>{% if snapshot.price is not none %}{{ snapshot.price }} {{ snapshot.price_currency or "" }}{% elif snapshot.price_amount is not none %}{{ snapshot.price_amount }} {{ snapshot.price_currency or "" }}{% else %}—{% endif %}</td><td>{{ snapshot.review_count if snapshot.review_count is not none else "—" }}</td><td>{% set daily_points = points|selectattr("value_type", "equalto", "daily_increment")|list if points is iterable else [] %}{% if daily_points %}{{ daily_points|length }} 个直接日增量{% else %}无 IXSPY 日增量{% endif %}</td><td>{{ snapshot.collector_name }} {{ snapshot.collector_version }}</td><td>{{ snapshot.error_message or snapshot.error_type or "—" }}</td></tr>
   {% else %}<tr><td colspan="8" class="empty">尚未采集快照。</td></tr>{% endfor %}
   </tbody></table></div>
 </section>

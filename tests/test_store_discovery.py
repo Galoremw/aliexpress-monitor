@@ -54,12 +54,16 @@ def create_store(client):
 
 def test_parses_and_ranks_public_store_product_links():
     html = "<html>" + "".join(
-        f'<a href="/item/{100500800000 + index}.html" title="Item {index}">{index}K sold</a>'
+        f'<a href="/item/{100500800000 + index}.html" title="Item {index}"><img src="//ae01.alicdn.com/kf/{index}.jpg">{index}K sold</a>'
         for index in range(1, 4)
     ) + "</html>"
     parsed, _ = parse_store_products(html, "https://www.aliexpress.com/store/990001")
-    assert [item.public_cumulative_sold for item in parsed] == [3000, 2000, 1000]
-    assert parsed[0].url == "https://www.aliexpress.com/item/100500800003.html"
+    assert [item.product_id for item in parsed] == [
+        "100500800001", "100500800002", "100500800003"
+    ]
+    assert all(item.public_cumulative_sold is None for item in parsed)
+    assert parsed[-1].url == "https://www.aliexpress.com/item/100500800003.html"
+    assert parsed[-1].image_url == "https://ae01.alicdn.com/kf/3.jpg"
 
 
 def test_http_store_collector_saves_failure_context():
@@ -94,7 +98,8 @@ def test_firecrawl_api_adapter_parses_rendered_links(monkeypatch):
 
     assert result.parse_status == "success"
     assert result.candidates[0].product_id == "100500812345"
-    assert result.candidates[0].public_cumulative_sold == 42
+    assert result.candidates[0].public_cumulative_sold is None
+    assert result.candidates[0].title is None
     assert result.raw_payload["metadata"]["cacheState"] == "miss"
     get_settings.cache_clear()
 
@@ -137,6 +142,8 @@ def test_firecrawl_cli_invokes_node_and_preserves_query_string(monkeypatch, tmp_
 
 
 def test_firecrawl_cli_empty_output_is_a_failed_result(monkeypatch):
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    get_settings.cache_clear()
     collector = FirecrawlStoreDiscoveryCollector()
     monkeypatch.setattr(collector, "_cli_command", "firecrawl")
     monkeypatch.setattr(
@@ -149,6 +156,7 @@ def test_firecrawl_cli_empty_output_is_a_failed_result(monkeypatch):
     assert result.parse_status == "failed"
     assert result.error_type == "firecrawl_error"
     assert result.error_message == "Firecrawl CLI returned no JSON output"
+    get_settings.cache_clear()
 
 
 def test_fallback_uses_firecrawl_only_after_http_finds_no_products():
@@ -268,7 +276,7 @@ def test_store_discovery_refreshes_auto_pool_and_keeps_snapshot_history(client, 
     assert len(db_session.query(ProductSnapshot).filter_by(source="AUTO").all()) == 60
 
 
-def test_yesterday_top_products_returns_only_best_twenty(client, db_session):
+def test_yesterday_top_products_hides_legacy_cumulative_estimates(client, db_session):
     store = create_store(client)
     for index, candidate in enumerate(candidates(), start=1):
         product = Product(
@@ -298,11 +306,9 @@ def test_yesterday_top_products_returns_only_best_twenty(client, db_session):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "ready"
-    assert len(body["products"]) == 20
-    assert body["products"][0]["estimated_sales"] == 25
-    assert body["products"][-1]["estimated_sales"] == 6
-    assert body["estimate_type"] == "estimated"
+    assert body["status"] == "awaiting_daily_baseline"
+    assert body["products"] == []
+    assert db_session.query(ProductDailyMetric).count() == 25
 
 
 def test_top_products_waits_for_daily_baseline(client):

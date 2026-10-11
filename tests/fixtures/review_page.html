@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <body>
+    <main>
+      <h2>Customer reviews</h2>
+      <article class="review-item" data-review-id="public-review-001">
+        <div class="review-author">reviewer-name-must-not-be-captured</div>
+        <span class="review-rating" aria-label="5 out of 5 stars"></span>
+        <time datetime="2026-09-20">2026-09-20</time>
+        <span class="review-country">Canada</span>
+        <div class="review-content">The quality is excellent and setup was easy.</div>
+        <span class="verified-purchase">Verified Purchase</span>
+      </article>
+      <article class="review-item">
+        <div class="review-author">another-private-name</div>
+        <span class="review-rating" aria-label="3 stars"></span>
+        <div class="review-content">Battery capacity is lower than I expected.</div>
+      </article>
+    </main>
+    <script src="../../extension/page_collector.js"></script>
+    <script>
+      window.addEventListener("load", async () => {
+        const captured = await window.AliExpressMonitorPageCollector.collectReviews([], 100, 6000);
+        document.body.setAttribute("data-review-capture", JSON.stringify(captured));
+        document.querySelectorAll(".review-author").forEach((node) => node.remove());
+      });
+    </script>
+  </body>
+</html>

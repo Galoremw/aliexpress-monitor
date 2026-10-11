@@ -1,3 +1,6 @@
+from app.db.models import Product
+
+
 def create_store(client, **overrides):
     payload = {
         "name": "Peer Store",
@@ -70,6 +73,30 @@ def test_product_crud_by_url_and_id(client):
     deactivated = client.post(f"/api/products/{created.json()['id']}/deactivate")
     assert deactivated.json()["status"] == "inactive"
     assert len(client.get(f"/api/products?store_id={store_id}").json()) == 2
+
+
+def test_product_titles_drop_public_sales_and_price_suffixes_before_storage(client, db_session):
+    store_id = create_store(client).json()["id"]
+    created = client.post(
+        "/api/products",
+        json={
+            "store_id": store_id,
+            "aliexpress_product_id": "100500123999",
+            "title": "Desk Organizer 1,200 sold HK$ 52.32 New shoppers save HK$20",
+        },
+    )
+
+    assert created.status_code == 201
+    product_id = created.json()["id"]
+    assert created.json()["title"] == "Desk Organizer"
+    assert db_session.get(Product, product_id).title == "Desk Organizer"
+
+    updated = client.patch(
+        f"/api/products/{product_id}", json={"title": "Desk Organizer € 4.25"}
+    )
+    assert updated.status_code == 200
+    assert updated.json()["title"] == "Desk Organizer"
+    assert db_session.get(Product, product_id).title == "Desk Organizer"
 
 
 def test_rejects_duplicate_and_mismatched_product(client):

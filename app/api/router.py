@@ -4,21 +4,25 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.api.schemas import (
     BrowserCollectionChallengeRequest,
+    BrowserCollectionClaimRequest,
     BrowserCollectionClaimRead,
+    BrowserCollectionControlRead,
     BrowserCollectionFailureRequest,
     BrowserCollectionHeartbeatRequest,
     BrowserCollectionRunEnsureRequest,
     BrowserCollectionRunRead,
+    BrowserCollectionWorkerSelectRequest,
     BrowserExtensionCollectionRequest,
     DianxiaomiHandoffBatchRead,
     DianxiaomiHandoffClaimRequest,
     DianxiaomiHandoffCreate,
     DianxiaomiHandoffRead,
     DianxiaomiHandoffStatusRequest,
+    DianxiaomiQueueHeartbeatRequest,
     BrowserStoreDiscoveryRead,
     BrowserStoreDiscoveryRequest,
     CollectionAttemptRead,
@@ -57,6 +61,7 @@ from app.db.models import (
     BrowserCollectionRun,
     CollectionAttempt,
     DianxiaomiHandoff,
+    DianxiaomiQueueControl,
     ManualCollectionTask,
     Product,
     ProductDailyMetric,
@@ -70,26 +75,44 @@ from app.services.snapshots import collect_product_snapshot
 from app.services.snapshots import save_external_snapshot, save_store_product_snapshot
 from app.services.collection_runs import run_collection_cycle
 from app.services.metrics import calculate_product_daily_metrics, calculate_store_daily_metric
-from app.services.historical_metrics import import_historical_sales
+from app.services.historical_metrics import (
+    import_historical_sales,
+    looks_cumulative_like_daily_values,
+)
+from app.services.monitored_store_collection import save_monitored_store_observation
+from app.services.product_presentation import clean_product_title
 from app.services.store_discovery import discover_store_products, store_top_products
 from app.services.collection_progress import build_collection_progress, manual_completed_product_ids
 from app.services.browser_collection import (
+    browser_collection_control_status,
+    cancel_run,
     claim_next_item,
     ensure_browser_collection_run,
     fail_item,
     finish_item,
     get_today_run,
     pause_for_challenge,
+    pause_run,
+    queue_all_store_collections,
+    queue_single_product_collection,
+    queue_store_collection,
     record_heartbeat,
     resume_run,
+    retry_item,
+    select_browser_collection_worker,
     serialize_item,
     serialize_run,
+    start_browser_collection_run,
+    validate_browser_collection_claim,
 )
 from app.services.dianxiaomi import (
     ACTIVE_HANDOFF_STATUSES,
     claim_handoff_batch,
     claim_next_handoff,
     create_handoff_batch,
+    pause_dianxiaomi_queue,
+    record_dianxiaomi_heartbeat,
+    resume_dianxiaomi_queue,
     serialize_handoff,
     update_handoff,
 )
@@ -155,38 +178,73 @@ def _save_channel_observation(
     *,
     commit: bool = True,
     expected_product: Product | None = None,
+    daily_target_date: date | None = None,
 ) -> ProductSnapshot:
     product = expected_product or _find_extension_product(db, payload)
-    captured_at = payload.captured_at or datetime.now(ZoneInfo(get_settings().timezone))
-    parse_status = "success" if payload.sold_count is not None else "partial"
+    local_timezone = ZoneInfo(get_settings().timezone)
+    captured_at = payload.captured_at or datetime.now(timezone.utc)
+    if captured_at.tzinfo is None:
+        captured_at = captured_at.replace(tzinfo=local_timezone)
+    captured_at = captured_at.astimezone(timezone.utc)
+    target_date = daily_target_date
+    if target_date is None:
+        raw_target = payload.raw_data.get("history_target_date")
+        try:
+            target_date = date.fromisoformat(str(raw_target)) if raw_target else captured_at.astimezone(local_timezone).date()
+        except ValueError:
+            target_date = captured_at.astimezone(local_timezone).date()
+    expected_dates = {target_date - timedelta(days=offset) for offset in range(1, 8)}
+    daily_points_by_date = {
+        point.date: point
+        for point in payload.historical_sales
+        if point.value_type == "daily_increment" and point.date in expected_dates
+    }
+    daily_points = [daily_points_by_date[value] for value in sorted(daily_points_by_date)]
+    daily_capture_complete = set(daily_points_by_date) == expected_dates
     raw_data = dict(payload.raw_data)
-    if payload.historical_sales:
-        raw_data["historical_sales"] = [
-            point.model_dump(mode="json") for point in payload.historical_sales
-        ]
+    for key in (
+        "sales_collection_source",
+        "sales_count_type",
+        "sales_count_captured",
+        "sales_count_source_text",
+        "sales_count_approximate",
+        "visible_text_excerpt",
+        "public_cumulative_sold",
+    ):
+        raw_data.pop(key, None)
+    raw_data["historical_sales"] = [point.model_dump(mode="json") for point in daily_points]
+    raw_data["history_daily_capture_complete"] = daily_capture_complete
+    raw_data["history_sampling_strategy"] = "latest_7_daily_increments_only"
     result = CollectorResult(
         collected_at=captured_at,
         collector_name=source.lower(),
         collector_version=str(payload.raw_data.get("extractor_version", "1.0")),
-        parse_status=parse_status,
-        cumulative_sold=payload.sold_count,
+        parse_status="success" if daily_capture_complete else "partial",
+        cumulative_sold=None,
         price_amount=payload.price,
         price_currency=None,
         review_count=payload.review_count,
-        title=payload.title,
+        title=clean_product_title(payload.title),
         source_http_status=200,
         raw_payload=raw_data,
         raw_content=None,
-        error_type=None if payload.sold_count is not None else "missing_sold_count",
-        error_message=None if payload.sold_count is not None else "公开页面未提供累计销量",
+        error_type=None if daily_capture_complete else "missing_ixspy_daily_increment",
+        error_message=None
+        if daily_capture_complete
+        else f"IXSPY 最近 7 日仅读取到 {len(daily_points)}/7 天日增量",
     )
     snapshot = save_external_snapshot(db, product, result, source, commit=False)
-    imported_dates = import_historical_sales(
-        db,
-        product.id,
-        snapshot.id,
-        payload.historical_sales,
-        commit=False,
+    imported_dates = (
+        import_historical_sales(
+            db,
+            product.id,
+            snapshot.id,
+            daily_points,
+            target_date=daily_target_date,
+            commit=False,
+        )
+        if payload.historical_sales
+        else set()
     )
     metrics = calculate_product_daily_metrics(
         db,
@@ -195,8 +253,7 @@ def _save_channel_observation(
         commit=False,
     )
     metric_dates = set(imported_dates)
-    if metrics:
-        metric_dates.add(metrics[-1].metric_date)
+    metric_dates.update(metric.metric_date for metric in metrics)
     for metric_date in metric_dates:
         calculate_store_daily_metric(
             db, product.store_id, metric_date, commit=False
@@ -212,17 +269,119 @@ def _save_store_observation(
     payload: BrowserStoreDiscoveryRequest,
     *,
     commit: bool = True,
+    expected_store_id: int | None = None,
+    target_date: date | None = None,
 ) -> dict:
-    store = db.scalar(
-        select(Store).where(Store.aliexpress_store_id == payload.platform_store_id)
-    )
+    normalized_store_url = normalize_aliexpress_url(payload.url, "store")
+    url_store_id = extract_store_id(normalized_store_url)
+    candidate_ids = {payload.platform_store_id}
+    if url_store_id:
+        candidate_ids.add(url_store_id)
+
+    if expected_store_id is not None:
+        store = db.get(Store, expected_store_id)
+        if (
+            store is not None
+            and url_store_id
+            and store.aliexpress_store_id
+            and url_store_id != store.aliexpress_store_id
+        ):
+            raise HTTPException(status_code=409, detail="当前页面明确指向其他 AliExpress 店铺")
+    else:
+        matches = list(
+            db.scalars(
+                select(Store).where(Store.aliexpress_store_id.in_(candidate_ids))
+            )
+        )
+        if len(matches) > 1:
+            raise HTTPException(status_code=409, detail="店铺页面 ID 与采集 ID 不一致")
+        store = matches[0] if matches else None
     if store is None:
         raise HTTPException(status_code=404, detail="该店铺尚未加入监控")
     if store.status != "active":
         raise HTTPException(status_code=409, detail="该店铺监控已停用")
+    if expected_store_id is None and store.aliexpress_store_id not in candidate_ids:
+        raise HTTPException(status_code=409, detail="当前店铺页与采集任务的监控店铺不一致")
 
-    captured_at = datetime.now(ZoneInfo(get_settings().timezone))
-    normalized_store_url = normalize_aliexpress_url(payload.url, "store")
+    ranked_selection = payload.raw_data.get("collection_mode") == "top_7d_increment_selection"
+    if ranked_selection:
+        try:
+            candidate_count = max(0, int(payload.raw_data.get("unique_candidate_count") or 0))
+        except (TypeError, ValueError):
+            candidate_count = 0
+        expected_pool_size = min(20, candidate_count)
+        selected_ids = [item.platform_product_id for item in payload.products]
+        if (
+            candidate_count == 0
+            or len(set(selected_ids)) != len(selected_ids)
+            or len(selected_ids) != expected_pool_size
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"店铺监控池应有 {expected_pool_size} 件商品，本次提交 {len(selected_ids)} 件；未修改现有监控池",
+            )
+        complete_history_count = 0
+        for candidate in payload.products:
+            expected_dates = candidate.history_expected_dates
+            points = candidate.historical_sales
+            point_dates = [point.date for point in points]
+            if looks_cumulative_like_daily_values(
+                [point.value for point in sorted(points, key=lambda point: point.date)]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="七日增量曲线疑似累计销量，未修改监控池；请核对 IXSPY 增量图表",
+                )
+            complete = (
+                candidate.history_daily_capture_complete
+                and candidate.history_source == "ixspy_visible_daily_increment"
+                and not candidate.history_missing_dates
+                and len(expected_dates) == 7
+                and len(set(expected_dates)) == 7
+                and all(
+                    expected_dates[index] - expected_dates[index - 1] == timedelta(days=1)
+                    for index in range(1, len(expected_dates))
+                )
+                and len(points) == 7
+                and len(set(point_dates)) == 7
+                and set(point_dates) == set(expected_dates)
+                and all(point.value_type == "daily_increment" for point in points)
+            )
+            complete_history_count += int(complete)
+        if complete_history_count != expected_pool_size:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"七日增量筛选要求提交的 {expected_pool_size} 件商品均有完整 IXSPY 七日数据；"
+                    f"当前 {complete_history_count} 件完整，未修改现有监控池"
+                ),
+            )
+        for candidate in payload.products:
+            normalized_product_url = normalize_aliexpress_url(candidate.url, "product")
+            if extract_product_id(normalized_product_url) != candidate.platform_product_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="七日增量筛选中商品 ID 与链接不一致，未修改监控池",
+                )
+            existing_product_id = db.scalar(
+                select(Product.id).where(
+                    Product.store_id == store.id,
+                    Product.aliexpress_product_id == candidate.platform_product_id,
+                )
+            )
+            conflicting_product_id = db.scalar(
+                select(Product.id).where(Product.url == normalized_product_url)
+            )
+            if conflicting_product_id is not None and conflicting_product_id != existing_product_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="七日增量筛选包含已归属其他店铺的商品链接，未修改监控池",
+                )
+
+    captured_at = datetime.now(timezone.utc)
+    history_target_date = target_date or captured_at.astimezone(
+        ZoneInfo(get_settings().timezone)
+    ).date()
     links: list[str] = []
     added_count = 0
     existing_count = 0
@@ -242,12 +401,12 @@ def _save_store_observation(
             )
         )
         if product is not None:
-            if product.discovery_source in ("store_page", "chrome_extension_store"):
+            if ranked_selection or product.discovery_source in ("store_page", "chrome_extension_store"):
                 product.status = "active"
             product.discovery_rank = rank
             product.discovered_at = captured_at
             if candidate.title and not product.title:
-                product.title = candidate.title
+                product.title = clean_product_title(candidate.title)
             observed_products.append((product, candidate, rank))
             existing_count += 1
             continue
@@ -259,7 +418,7 @@ def _save_store_observation(
             store_id=store.id,
             aliexpress_product_id=candidate.platform_product_id,
             url=normalized_url,
-            title=candidate.title,
+            title=clean_product_title(candidate.title),
             discovery_source="chrome_extension_store",
             discovery_rank=rank,
             discovered_at=captured_at,
@@ -271,21 +430,18 @@ def _save_store_observation(
 
     current_ids = {extract_product_id(link) for link in links}
     if current_ids:
-        pool_products = list(
-            db.scalars(
-                select(Product).where(
-                    Product.store_id == store.id,
-                    Product.discovery_source.in_(("store_page", "chrome_extension_store")),
-                    Product.status == "active",
-                )
+        pool_query = select(Product).where(Product.store_id == store.id, Product.status == "active")
+        if not ranked_selection:
+            pool_query = pool_query.where(
+                Product.discovery_source.in_(("store_page", "chrome_extension_store"))
             )
-        )
+        pool_products = list(db.scalars(pool_query))
         for product in pool_products:
             if product.aliexpress_product_id not in current_ids:
                 product.status = "inactive"
                 deactivated_count += 1
 
-    snapshot = StoreSnapshot(
+    store_snapshot = StoreSnapshot(
         store_id=store.id,
         collected_at=captured_at,
         collector_name="chrome_extension_store",
@@ -295,37 +451,61 @@ def _save_store_observation(
         source_http_status=200,
         raw_payload={
             "store_url": normalized_store_url,
-            "products": [item.model_dump() for item in payload.products],
+            "submitted_platform_store_id": payload.platform_store_id,
+            "resolved_platform_store_id": store.aliexpress_store_id,
+            "store_id_resolution": (
+                "task" if expected_store_id is not None
+                else "platform_id" if payload.platform_store_id == store.aliexpress_store_id
+                else "page_url"
+            ),
+            "products": [
+                item.model_dump(mode="json", exclude={"public_cumulative_sold"})
+                for item in payload.products
+            ],
             "raw_data": payload.raw_data,
         },
         error_type=None if links else "no_valid_product_links",
         error_message=None if links else "没有读取到有效商品链接",
     )
-    db.add(snapshot)
+    db.add(store_snapshot)
     db.flush()
     metric_date = captured_at.astimezone(ZoneInfo(get_settings().timezone)).date()
+    metric_dates = {metric_date}
     for product, candidate, rank in observed_products:
-        save_store_product_snapshot(
+        product_url = normalize_aliexpress_url(candidate.url, "product")
+        product_snapshot = save_store_product_snapshot(
             db,
             product,
             captured_at=captured_at,
-            sold_count=candidate.public_cumulative_sold,
+            sold_count=None,
             title=candidate.title,
             source="CHROME_EXTENSION",
             collector_name="chrome_extension_store",
             collector_version=str(payload.raw_data.get("extractor_version", "1.0")),
             raw_payload={
                 "collection_mode": "store_page",
-                "store_snapshot_id": snapshot.id,
+                "store_snapshot_id": store_snapshot.id,
                 "rank": rank,
                 "product_id": candidate.platform_product_id,
-                "url": normalized_url,
+                "url": product_url,
                 "title": candidate.title,
-                "public_cumulative_sold": candidate.public_cumulative_sold,
+                "main_image_url": candidate.image_url,
                 "extension_raw_data": payload.raw_data,
             },
+            historical_sales=candidate.historical_sales,
+            history_target_date=history_target_date,
+            history_source=candidate.history_source,
             commit=False,
         )
+        imported_dates = import_historical_sales(
+            db,
+            product.id,
+            product_snapshot.id,
+            candidate.historical_sales,
+            target_date=history_target_date,
+            commit=False,
+        ) if candidate.history_source == "ixspy_visible_daily_increment" else set()
+        metric_dates.update(imported_dates)
         calculate_product_daily_metrics(
             db,
             product.id,
@@ -333,7 +513,8 @@ def _save_store_observation(
             commit=False,
         )
     if observed_products:
-        calculate_store_daily_metric(db, store.id, metric_date, commit=False)
+        for observed_date in metric_dates:
+            calculate_store_daily_metric(db, store.id, observed_date, commit=False)
     if commit:
         db.commit()
     else:
@@ -372,6 +553,50 @@ def create_store(payload: StoreCreate, db: Session = Depends(get_db)) -> Store:
     commit_or_conflict(db, "Store URL or AliExpress store ID already exists")
     db.refresh(store)
     return store
+
+
+@router.post("/stores/{store_id}/browser-collection")
+def start_store_browser_collection(
+    store_id: int, db: Session = Depends(get_db)
+) -> dict:
+    store = db.get(Store, store_id)
+    if store is None:
+        raise HTTPException(status_code=404, detail="Store not found")
+    if store.status != "active":
+        raise HTTPException(status_code=409, detail="该店铺监控已停用")
+    try:
+        run, queued_count, reused_count, discovery_queued = queue_store_collection(db, store)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "run": serialize_run(run),
+        "queued_count": queued_count,
+        "reused_count": reused_count,
+        "discovery_queued": discovery_queued,
+    }
+
+
+@router.post("/products/{product_id}/browser-collection")
+def start_product_browser_collection(
+    product_id: int, db: Session = Depends(get_db)
+) -> dict:
+    product = db.get(Product, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if product.status != "active":
+        raise HTTPException(status_code=409, detail="该商品监控已停用")
+    store = db.get(Store, product.store_id)
+    if store is None or store.status != "active":
+        raise HTTPException(status_code=409, detail="所属店铺监控已停用")
+    try:
+        run, item, queued = queue_single_product_collection(db, product)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "run": serialize_run(run),
+        "item": serialize_item(item),
+        "queued": queued,
+    }
 
 
 @router.get("/stores", response_model=list[StoreRead])
@@ -414,6 +639,8 @@ def discover_store_from_browser_extension(
     payload: BrowserStoreDiscoveryRequest,
     db: Session = Depends(get_db),
 ) -> dict:
+    if not payload.products:
+        raise HTTPException(status_code=409, detail="店铺商品发现结果不能为空")
     return _save_store_observation(db, payload)
 
 
@@ -522,40 +749,131 @@ def list_dianxiaomi_handoffs(
 
 @router.get("/integrations/dianxiaomi/status")
 def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
+    control = db.get(DianxiaomiQueueControl, 1)
+    if control is None:
+        control = DianxiaomiQueueControl(id=1)
+        db.add(control)
+        db.commit()
+        db.refresh(control)
+    status_counts = dict(
+        db.execute(
+            select(DianxiaomiHandoff.status, func.count(DianxiaomiHandoff.id))
+            .group_by(DianxiaomiHandoff.status)
+        ).all()
+    )
     rows = list(
         db.scalars(
             select(DianxiaomiHandoff)
+            .options(
+                joinedload(DianxiaomiHandoff.product),
+                joinedload(DianxiaomiHandoff.store),
+            )
             .order_by(DianxiaomiHandoff.requested_at.desc(), DianxiaomiHandoff.id.desc())
-            .limit(500)
+            .limit(100)
         )
     )
-    counts = {
-        "queued": 0,
-        "processing": 0,
-        "submitted": 0,
-        "succeeded": 0,
-        "failed": 0,
-        "needs_confirmation": 0,
+    latest_active = db.scalar(
+        select(DianxiaomiHandoff)
+        .where(
+            DianxiaomiHandoff.status.in_(
+                ACTIVE_HANDOFF_STATUSES - {"QUEUED"}
+            )
+        )
+        .order_by(DianxiaomiHandoff.requested_at, DianxiaomiHandoff.id)
+        .limit(1)
+    )
+    heartbeat_at = control.last_heartbeat_at
+    if heartbeat_at and heartbeat_at.tzinfo is None:
+        heartbeat_at = heartbeat_at.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    def count_for(status_value: str) -> int:
+        return int(status_counts.get(status_value, 0))
+
+    processing_count = sum(count_for(value) for value in ("CLAIMED", "OPENED", "FILLED"))
+    queued_count = count_for("QUEUED")
+    succeeded_count = count_for("SUCCEEDED")
+    failed_count = count_for("FAILED")
+    needs_confirmation_count = count_for("NEEDS_CONFIRMATION")
+    completed_count = succeeded_count + failed_count + count_for("CANCELED")
+    stale_cutoff = now - timedelta(minutes=10)
+    stalled_count = 0
+    if latest_active is not None:
+        active_rows = list(
+            db.scalars(
+                select(DianxiaomiHandoff).where(
+                    DianxiaomiHandoff.status.in_(ACTIVE_HANDOFF_STATUSES - {"QUEUED", "NEEDS_CONFIRMATION"}),
+                    DianxiaomiHandoff.claimed_at.is_not(None),
+                )
+            )
+        )
+        stalled_count = sum(
+            (row.claimed_at.replace(tzinfo=timezone.utc) if row.claimed_at.tzinfo is None else row.claimed_at) < stale_cutoff
+            for row in active_rows
+        )
+    total_count = sum(status_counts.values())
+    legacy_counts = {
+        "queued": queued_count,
+        "processing": processing_count + count_for("COLLECTING"),
+        "submitted": count_for("COLLECTING"),
+        "succeeded": succeeded_count,
+        "failed": failed_count,
+        "needs_confirmation": needs_confirmation_count,
     }
-    for row in rows:
-        if row.status == "QUEUED":
-            counts["queued"] += 1
-        elif row.status == "COLLECTING":
-            counts["submitted"] += 1
-            counts["processing"] += 1
-        elif row.status in {"CLAIMED", "OPENED", "FILLED"}:
-            counts["processing"] += 1
-        elif row.status == "SUCCEEDED":
-            counts["succeeded"] += 1
-        elif row.status == "FAILED":
-            counts["failed"] += 1
-        elif row.status == "NEEDS_CONFIRMATION":
-            counts["needs_confirmation"] += 1
     return {
-        **counts,
+        **legacy_counts,
+        "paused": control.is_paused,
+        "paused_at": control.paused_at,
+        "paused_reason": control.paused_reason,
+        "worker_id": control.worker_id,
+        "last_heartbeat_at": control.last_heartbeat_at,
+        "worker_online": bool(heartbeat_at and now - heartbeat_at <= timedelta(minutes=2)),
+        "total_count": total_count,
+        "queued_count": queued_count,
+        "processing_count": processing_count,
+        "submitted_count": count_for("COLLECTING"),
+        "completed_count": completed_count,
+        "succeeded_count": succeeded_count,
+        "failed_count": failed_count,
+        "needs_confirmation_count": needs_confirmation_count,
+        "stalled_count": stalled_count,
+        "current_item": serialize_handoff(latest_active) if latest_active else None,
         "latest_at": rows[0].requested_at if rows else None,
-        "items": [serialize_handoff(row) for row in rows[:50]],
+        "items": [serialize_handoff(row) for row in rows],
         "latest": [serialize_handoff(row) for row in rows[:10]],
+    }
+
+
+@router.post("/integrations/dianxiaomi/queue/pause")
+def pause_dianxiaomi_handoff_queue(db: Session = Depends(get_db)) -> dict:
+    control = pause_dianxiaomi_queue(db, "manual_pause")
+    return {
+        "paused": control.is_paused,
+        "paused_at": control.paused_at,
+        "paused_reason": control.paused_reason,
+    }
+
+
+@router.post("/integrations/dianxiaomi/queue/resume")
+def resume_dianxiaomi_handoff_queue(db: Session = Depends(get_db)) -> dict:
+    control = resume_dianxiaomi_queue(db)
+    return {
+        "paused": control.is_paused,
+        "paused_at": control.paused_at,
+        "paused_reason": control.paused_reason,
+    }
+
+
+@router.post("/integrations/dianxiaomi/queue/heartbeat")
+def dianxiaomi_worker_heartbeat(
+    payload: DianxiaomiQueueHeartbeatRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    control = record_dianxiaomi_heartbeat(db, payload.worker_id)
+    return {
+        "paused": control.is_paused,
+        "paused_reason": control.paused_reason,
+        "last_heartbeat_at": control.last_heartbeat_at,
+        "worker_id": control.worker_id,
     }
 
 
@@ -597,12 +915,16 @@ def claim_dianxiaomi_handoff(
     payload: DianxiaomiHandoffClaimRequest,
     db: Session = Depends(get_db),
 ) -> dict:
+    control = db.get(DianxiaomiQueueControl, 1)
+    if control and control.is_paused:
+        raise HTTPException(status_code=409, detail="店小秘采集队列已暂停")
     row = _handoff_or_404(db, handoff_id)
     if row.status != "QUEUED":
         raise HTTPException(status_code=409, detail="该店小秘任务已被领取或已完成")
     row.status = "CLAIMED"
     row.claimed_at = datetime.now(timezone.utc)
     row.worker_id = payload.worker_id
+    record_dianxiaomi_heartbeat(db, payload.worker_id)
     db.commit()
     db.refresh(row)
     return serialize_handoff(row)
@@ -729,6 +1051,54 @@ def _browser_collection_item(
     return item
 
 
+def _claimed_browser_collection_item(
+    db: Session,
+    item_id: int,
+    payload: BrowserExtensionCollectionRequest | BrowserStoreDiscoveryRequest
+    | BrowserCollectionFailureRequest | BrowserCollectionChallengeRequest,
+    target_type: str | None = None,
+) -> BrowserCollectionItem:
+    item = _browser_collection_item(db, item_id, target_type)
+    try:
+        return validate_browser_collection_claim(
+            db, item.id, payload.worker_id, payload.claim_token
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get(
+    "/browser-collection/control",
+    response_model=BrowserCollectionControlRead,
+)
+def browser_collection_control(db: Session = Depends(get_db)) -> dict:
+    return browser_collection_control_status(db)
+
+
+@router.post("/browser-collection/control/worker", response_model=BrowserCollectionControlRead)
+def browser_collection_select_worker(
+    payload: BrowserCollectionWorkerSelectRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return select_browser_collection_worker(
+            db, payload.worker_id, confirm_handoff=payload.confirm_handoff
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/browser-collection/runs/start-today",
+    response_model=BrowserCollectionRunRead,
+)
+def browser_collection_start_today(db: Session = Depends(get_db)) -> dict:
+    try:
+        return serialize_run(start_browser_collection_run(db))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @router.get(
     "/browser-collection/runs/today",
     response_model=BrowserCollectionRunRead | None,
@@ -751,15 +1121,33 @@ def browser_collection_ensure(
     )
 
 
+@router.post("/browser-collection/runs/collect-all")
+def browser_collection_collect_all(db: Session = Depends(get_db)) -> dict:
+    try:
+        run, queued_count, reused_count, active_store_count = queue_all_store_collections(db)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "run": serialize_run(run),
+        "queued_count": queued_count,
+        "reused_count": reused_count,
+        "active_store_count": active_store_count,
+    }
+
+
 @router.post(
     "/browser-collection/items/claim",
     response_model=BrowserCollectionClaimRead,
 )
-def browser_collection_claim(db: Session = Depends(get_db)) -> dict:
-    run, item = claim_next_item(db)
+def browser_collection_claim(
+    payload: BrowserCollectionClaimRequest | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    run, item = claim_next_item(db, payload.worker_id if payload else None)
     return {
         "run": serialize_run(run),
-        "item": serialize_item(item) if item else None,
+        "item": serialize_item(item, include_targets=True) if item else None,
+        "claim_token": item.claim_token if item else None,
     }
 
 
@@ -772,7 +1160,7 @@ def browser_collection_product_snapshot(
     payload: BrowserExtensionCollectionRequest,
     db: Session = Depends(get_db),
 ) -> dict:
-    item = _browser_collection_item(db, item_id, "PRODUCT")
+    item = _claimed_browser_collection_item(db, item_id, payload, "PRODUCT")
     product = item.product
     if product is None:
         raise HTTPException(status_code=409, detail="Browser product task has no product")
@@ -783,6 +1171,7 @@ def browser_collection_product_snapshot(
                 "collection_mode": "scheduled",
                 "browser_collection_item_id": item.id,
                 "monitored_product_id": product.aliexpress_product_id,
+                "history_target_date": item.run.target_date.isoformat(),
             }
         }
     )
@@ -792,14 +1181,17 @@ def browser_collection_product_snapshot(
         "CHROME_EXTENSION",
         commit=False,
         expected_product=product,
+        daily_target_date=item.run.target_date,
     )
     if snapshot.product_id != item.product_id:
         db.rollback()
         raise HTTPException(status_code=409, detail="Snapshot product does not match task")
+    raw_snapshot = snapshot.raw_data if isinstance(snapshot.raw_data, dict) else {}
+    daily_capture_complete = raw_snapshot.get("history_daily_capture_complete") is True
     run = finish_item(
         db,
         item,
-        "SUCCEEDED" if snapshot.status == "VALID" else "PARTIAL",
+        "SUCCEEDED" if snapshot.status == "VALID" and daily_capture_complete else "PARTIAL",
         snapshot_id=snapshot.id,
         error_type=snapshot.error_type,
         error_message=snapshot.error_message,
@@ -819,23 +1211,21 @@ def browser_collection_store_discovery(
     payload: BrowserStoreDiscoveryRequest,
     db: Session = Depends(get_db),
 ) -> dict:
-    item = _browser_collection_item(db, item_id, "STORE")
-    result = _save_store_observation(db, payload, commit=False)
-    if result["store_id"] != item.store_id:
+    item = _claimed_browser_collection_item(db, item_id, payload, "STORE")
+    try:
+        snapshot, complete, diagnostics = save_monitored_store_observation(db, item, payload)
+    except ValueError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Store result does not match task")
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     run = finish_item(
-        db,
-        item,
-        "SUCCEEDED" if result["status"] == "success" else "FAILED",
-        error_type=None if result["status"] == "success" else "no_valid_product_links",
-        error_message=result["error_message"],
+        db, item, "SUCCEEDED" if complete else "PARTIAL",
+        error_type=None if complete else "ixspy_store_page_pending",
+        error_message=None if complete else f"待补 {len(diagnostics['missing_dates'])} 件商品的七日日增量",
         commit=False,
     )
     db.commit()
     db.refresh(run)
     return serialize_run(run)
-
 
 @router.post(
     "/browser-collection/items/{item_id}/failure",
@@ -846,10 +1236,24 @@ def browser_collection_failure(
     payload: BrowserCollectionFailureRequest,
     db: Session = Depends(get_db),
 ) -> dict:
-    item = _browser_collection_item(db, item_id)
+    item = _claimed_browser_collection_item(db, item_id, payload)
     return serialize_run(
         fail_item(db, item, payload.error_type, payload.error_message)
     )
+
+
+@router.post(
+    "/browser-collection/items/{item_id}/retry",
+    response_model=BrowserCollectionRunRead,
+)
+def browser_collection_retry(item_id: int, db: Session = Depends(get_db)) -> dict:
+    item = db.get(BrowserCollectionItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Browser collection item not found")
+    try:
+        return serialize_run(retry_item(db, item))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.post(
@@ -861,7 +1265,7 @@ def browser_collection_challenge(
     payload: BrowserCollectionChallengeRequest,
     db: Session = Depends(get_db),
 ) -> dict:
-    item = _browser_collection_item(db, item_id)
+    item = _claimed_browser_collection_item(db, item_id, payload)
     return serialize_run(pause_for_challenge(db, item, payload.error_message))
 
 
@@ -876,9 +1280,46 @@ def browser_collection_resume(
     run = db.get(BrowserCollectionRun, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Browser collection run not found")
-    if run.status != "NEEDS_VERIFICATION":
+    if run.status not in {"NEEDS_VERIFICATION", "PAUSED"}:
         raise HTTPException(status_code=409, detail="Browser collection run is not paused")
-    return serialize_run(resume_run(db, run))
+    try:
+        return serialize_run(resume_run(db, run))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/browser-collection/runs/{run_id}/pause",
+    response_model=BrowserCollectionRunRead,
+)
+def browser_collection_pause(
+    run_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    run = db.get(BrowserCollectionRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Browser collection run not found")
+    try:
+        return serialize_run(pause_run(db, run))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/browser-collection/runs/{run_id}/cancel",
+    response_model=BrowserCollectionRunRead,
+)
+def browser_collection_cancel(
+    run_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    run = db.get(BrowserCollectionRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Browser collection run not found")
+    try:
+        return serialize_run(cancel_run(db, run))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.post(
@@ -886,10 +1327,20 @@ def browser_collection_resume(
     response_model=BrowserCollectionRunRead,
 )
 def browser_collection_heartbeat(
-    _payload: BrowserCollectionHeartbeatRequest,
+    payload: BrowserCollectionHeartbeatRequest,
     db: Session = Depends(get_db),
 ) -> dict:
-    return serialize_run(record_heartbeat(db))
+    try:
+        run = record_heartbeat(
+            db,
+            [(claim.item_id, claim.claim_token) for claim in payload.active_claims],
+            worker_id=payload.worker_id,
+            worker_label=payload.worker_label,
+            extension_version=payload.extension_version,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_run(run)
 
 
 @router.patch("/stores/{store_id}", response_model=StoreRead)
@@ -1018,7 +1469,7 @@ def create_product(payload: ProductCreate, db: Session = Depends(get_db)) -> Pro
         store_id=store.id,
         aliexpress_product_id=product_id,
         url=normalized_url,
-        title=payload.title,
+        title=clean_product_title(payload.title),
     )
     db.add(product)
     commit_or_conflict(db, "Product URL or AliExpress product ID already exists for this store")
@@ -1080,8 +1531,8 @@ def collect_product(
         raise HTTPException(status_code=409, detail="Product monitoring is inactive")
     snapshot = collect_product_snapshot(db, product, collector)
     metrics = calculate_product_daily_metrics(db, product.id)
-    if metrics:
-        calculate_store_daily_metric(db, product.store_id, metrics[-1].metric_date)
+    for metric in metrics:
+        calculate_store_daily_metric(db, product.store_id, metric.metric_date)
     return snapshot
 
 
@@ -1114,7 +1565,10 @@ def list_product_daily_metrics(
         raise HTTPException(status_code=404, detail="Product not found")
     statement = (
         select(ProductDailyMetric)
-        .where(ProductDailyMetric.product_id == product_id)
+        .where(
+            ProductDailyMetric.product_id == product_id,
+            ProductDailyMetric.calculation_method == "ixspy_visible_daily_increment",
+        )
         .order_by(ProductDailyMetric.metric_date.desc())
         .limit(limit)
     )
@@ -1131,7 +1585,11 @@ def list_store_daily_metrics(
         raise HTTPException(status_code=404, detail="Store not found")
     statement = (
         select(StoreDailyMetric)
-        .where(StoreDailyMetric.store_id == store_id)
+        .where(
+            StoreDailyMetric.store_id == store_id,
+            StoreDailyMetric.calculation_method == "sum_of_ixspy_visible_daily_increments",
+            StoreDailyMetric.estimable_products > 0,
+        )
         .order_by(StoreDailyMetric.metric_date.desc())
         .limit(limit)
     )

@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timezone as dt_timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -12,7 +12,7 @@ def _local_date(value: datetime | None, timezone: ZoneInfo) -> date | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.date()
+        value = value.replace(tzinfo=dt_timezone.utc)
     return value.astimezone(timezone).date()
 
 
@@ -32,6 +32,8 @@ def snapshot_collection_state(
 
 def manual_completed_product_ids(db: Session, day_start: datetime) -> set[int]:
     """Return products completed through a non-auto collection channel today."""
+    if day_start.tzinfo is not None:
+        day_start = day_start.astimezone(dt_timezone.utc)
     snapshot_product_ids = set(
         db.scalars(
             select(ProductSnapshot.product_id).where(

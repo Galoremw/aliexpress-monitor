@@ -1,0 +1,109 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+const test = require("node:test");
+
+const source = fs.readFileSync(path.join(__dirname, "../extension/content.js"), "utf8");
+
+function makeMessageListener(collect, sendRuntimeMessage = async () => ({ ok: true })) {
+  let listener;
+  const window = {};
+  window.top = window;
+  vm.runInNewContext(source, {
+    AliExpressMonitorPageCollector: { collect },
+    chrome: {
+      runtime: {
+        onMessage: { addListener(callback) { listener = callback; } },
+        sendMessage(message, callback) {
+          const response = Promise.resolve(sendRuntimeMessage(message));
+          if (callback) response.then(callback);
+          return response;
+        },
+      },
+    },
+    window,
+    location: { pathname: "/store/1103845415" },
+  }, { filename: "content.js" });
+  return listener;
+}
+
+function request(listener, targetType, options = {}) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("content script did not respond")), 1000);
+    try {
+      assert.equal(listener({ type: "collect-visible-page", target_type: targetType, ...options }, null, (result) => {
+        clearTimeout(timeout);
+        resolve(result);
+      }), true);
+    } catch (error) {
+      clearTimeout(timeout);
+      reject(error);
+    }
+  });
+}
+
+test("store identity responds when the collector returns synchronously", async () => {
+  const listener = makeMessageListener(() => ({ state: "ready", platform_store_id: "1103845415" }));
+  const result = await request(listener, "STORE_IDENTITY");
+  assert.equal(result.state, "ready");
+  assert.equal(result.platform_store_id, "1103845415");
+});
+
+test("store selection responds when the collector returns a promise", async () => {
+  const listener = makeMessageListener(async () => ({ state: "ready", page_result: { candidates: [] } }));
+  const result = await request(listener, "STORE_SELECT_PAGE");
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.candidates.length, 0);
+});
+
+test("synchronous collector errors return a failed response", async () => {
+  const listener = makeMessageListener(() => { throw new Error("identity failed"); });
+  const result = await request(listener, "STORE_IDENTITY");
+  assert.equal(result.state, "failed");
+  assert.equal(result.message, "identity failed");
+});
+
+test("store selection forwards same-day retry IDs to the page collector", async () => {
+  let forwardedOptions;
+  const listener = makeMessageListener((_type, _date, options) => {
+    forwardedOptions = options;
+    return { state: "ready", page_result: { candidates: [] } };
+  });
+
+  await request(listener, "STORE_SELECT_PAGE", {
+    target_date: "2026-09-29",
+    skip_product_ids: ["2501"],
+  });
+
+  assert.equal(forwardedOptions.skip_product_ids[0], "2501");
+});
+
+test("store collection forwards completed products to the worker checkpoint", async () => {
+  let forwardedOptions;
+  const progressMessages = [];
+  const listener = makeMessageListener((_type, _date, options) => {
+    forwardedOptions = options;
+    return { state: "ready", page_result: { products: [] } };
+  }, async (message) => {
+    progressMessages.push(message);
+    return { ok: true };
+  });
+
+  await request(listener, "STORE", {
+    target_date: "2026-10-10",
+    monitored_product_ids: ["1005001234567890"],
+    item_id: 401,
+    claim_token: "claim-401",
+  });
+
+  assert.equal(typeof forwardedOptions.on_product_collected, "function");
+  const product = { platform_product_id: "1005001234567890", historical_sales: [] };
+  await forwardedOptions.on_product_collected(product);
+  assert.deepEqual(JSON.parse(JSON.stringify(progressMessages)), [{
+    type: "store-collection-product-progress",
+    item_id: 401,
+    claim_token: "claim-401",
+    product,
+  }]);
+});

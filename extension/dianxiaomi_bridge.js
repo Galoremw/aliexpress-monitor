@@ -61,7 +61,7 @@
     if (/您还未安装采集插件/.test(document.body?.innerText || "")) {
       return {
         state: "needs_confirmation",
-        message: "隔离 Chrome 尚未安装店小秘采集插件，请在该窗口的 chrome://extensions 加载店小秘助手",
+        message: "当前 Chrome 尚未安装店小秘采集插件，请在 Chrome 扩展管理页完成安装",
       };
     }
     const agreement = agreementCheckbox();

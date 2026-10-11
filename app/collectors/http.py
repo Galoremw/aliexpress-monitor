@@ -11,6 +11,7 @@ import httpx
 
 from app.collectors.base import CollectorResult, CollectorTarget
 from app.core.config import get_settings
+from app.services.product_presentation import clean_product_title, product_image_url
 
 
 class ScriptExtractor(HTMLParser):
@@ -33,6 +34,22 @@ class ScriptExtractor(HTMLParser):
         if tag.lower() == "script" and self._in_script:
             self.scripts.append("".join(self._parts).strip())
             self._in_script = False
+
+
+class MetaImageExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.image_url: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "meta" or self.image_url:
+            return
+        attributes = {key.lower(): value for key, value in attrs}
+        property_name = (attributes.get("property") or attributes.get("name") or "").lower()
+        if property_name in {"og:image", "twitter:image"}:
+            content = attributes.get("content")
+            if content and content.startswith(("https://", "http://")):
+                self.image_url = content
 
 
 def _json_objects_from_html(html: str) -> list[Any]:
@@ -106,9 +123,6 @@ def _parse_decimal(value: Any) -> Decimal | None:
 
 def parse_product_html(html: str) -> dict[str, Any]:
     objects = _json_objects_from_html(html)
-    sold = _parse_count(
-        _first_value(objects, {"tradeCount", "soldCount", "ordersCount", "formatTradeCount"})
-    )
     price = _parse_decimal(
         _first_value(objects, {"price", "salePrice", "minPrice", "formatedActivityPrice"})
     )
@@ -117,12 +131,15 @@ def parse_product_html(html: str) -> dict[str, Any]:
         _first_value(objects, {"reviewCount", "ratingCount", "totalValidNum"})
     )
     title = _first_value(objects, {"name", "subject", "title"})
+    meta_image = MetaImageExtractor()
+    meta_image.feed(html)
     return {
-        "cumulative_sold": sold,
+        "cumulative_sold": None,
         "price_amount": price,
         "price_currency": str(currency).upper() if currency else None,
         "review_count": review_count,
-        "title": str(title).strip() if title else None,
+        "title": clean_product_title(str(title)) if title else None,
+        "main_image_url": meta_image.image_url or product_image_url({"structured_objects": objects}),
         "structured_objects": objects,
     }
 
@@ -179,15 +196,12 @@ class HTTPCollector:
             parsed = parse_product_html(response.text)
             has_any_field = any(
                 parsed[key] is not None
-                for key in ("cumulative_sold", "price_amount", "review_count", "title")
+                for key in ("price_amount", "review_count", "title", "main_image_url")
             )
-            if parsed["cumulative_sold"] is not None:
-                parse_status = "success"
-                error_type = error_message = None
-            elif has_any_field:
+            if has_any_field:
                 parse_status = "partial"
-                error_type = "missing_cumulative_sold"
-                error_message = "Public cumulative sold/orders value was not found"
+                error_type = "missing_ixspy_daily_increment"
+                error_message = "IXSPY daily increments are unavailable to the HTTP collector"
             else:
                 parse_status = "failed"
                 error_type = "page_structure_unrecognized"
@@ -206,9 +220,9 @@ class HTTPCollector:
                 raw_payload={
                     "target": {"product_id": target.product_id, "url": target.url},
                     "final_url": str(response.url),
-                    "structured_objects": parsed["structured_objects"],
+                    "main_image_url": parsed["main_image_url"],
                 },
-                raw_content=response.text,
+                raw_content=None,
                 error_type=error_type,
                 error_message=error_message,
             )

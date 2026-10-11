@@ -2,46 +2,24 @@ import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import select
 
-from app.collectors.http import HTTPCollector
-from app.collectors.store_dependencies import build_store_discovery_collector
 from app.core.config import Settings, get_settings
 from app.db.session import get_session_factory
-from app.services.collection_runs import run_collection_cycle
 from app.services.browser_collection import ensure_browser_collection_run
-from app.services.store_discovery import discover_store_products
-from app.db.models import Store
 
 logger = logging.getLogger(__name__)
 DAILY_COLLECTION_JOB_ID = "daily_public_product_snapshot"
 
 
 def run_scheduled_collection() -> None:
-    collector = HTTPCollector()
-    store_collector = build_store_discovery_collector()
     session = get_session_factory()()
     try:
-        for store in session.scalars(select(Store).where(Store.status == "active")):
-            discover_store_products(session, store, store_collector, limit=20)
-        summary = run_collection_cycle(
-            session,
-            collector,
-            skip_current_date_snapshots=True,
-        )
-        logger.info("Scheduled collection completed: %s", summary.to_dict())
-    except Exception:
-        session.rollback()
-        logger.exception("Scheduled HTTP collection failed; browser fallback will still be queued")
-    try:
         run = ensure_browser_collection_run(session, trigger="SCHEDULED")
-        logger.info("Browser fallback run ready: id=%s status=%s", run.id, run.status)
+        logger.info("Scheduled store-page run ready: id=%s status=%s", run.id, run.status)
     except Exception:
         session.rollback()
-        logger.exception("Unable to create browser fallback run")
+        logger.exception("Unable to create scheduled store-page run")
     finally:
-        collector.close()
-        store_collector.close()
         session.close()
 
 
@@ -56,7 +34,7 @@ def create_scheduler(settings: Settings | None = None) -> BackgroundScheduler:
             timezone=settings.timezone,
         ),
         id=DAILY_COLLECTION_JOB_ID,
-        name="Daily public AliExpress product snapshots",
+        name="Daily monitored AliExpress store pages",
         replace_existing=True,
         coalesce=True,
         max_instances=1,

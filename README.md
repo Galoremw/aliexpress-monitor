@@ -1,14 +1,14 @@
 # AliExpress 竞品监控 MVP
 
-用于选品研究的 AliExpress 公开数据监控系统。系统按日保存商品页面快照，并通过相邻自然日公开累计 `sold/orders` 的差值估算商品日销量。店铺汇总只覆盖已添加并保持活跃的监控商品，不代表店铺真实后台订单量或全店销量。
+用于选品研究的 AliExpress 公开数据监控系统。商品日销量只采用商品页 IXSPY 图表中用户可见的日增量；不采集累计售出数，也不通过累计值差分估算。店铺汇总只覆盖已添加并保持活跃的监控商品，不代表店铺真实后台订单量或全店销量。
 
 ## MVP 能力
 
 - 手动添加同行店铺和商品 URL/ID
 - 输入店铺链接后，从公开店铺页发现商品并自动建立监控列表
-- HTTP 优先采集公开商品页，保存原始响应与结构化字段
+- HTTP 仅采集公开商品页可用的非销量字段；销量由已登录 Chrome 读取 IXSPY 可见日增量
 - 解析失败照常保存 Snapshot，不覆盖历史记录
-- 按 `Asia/Shanghai` 自然日估算商品销量并汇总店铺监控范围
+- 按 `Asia/Shanghai` 自然日保存 IXSPY 直接日增量并汇总店铺监控范围
 - APScheduler 每日采集，以及单商品/全量手动采集
 - FastAPI JSON API、OpenAPI 文档和轻量中文 Dashboard
 - AUTO FIRST + BROWSER FALLBACK：HTTP 失败后由专用 Chrome 顺序采集，验证页只允许人工正常通过
@@ -18,13 +18,17 @@
 
 ## Windows 本地部署
 
-日常使用不依赖 Codex Preview。Windows 安装并启动 Docker Desktop 后，双击项目目录中的 `start.bat`，脚本会启动 PostgreSQL、Backend、Frontend 和 Scheduler，等待健康检查通过后自动打开：
+日常使用不依赖 Codex Preview。Windows 安装并启动 Docker Desktop 后，双击项目目录中的 `start.bat`，脚本会启动 PostgreSQL、Backend、Frontend 和 Scheduler，等待健康检查通过后，在默认浏览器打开普通监控台：
 
 <http://127.0.0.1:3000>
+
+此地址不启用浏览器采集 worker。每日采集使用单独的 Chrome 配置，避免触碰日常 Chrome 的窗口和标签页。
 
 停止使用时双击 `stop.bat`；需要重新构建或重启时双击 `restart.bat`。PostgreSQL 数据保存在 Docker volume `postgres_data`，执行 `docker compose down` 不会删除该 volume。
 
 项目目录中还提供 `AliExpress Monitor.url`，可以右键发送到桌面作为网页快捷方式。网页快捷方式要求服务已经运行；希望双击时自动启动 Docker 的场景，请为 `open-monitor.bat` 创建桌面快捷方式。
+
+监控台的“打开专用 Chrome”按钮使用隔离配置 `%LOCALAPPDATA%\AliExpressMonitor\DianxiaomiProfile`，不会打开或关闭日常 Chrome。已有专用窗口时会唤回原窗口并保留当前标签。首次运行 `start.bat` 会为当前 Windows 用户注册本机 `aliexpress-monitor://` 启动协议；浏览器首次询问是否打开外部应用时选择允许。
 
 ## Hosted Frontend and Backend
 
@@ -92,7 +96,7 @@ docker compose up -d --build
 
 ## Chrome Extension 手动补采
 
-扩展目录为 `extension/`。在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，选择“加载已解压的扩展程序”并选中该目录。然后从监控台商品详情页点击“在 Chrome 打开”，在商品页点击扩展图标中的“采集当前商品”。
+扩展目录为 `extension/`。在 Chrome 打开 `chrome://extensions`，开启“开发者模式”，选择“加载已解压的扩展程序”并选中该目录。每日 worker profile 由计划任务启动器加载扩展；手动补采仍可在你选择的 Chrome 配置中加载扩展，然后从监控台商品详情页点击“在 Chrome 打开”，在商品页点击扩展图标中的“采集当前商品”。
 
 扩展只读取当前商品页的公开可见信息，并通过 `POST /api/collection/browser-extension` 写入新的 `ProductSnapshot(source=CHROME_EXTENSION)`；它不会读取 Cookie、绕过验证码或后台自动监控页面。自动采集失败的商品可在 `/collection/pending` 查看并补采。
 
@@ -108,13 +112,19 @@ docker compose up -d --build
 
 ## 每日浏览器自动采集
 
-双击 `install-browser-collector.bat` 会创建 Windows 计划任务 `AliExpress Monitor Daily Collection`，每天北京时间 `02:00` 调用 `start-browser-collector.bat`。如果计划时间电脑未开机，Windows 会在当前用户下次登录后尽快补跑。专用浏览器配置保存在 `%LOCALAPPDATA%\AliExpressMonitor\ChromeProfile`，与日常 Chrome 配置隔离。
+双击 `install-browser-collector.bat` 会创建 Windows 计划任务 `AliExpress Monitor Daily Collection`，每天北京时间 `02:00` 调用 `start-browser-collector.bat`。如果计划时间电脑未开机，Windows 会在当前用户下次登录后尽快补跑。计划任务确保本地服务运行，并启动独立 Chrome 用户配置 `%LOCALAPPDATA%\AliExpressMonitor\BrowserCollectorProfile`；它不会关闭、复用或改动日常 Chrome 配置。
 
-首次安装后需在脚本打开的专用 Chrome 中完成两件事：从 `extension/` 加载未打包扩展，以及正常登录 AliExpress。之后每日流程会先刷新各活跃店铺的公开订单排序页并更新前 20 监控池，再逐个采集当天尚无有效快照的商品。自动发现且已离开前 20 的商品会停用，手动添加商品不会自动停用。
+首次启用时，运行一次 `start-browser-collector.bat`，从任务栏打开新出现的独立 Chrome 窗口，在该配置中登录监控台、AliExpress 和 IXSPY。启动器通过 Chrome 的 `--load-extension` 加载项目 `extension/`；无需把 worker 参数加到日常监控台。独立配置完成登录后可保持运行，计划任务会复用它；如果尚未运行，计划任务会单独启动它。采集窗口保持可见但不抢键盘焦点；若遇到验证，才会将验证页置前。普通 Chrome 可以照常使用。
+
+在 Galore 主机本机通过 `http://127.0.0.1:3000` 打开监控台，可点击“Galore主机采集”启动或唤起该独立 Chrome；按钮只负责启动浏览器，不创建或启动采集队列。`start.bat` 会注册按钮所需的本机启动协议。
+
+每日 `02:00` 调度只准备当日店铺页队列，队列保持待启动，不会自动打开店铺或商品页面。要运行队列，在监控台“每日浏览器采集”中选择一台在线采集电脑，再单独点击“开始采集”；只有所选电脑可以领取任务，没有自动切换或并行采集。切换电脑时需等旧任务结束，再重新选择并点击开始。`立即采集全部` 与“重新检查今日任务”只准备或刷新队列，不会启动采集。
+
+开始后，扩展会逐个访问活跃店铺的公开 Orders 排序页更新监控池，再采集当天尚无有效快照的商品。自动发现且已离开前 20 的商品会停用，手动添加商品不会自动停用。扩展心跳仅表示电脑在线；页面验证仍由用户处理。扩展需使用包含 worker identity 与 claim token 的新版本；旧版本不会领取受控队列。
 
 如果页面要求验证，任务会暂停并保留当前标签页，同时发送 Chrome 系统通知。人工正常完成验证后，扩展会自动继续；也可以在监控台点击“验证完成，继续任务”。系统不会识别或绕过验证码，也不会读取 Cookie、密码或浏览器凭据。
 
-可在监控台点击“立即运行今日任务”创建或恢复当日幂等队列。`remove-browser-collector-task.bat` 只删除 Windows 计划任务，不会删除专用 Chrome 配置或历史监控数据。
+“重新检查今日任务”会幂等地创建或刷新当日队列，但仍保持待启动；选择在线电脑并点击“开始采集”后才会派发。`remove-browser-collector-task.bat` 只删除 Windows 计划任务，不会删除扩展配置或历史监控数据。
 
 应用容器启动时会先执行 `alembic upgrade head`。PostgreSQL 数据保存在 `postgres_data` volume。
 
@@ -146,7 +156,7 @@ SQLite 仅用于本地开发和测试；正式 Compose 环境使用 PostgreSQL�
 | `PATCH` | `/api/stores/{id}` | 更新店铺或监控状态 |
 | `POST` | `/api/stores/{id}/discover` | 从公开店铺页发现商品链接 |
 | `GET` | `/api/stores/{id}/discovery-snapshots` | 查询店铺发现历史与失败原因 |
-| `GET` | `/api/stores/{id}/top-products` | 查询昨日估算销量 Top 20 |
+| `GET` | `/api/stores/{id}/top-products` | 查询昨日 IXSPY 日增量 Top 20 |
 | `POST` | `/api/products` | 添加商品 URL/ID |
 | `PATCH` | `/api/products/{id}` | 更新商品或监控状态 |
 | `POST` | `/api/products/{id}/collect` | 手动采集单商品 |
@@ -159,22 +169,16 @@ SQLite 仅用于本地开发和测试；正式 Compose 环境使用 PostgreSQL�
 | `POST` | `/api/browser-collection/runs/ensure` | 幂等创建或恢复今日任务 |
 | `POST` | `/api/browser-collection/items/claim` | 扩展领取下一条顺序任务 |
 | `GET` | `/api/products/{id}/snapshots` | 查询原始快照历史 |
-| `GET` | `/api/products/{id}/daily-metrics` | 查询商品日销量估算 |
-| `GET` | `/api/stores/{id}/daily-metrics` | 查询店铺监控范围估算 |
+| `GET` | `/api/products/{id}/daily-metrics` | 查询商品 IXSPY 直接日增量 |
+| `GET` | `/api/stores/{id}/daily-metrics` | 查询店铺监控范围 IXSPY 日增量汇总 |
 
-## 估算规则
+## 日增量规则
 
-每天使用该自然日最后一条 Snapshot 作为代表值，与后一自然日代表值比较，差值归属于区间起始日。例如 9 月 19 日到 20 日的公开累计量差值记为 9 月 19 日估算销量。以下情况不会强行填充销量：
+扩展在正常打开的商品页选择 IXSPY「增量」图表，读取截至目标日之前最近 7 个日期的可见提示值。只有图表实际显示的日期和值会保存；显示的 0 保留为 0，没有读到的日期保持缺失。
 
-- 没有前一日基线
-- 两个快照日期不连续
-- 任一代表快照解析失败
-- 累计 sold/orders 缺失
-- 累计值下降（可能是页面口径、商品变体或数据重置）
+累计售出、`sold/orders` 总量和相邻快照差值都不参与日销量计算。历史 Snapshot 与旧估算指标保留在数据库中，但当前监控台和日指标 API 仅展示 IXSPY 直接日增量。
 
-API 使用 `estimated_sales`、`estimate_type=estimated`、`data_basis=public_observable_data`；店铺指标额外返回 `estimate_scope=monitored_products_only`。
-
-首次发现商品时只能得到候选商品链接，不能从单次公开数据判断昨日销量。系统会明确显示“等待日销量基线”；连续两天采集完成后，店铺详情页才会按估算销量显示昨日 Top 20。候选商品的公开累计销量只用于发现阶段排序，不会被表述成日销量。
+只有最近 7 个日期都读到 IXSPY 日增量时才显示完整 7 日合计；覆盖不足时显示实际覆盖数，不用累计值补齐或推算。
 
 ## Collector 扩展
 

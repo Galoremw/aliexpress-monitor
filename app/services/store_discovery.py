@@ -12,6 +12,7 @@ from app.collectors.store_discovery import StoreDiscoveryCollector, StoreDiscove
 from app.core.config import get_settings
 from app.db.models import Product, ProductDailyMetric, Store, StoreSnapshot
 from app.services.metrics import calculate_product_daily_metrics, calculate_store_daily_metric
+from app.services.product_presentation import clean_product_title
 from app.services.snapshots import save_store_product_snapshot
 
 
@@ -62,8 +63,8 @@ def discover_store_products(
         parse_status=result.parse_status,
         candidate_count=len(result.candidates),
         source_http_status=result.source_http_status,
-        raw_payload=result.raw_payload,
-        raw_content=result.raw_content,
+        raw_payload={key: value for key, value in result.raw_payload.items() if key != "structured_objects"},
+        raw_content=None,
         error_type=result.error_type,
         error_message=result.error_message,
     )
@@ -90,7 +91,9 @@ def discover_store_products(
         if existing is not None:
             existing.discovery_rank = rank
             if candidate.title and not existing.title:
-                existing.title = candidate.title
+                existing.title = clean_product_title(candidate.title)
+            elif existing.title:
+                existing.title = clean_product_title(existing.title)
             if existing.discovery_source in ("store_page", "chrome_extension_store"):
                 existing.status = "active"
                 existing.discovered_at = result.collected_at
@@ -102,7 +105,7 @@ def discover_store_products(
             store_id=store.id,
             aliexpress_product_id=candidate.product_id,
             url=candidate.url,
-            title=candidate.title,
+            title=clean_product_title(candidate.title),
             discovery_source="store_page",
             discovery_rank=rank,
             discovered_at=result.collected_at,
@@ -136,7 +139,7 @@ def discover_store_products(
             db,
             product,
             captured_at=result.collected_at,
-            sold_count=candidate.public_cumulative_sold,
+            sold_count=None,
             title=candidate.title,
             source="AUTO",
             collector_name=result.collector_name,
@@ -148,7 +151,7 @@ def discover_store_products(
                 "product_id": candidate.product_id,
                 "url": candidate.url,
                 "title": candidate.title,
-                "public_cumulative_sold": candidate.public_cumulative_sold,
+                "main_image_url": candidate.image_url,
             },
             commit=False,
         )
@@ -214,6 +217,7 @@ def store_top_products(
                 Product.status == "active",
                 ProductDailyMetric.metric_date == metric_date,
                 ProductDailyMetric.is_estimable.is_(True),
+                ProductDailyMetric.calculation_method == "ixspy_visible_daily_increment",
             )
             .order_by(
                 ProductDailyMetric.estimated_sales.desc(),

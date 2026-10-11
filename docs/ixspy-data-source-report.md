@@ -1,30 +1,12 @@
-# IXSPY Data Source Report
+# IXSPY Data Source Contract
 
-## Conclusion
+## Source
 
-IXSPY appears to maintain a server-side historical dataset populated by periodic
-or broad collection. The user does not need to open a product every day for the
-one-year trend chart to exist. IXSPY's public product description says that
-product data is updated daily and that trend data is retained for a year, but no
-documented public historical-sales API was found.
+The extension reads values only from IXSPY charts visible to the signed-in user. It first opens each store-listing card's trend panel in sequence and verifies the visible chart's product ID against the card. Product-detail charts remain a fallback for incomplete store-page reads. The collector selects daily-increment mode and reads the latest seven dated tooltip values. It does not call private endpoints, inspect hidden application state, or collect account credentials.
 
-This is an inference from the visible chart and official product description,
-not a claim about IXSPY's private implementation.
+## Accepted Values
 
-## Observed Data
-
-- The visible chart exposes `总量` and `增量` modes.
-- A visible tooltip such as `2026-09-06 / 近一年销量 9,159` is a cumulative
-  total, not that day's orders.
-- `增量` is the preferred daily-sales value when it is visibly available.
-- When only cumulative totals are visible, a daily value is derived only from
-  consecutive, non-decreasing dates.
-- Hidden canvas pixels, private requests, credentials, cookies, and tokens are
-  not used.
-
-## Monitor Import Contract
-
-The Chrome collector sends explicit points:
+Each imported point has this shape:
 
 ```json
 {
@@ -34,47 +16,18 @@ The Chrome collector sends explicit points:
 }
 ```
 
-or:
+The tooltip must expose both a date and a signed integer. A visible zero or negative correction is preserved as shown. An unread date stays missing; the collector never fills it from cumulative totals or estimates it from adjacent snapshots. A seven-day result is complete only when all seven expected dates were read.
 
-```json
-{
-  "date": "2026-09-22",
-  "value": 125,
-  "value_type": "cumulative_total"
-}
-```
+## Collection Behavior
 
-The original points are stored in `ProductSnapshot.raw_data.historical_sales`.
-The derived daily metric is stored separately and never replaces the Snapshot.
+- Store-page collection activates one card trend at a time, follows its visible "More" action, verifies the chart product ID, then samples the latest seven visible chart positions.
+- Complete store-page histories are saved as direct IXSPY points and skip the corresponding product-page task; incomplete histories retain their observed points and use the existing product-page fallback.
+- It does not open the full-year view or collect the cumulative-total series.
+- If the series is stale or incomplete after one retry, the snapshot is marked partial and missing dates remain missing.
+- If IXSPY requires login, collection pauses and brings the normal login page to the user. Platform verification is always completed by the user.
+- The API and dashboard expose only `ixspy_visible_daily_increment` product metrics and their direct store aggregates.
+- Existing snapshots and old cumulative-derived metrics are retained, but old estimates are not included in current dashboard or daily-metric API results.
 
-## Initial and Daily Flow
+## Limitations
 
-1. On first collection, the extension reads the visible IXSPY history and can
-   import 19, 20, and 21 directly when `增量` points are visible.
-2. If only cumulative points are visible, the backend computes a point only
-   when the previous calendar date is available and the value did not decrease.
-3. On a later run, the extension may submit only the new 22 cumulative point.
-   The backend reads the 21 point from earlier raw Snapshots and derives the 22
-   daily increment.
-4. A missing date, a decreased cumulative value, or a parse failure produces
-   no fabricated metric.
-5. Repeated submission is idempotent for the same product/date metric while
-   every collection remains a new raw Snapshot.
-
-## Verification Status
-
-Local unit tests cover direct daily points, cumulative consecutive points, and
-the later single-point baseline flow. The latest browser collector is version
-`0.4.1`.
-
-The public Render backend still exposes the old request schema without
-`historical_sales`; therefore the cloud end-to-end import is not yet verified.
-Render must complete a Blueprint sync or deploy the latest commit before a real
-cloud Snapshot can prove the loop.
-
-## Security Boundary
-
-The implementation uses only normal, user-visible page data and normal manual
-verification. It does not bypass CAPTCHA or anti-bot controls, read cookies or
-tokens, reverse-engineer protected endpoints, or claim that estimated sales are
-real backend orders.
+IXSPY's visible chart can be unavailable, delayed, or incomplete. A product may therefore have partial history even when its chart appears populated at a glance. The monitor reports observed coverage rather than inventing values. Any claim of 7/7 refers to the seven expected calendar dates for the collection target date, not to all data shown by the chart.

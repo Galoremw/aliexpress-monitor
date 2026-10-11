@@ -39,24 +39,20 @@ def seed_metrics(db_session):
     return store, product
 
 
-def test_product_metric_api_uses_estimate_language(client, db_session):
+def test_product_metric_api_hides_legacy_cumulative_estimates(client, db_session):
     _, product = seed_metrics(db_session)
     response = client.get(f"/api/products/{product.id}/daily-metrics")
     assert response.status_code == 200
-    metric = response.json()[0]
-    assert metric["estimated_sales"] == 7
-    assert metric["estimate_type"] == "estimated"
-    assert metric["data_basis"] == "public_observable_data"
+    assert response.json() == []
+    assert db_session.query(ProductSnapshot).filter_by(product_id=product.id).count() == 2
 
 
-def test_store_metric_api_declares_monitored_product_scope(client, db_session):
-    store, _ = seed_metrics(db_session)
+def test_store_metric_api_hides_legacy_cumulative_estimates(client, db_session):
+    store, product = seed_metrics(db_session)
     response = client.get(f"/api/stores/{store.id}/daily-metrics")
     assert response.status_code == 200
-    metric = response.json()[0]
-    assert metric["estimated_sales"] == 7
-    assert metric["estimate_scope"] == "monitored_products_only"
-    assert metric["data_basis"] == "public_observable_data"
+    assert response.json() == []
+    assert db_session.query(ProductSnapshot).filter_by(product_id=product.id).count() == 2
 
 
 def test_openapi_and_docs_are_available(client):

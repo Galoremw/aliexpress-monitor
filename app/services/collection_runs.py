@@ -59,8 +59,9 @@ def run_collection_cycle(
         metrics = calculate_product_daily_metrics(
             db, product.id, timezone_name=get_settings().timezone
         )
-        if metrics:
-            metric_dates_by_store.setdefault(product.store_id, set()).add(metrics[-1].metric_date)
+        metric_dates_by_store.setdefault(product.store_id, set()).update(
+            metric.metric_date for metric in metrics
+        )
     for store_id, metric_dates in metric_dates_by_store.items():
         for metric_date in metric_dates:
             calculate_store_daily_metric(db, store_id, metric_date)

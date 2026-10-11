@@ -31,6 +31,8 @@ h2 { margin: 0; font-size: 22px; }
 .action-row { display: flex; gap: 12px; margin-top: 20px; }
 .button { display: inline-block; padding: 11px 16px; border: 1px solid #cad8cc; color: #285a43; text-decoration: none; font-weight: 700; }
 .button.primary { border-color: #39715a; color: #fff; background: #39715a; }
+.history-periods { display: flex; flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+[data-history-date][hidden] { display: none; }
 .button.danger { border-color: #e4b9b4; color: #b42318; background: #fff; cursor: pointer; }
 .nav-logout { padding: 4px 8px; border: 1px solid #718077; color: #dbe7dd; background: transparent; cursor: pointer; }
 .auth-page { display: grid; place-items: center; min-height: 70vh; }

@@ -28,6 +28,8 @@ def test_all_tables_are_created(db_session):
         "store_snapshots",
         "browser_collection_runs",
         "browser_collection_items",
+        "product_reviews",
+        "review_collection_tasks",
     } <= tables
 
 
@@ -56,6 +58,79 @@ def test_alembic_upgrade_creates_schema(tmp_path: Path, monkeypatch):
     migrated_tables = inspect(engine).get_table_names()
     assert "product_snapshots" in migrated_tables
     assert "store_snapshots" in migrated_tables
+    assert "product_reviews" in migrated_tables
+    assert "review_collection_tasks" in migrated_tables
+    engine.dispose()
+    command.downgrade(config, "20260922_0006")
+    engine = create_engine(f"sqlite:///{database_path.as_posix()}")
+    downgraded = inspect(engine)
+    assert "product_reviews" not in downgraded.get_table_names()
+    assert "review_collection_tasks" not in downgraded.get_table_names()
+    assert "business_role" not in {column["name"] for column in downgraded.get_columns("products")}
+    engine.dispose()
+    get_settings.cache_clear()
+
+
+def test_browser_control_migration_upgrades_and_downgrades_on_disposable_sqlite(
+    tmp_path: Path, monkeypatch
+):
+    from sqlalchemy import create_engine, text
+
+    database_path = tmp_path / "browser-control-migration.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+    config = Config("alembic.ini")
+    command.upgrade(config, "20260927_0009")
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text(
+            """INSERT INTO browser_collection_runs
+            (target_date, trigger, status, phase, total_count, succeeded_count,
+             partial_count, failed_count, created_at)
+            VALUES ('2026-10-09', 'SCHEDULED', 'PENDING', 'STORE_DISCOVERY',
+                    1, 0, 0, 0, CURRENT_TIMESTAMP)"""
+        ))
+        connection.execute(text(
+            """INSERT INTO browser_collection_items
+            (run_id, target_type, target_key, target_url, position, status, attempt_count)
+            VALUES (1, 'STORE', 'store:preserved',
+                    'https://www.aliexpress.com/store/123/pages/all-items.html',
+                    1, 'PENDING', 0)"""
+        ))
+    engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        run = connection.execute(text(
+            "SELECT id, dispatch_enabled FROM browser_collection_runs"
+        )).one()
+        item = connection.execute(text(
+            "SELECT id, run_id, target_key, status FROM browser_collection_items"
+        )).one()
+        tables = set(inspect(connection).get_table_names())
+    assert run.id == 1
+    assert run.dispatch_enabled in (0, False)
+    assert (item.id, item.run_id, item.target_key, item.status) == (
+        1, 1, "store:preserved", "PENDING"
+    )
+    assert {"browser_collection_controls", "browser_collection_workers"} <= tables
+    engine.dispose()
+
+    command.downgrade(config, "20260927_0009")
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT run_id, target_key, status FROM browser_collection_items"
+        )).all()
+        tables = set(inspect(connection).get_table_names())
+    assert rows == [(1, "store:preserved", "PENDING")]
+    assert "browser_collection_controls" not in tables
+    assert "browser_collection_workers" not in tables
     engine.dispose()
     get_settings.cache_clear()
 

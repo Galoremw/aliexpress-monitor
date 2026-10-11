@@ -3,8 +3,40 @@
   if (!collector) return;
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "collect-visible-reviews") {
+      collector.collectReviews(message.known_keys || [], message.max_new_reviews || 100)
+        .then(sendResponse)
+        .catch((error) => sendResponse({ state: "failed", message: error.message || "公开评论读取失败" }));
+      return true;
+    }
     if (message?.type !== "collect-visible-page") return false;
-    collector.collect(message.target_type)
+    const options = {
+      skip_product_ids: message.skip_product_ids,
+      monitored_product_ids: message.monitored_product_ids,
+    };
+    if (message.target_type === "STORE" && Number.isSafeInteger(message.item_id)
+      && typeof message.claim_token === "string" && message.claim_token) {
+      options.on_product_collected = async (product) => {
+        const response = await new Promise((resolve, reject) => {
+          chrome.runtime.sendMessage({
+            type: "store-collection-product-progress",
+            item_id: Number(message.item_id),
+            claim_token: message.claim_token,
+            product,
+          }, (value) => {
+            if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+            else resolve(value);
+          });
+        });
+        if (!response?.ok) throw new Error("后台未确认店铺商品采集进度");
+      };
+    }
+    Promise.resolve()
+      .then(() => collector.collect(
+        message.target_type,
+        message.target_date || message.history_target_date,
+        options,
+      ))
       .then(sendResponse)
       .catch((error) => sendResponse({ state: "failed", message: error.message || "页面读取失败" }));
     return true;
@@ -33,7 +65,7 @@
     <section class="panel" aria-label="AliExpress 监控采集">
       <p class="title">AliExpress 监控采集</p>
       <p class="hint">当前商品页已识别，可读取公开可见数据</p>
-      <button type="button">采集当前商品</button>
+      <button type="button">读取最近 7 日增量</button>
       <p class="result" role="status" aria-live="polite"></p>
     </section>`;
   document.documentElement.appendChild(host);
@@ -43,10 +75,11 @@
   button.addEventListener("click", async () => {
     button.disabled = true;
     result.className = "result";
-    result.textContent = "正在读取公开数据…";
+    result.textContent = "正在读取 IXSPY 图表最近 7 日增量…";
     try {
       const collected = await collector.collect("PRODUCT");
       if (collected.state === "challenge") throw new Error("请先正常完成 AliExpress 验证");
+      if (collected.state === "ixspy_login") throw new Error("IXSPY 登录已过期，请在当前页面正常登录后重试");
       if (!collected.payload) throw new Error(collected.message || "没有读取到商品公开数据");
       const response = await new Promise((resolve, reject) => {
         chrome.runtime.sendMessage(
@@ -58,7 +91,8 @@
         );
       });
       if (!response?.ok) throw new Error(response?.body?.detail || `同步失败 (${response?.status || 0})`);
-      result.textContent = "采集成功，已同步至监控系统";
+      const count = collected.payload.historical_sales?.length || 0;
+      result.textContent = `已同步 IXSPY 日增量：${count}/7 天${count < 7 ? "，缺失日期不会估算" : ""}`;
     } catch (error) {
       result.className = "result error";
       result.textContent = error.message || "采集失败";

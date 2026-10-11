@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 from app.collectors.base import CollectorResult
 from app.collectors.dependencies import get_collector
 from app.core.config import Settings
-from app.scheduler import DAILY_COLLECTION_JOB_ID, create_scheduler
+from app.db.models import BrowserCollectionItem, BrowserCollectionRun, ProductSnapshot
+from app.scheduler import DAILY_COLLECTION_JOB_ID, create_scheduler, run_scheduled_collection
 
 
 class CycleCollector:
@@ -51,6 +52,57 @@ def test_scheduler_registers_daily_job_in_shanghai_timezone():
     fields = {field.name: str(field) for field in job.trigger.fields}
     assert fields["hour"] == "3"
     assert fields["minute"] == "15"
+
+
+def test_scheduled_collection_queues_store_pages_without_detail_snapshots(client, db_session, monkeypatch):
+    import app.scheduler as scheduler_module
+
+    store = add_store_with_products(client)
+    calls = []
+    class StubCollector:
+        def close(self):
+            pass
+
+    class StubSummary:
+        def to_dict(self):
+            return {}
+
+    monkeypatch.setattr(scheduler_module, "get_session_factory", lambda: lambda: db_session)
+    monkeypatch.setattr(scheduler_module, "HTTPCollector",
+                        lambda: (calls.append("http"), StubCollector())[1], raising=False)
+    monkeypatch.setattr(scheduler_module, "build_store_discovery_collector",
+                        lambda: (calls.append("discovery"), StubCollector())[1], raising=False)
+    monkeypatch.setattr(scheduler_module, "discover_store_products",
+                        lambda *_args, **_kwargs: calls.append("discover"), raising=False)
+    monkeypatch.setattr(scheduler_module, "run_collection_cycle",
+                        lambda *_args, **_kwargs: (calls.append("detail"), StubSummary())[1], raising=False)
+
+    run_scheduled_collection()
+
+    assert calls == []
+    run = db_session.query(BrowserCollectionRun).one()
+    items = db_session.query(BrowserCollectionItem).all()
+    assert len(items) == 1
+    assert items[0].run_id == run.id
+    assert items[0].target_type == "STORE"
+    assert items[0].store_id == store["id"]
+    assert db_session.query(ProductSnapshot).count() == 0
+
+
+def test_scheduler_and_collect_all_leave_run_held(client, db_session, monkeypatch):
+    import app.scheduler as scheduler_module
+
+    add_store_with_products(client)
+    monkeypatch.setattr(scheduler_module, "get_session_factory", lambda: lambda: db_session)
+
+    run_scheduled_collection()
+    scheduled = client.get("/api/browser-collection/runs/today")
+    collected = client.post("/api/browser-collection/runs/collect-all")
+
+    assert scheduled.status_code == 200
+    assert scheduled.json()["dispatch_enabled"] is False
+    assert collected.status_code == 200
+    assert collected.json()["run"]["dispatch_enabled"] is False
 
 
 def test_manual_collection_cycle_processes_all_active_products(client):

@@ -48,6 +48,7 @@ services:
     restart: unless-stopped
 
   scheduler:
+    profiles: ["scheduled"]
     build: .
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://monitor:monitor-local-only@postgres:5432/monitor}

@@ -13,8 +13,9 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-from app.collectors.http import _json_objects_from_html, _parse_count
+from app.collectors.http import _json_objects_from_html
 from app.core.config import get_settings
+from app.services.product_presentation import clean_product_title
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +24,7 @@ class StoreProductCandidate:
     url: str
     title: str | None = None
     public_cumulative_sold: int | None = None
+    image_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,9 +56,17 @@ class ProductLinkParser(HTMLParser):
         self.links: list[StoreProductCandidate] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag.lower() == "img" and self._current is not None and not self._current["image_url"]:
+            image_src = (
+                attributes.get("src")
+                or attributes.get("data-src")
+                or attributes.get("data-lazy-src")
+                or (attributes.get("srcset") or "").split(",", 1)[0].strip().split(" ", 1)[0]
+            )
+            self._current["image_url"] = urljoin(self.base_url, image_src) if image_src else None
         if tag.lower() != "a":
             return
-        attributes = dict(attrs)
         href = attributes.get("href") or ""
         match = re.search(r"/item/(\d+)(?:\.html)?", href, re.IGNORECASE)
         if not match:
@@ -65,6 +75,7 @@ class ProductLinkParser(HTMLParser):
             "product_id": match.group(1),
             "url": urljoin(self.base_url, href),
             "title": attributes.get("title") or attributes.get("aria-label"),
+            "image_url": None,
             "text": [],
         }
 
@@ -76,17 +87,20 @@ class ProductLinkParser(HTMLParser):
         if tag.lower() != "a" or self._current is None:
             return
         text = " ".join(self._current["text"])
-        title = self._current["title"] or re.sub(r"\s+", " ", text).strip() or None
-        sold = None
-        sold_match = re.search(r"([\d.,]+\s*[KM]?)\s*(?:sold|orders?)", text, re.IGNORECASE)
-        if sold_match:
-            sold = _parse_count(sold_match.group(1))
+        raw_title = self._current["title"] or re.sub(r"\s+", " ", text).strip() or None
+        title = clean_product_title(raw_title)
+        if title and re.fullmatch(
+            r"\d[\d,.]*(?:\s*[km])?\+?\s*(?:sold|orders?)",
+            title,
+            re.IGNORECASE,
+        ):
+            title = None
         self.links.append(
             StoreProductCandidate(
                 product_id=self._current["product_id"],
                 url=self._current["url"],
                 title=title,
-                public_cumulative_sold=sold,
+                image_url=self._current["image_url"],
             )
         )
         self._current = None
@@ -128,15 +142,19 @@ def _candidate_from_dict(value: dict[str, Any], base_url: str) -> StoreProductCa
         (value.get(key) for key in ("title", "productTitle", "subject", "name") if value.get(key)),
         None,
     )
-    sold_value = next(
-        (value.get(key) for key in ("tradeCount", "soldCount", "ordersCount", "formatTradeCount") if value.get(key) is not None),
+    image_url = next(
+        (value.get(key) for key in ("imageUrl", "image_url", "image", "imageUrlList", "productImage") if value.get(key)),
         None,
     )
+    if isinstance(image_url, list):
+        image_url = image_url[0] if image_url else None
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url") or image_url.get("src")
     return StoreProductCandidate(
         product_id=str(product_id),
         url=absolute_url,
-        title=str(title).strip() if title else None,
-        public_cumulative_sold=_parse_count(sold_value),
+        title=clean_product_title(str(title)) if title else None,
+        image_url=urljoin(base_url, str(image_url)) if image_url else None,
     )
 
 
@@ -154,20 +172,9 @@ def parse_store_products(html: str, store_url: str) -> tuple[list[StoreProductCa
     unique: dict[str, StoreProductCandidate] = {}
     for candidate in candidates:
         existing = unique.get(candidate.product_id)
-        if existing is None or (
-            existing.public_cumulative_sold is None
-            and candidate.public_cumulative_sold is not None
-        ):
+        if existing is None or (existing.image_url is None and candidate.image_url is not None):
             unique[candidate.product_id] = candidate
-    ordered = sorted(
-        unique.values(),
-        key=lambda item: (
-            item.public_cumulative_sold is not None,
-            item.public_cumulative_sold or 0,
-        ),
-        reverse=True,
-    )
-    return ordered, structured_objects
+    return list(unique.values()), structured_objects
 
 
 class HTTPStoreDiscoveryCollector:
@@ -204,9 +211,8 @@ class HTTPStoreDiscoveryCollector:
                     "store_url": store_url,
                     "final_url": str(response.url),
                     "candidate_ids": [item.product_id for item in candidates],
-                    "structured_objects": structured_objects,
                 },
-                raw_content=response.text,
+                raw_content=response.text if not candidates else None,
                 error_type=None if candidates else "store_page_structure_unrecognized",
                 error_message=None if candidates else "No public product links were found on the store page",
             )
