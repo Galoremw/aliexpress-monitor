@@ -86,6 +86,25 @@ class Store(Base):
     discovery_snapshots: Mapped[list[StoreSnapshot]] = relationship(
         back_populates="store", cascade="all, delete-orphan"
     )
+    page_discovery_state: Mapped[StorePageDiscoveryState | None] = relationship(
+        back_populates="store", cascade="all, delete-orphan", uselist=False
+    )
+
+
+class StorePageDiscoveryState(Base):
+    __tablename__ = "store_page_discovery_states"
+
+    store_id: Mapped[int] = mapped_column(
+        ForeignKey("stores.id", ondelete="CASCADE"), primary_key=True
+    )
+    first_orders_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    next_page_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    last_successful_page_url: Mapped[str | None] = mapped_column(String(2048))
+    last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_outcome: Mapped[str | None] = mapped_column(String(32))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    store: Mapped[Store] = relationship(back_populates="page_discovery_state")
 
 
 class Product(Base):
