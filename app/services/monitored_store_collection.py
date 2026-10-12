@@ -1,16 +1,227 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.schemas import BrowserStoreDiscoveryRequest
+from app.api.schemas import BrowserStoreDiscoveryRequest, BrowserStoreProduct
 from app.api.utils import extract_product_id, extract_store_id, normalize_aliexpress_url
-from app.db.models import BrowserCollectionItem, Product, ProductDailyMetric, ProductSnapshot, Store, StoreSnapshot
-from app.services.historical_metrics import looks_cumulative_like_daily_values
-from app.services.metrics import calculate_store_daily_metric
+from app.db.models import (
+    BrowserCollectionItem,
+    Product,
+    ProductDailyMetric,
+    ProductSnapshot,
+    Store,
+    StoreSnapshot,
+)
+from app.services.historical_metrics import import_historical_sales, looks_cumulative_like_daily_values
+from app.services.metrics import calculate_product_daily_metrics, calculate_store_daily_metric
+from app.services.product_presentation import clean_product_title
+from app.services.snapshots import save_store_product_snapshot
+from app.services.store_page_discovery import (
+    advance_store_page_cursor,
+    candidate_daily_values,
+    get_or_create_store_page_discovery_state,
+)
+
+
+def _validated_orders_url(store: Store, value: str) -> str:
+    try:
+        normalized = normalize_aliexpress_url(value, "store")
+    except HTTPException as exc:
+        raise ValueError("店铺 Orders 页面 URL 无效") from exc
+    parsed = urlsplit(normalized)
+    if (
+        extract_store_id(normalized) != store.aliexpress_store_id
+        or parsed.path != f"/store/{store.aliexpress_store_id}/pages/all-items.html"
+        or parse_qs(parsed.query).get("shop_sortType") != ["orders_desc"]
+    ):
+        raise ValueError("结果包含非目标店铺或非 Orders 排序页面")
+    return normalized
+
+
+def _orders_url_identity(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return f"invalid:{value}"
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    page = next((item for key, item in query if key.lower() in {"page", "pagenum", "pageno"}), "1")
+    remaining = [
+        (key.lower(), item)
+        for key, item in query
+        if key.lower() not in {"page", "pagenum", "pageno", "spm"}
+    ]
+    if not any(key == "sorttype" for key, _ in remaining):
+        remaining.append(("sorttype", "bestmatch_sort"))
+    remaining.append(("page", page))
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, urlencode(sorted(remaining)), "")
+    )
+
+
+def _process_candidate_page(
+    db: Session,
+    store: Store,
+    page,
+    target_date,
+    raw: dict,
+    scan: dict,
+    page_url_error: str | None,
+) -> bool:
+    if page is None:
+        return True
+
+    active_products = list(
+        db.scalars(
+            select(Product)
+            .where(Product.store_id == store.id, Product.status == "active")
+            .order_by(Product.id)
+        )
+    )
+    if len(active_products) >= 20:
+        scan["status"] = "pool_full"
+        for candidate in page.candidates:
+            scan["skipped_ids"].append(candidate.platform_product_id)
+            scan["skip_reasons"].append(
+                {"product_id": candidate.platform_product_id, "reason": "pool_full"}
+            )
+        return True
+
+    state = get_or_create_store_page_discovery_state(db, store)
+    cursor_before = state.next_page_url
+    cursor = advance_store_page_cursor(
+        db,
+        store,
+        scanned_url=page.page_url,
+        has_next_page=page.has_next_page,
+        next_page_url=page.next_page_url,
+        scan_complete=page.scan_complete,
+        error=page_url_error or "IXSPY 候选商品图表页读取未完成",
+    )
+    scan["cursor_before"] = cursor_before
+    scan["cursor_after"] = cursor.next_page_url
+    scan["error"] = cursor.last_error
+    scan["status"] = cursor.last_outcome or "rejected"
+
+    if cursor.last_outcome not in {"advanced", "wrapped"}:
+        reason = "candidate_page_incomplete" if cursor.last_outcome == "incomplete" else "cursor_not_advanced"
+        for candidate in page.candidates:
+            scan["skipped_ids"].append(candidate.platform_product_id)
+            scan["skip_reasons"].append(
+                {"product_id": candidate.platform_product_id, "reason": reason}
+            )
+        return cursor.last_outcome == "duplicate"
+
+    expected_dates = {target_date - timedelta(days=offset) for offset in range(1, 8)}
+    active_ids = {product.aliexpress_product_id for product in active_products}
+    inactive_ids = set(
+        db.scalars(
+            select(Product.aliexpress_product_id).where(
+                Product.store_id == store.id, Product.status == "inactive"
+            )
+        )
+    )
+    eligible: list[tuple[BrowserStoreProduct, str, dict, int, int]] = []
+    seen_ids: set[str] = set()
+    for orders_rank, candidate in enumerate(page.candidates, start=1):
+        product_id = candidate.platform_product_id
+        reason = None
+        if product_id in seen_ids:
+            reason = "duplicate_candidate"
+        else:
+            seen_ids.add(product_id)
+            if product_id in active_ids:
+                reason = "already_monitored"
+            elif product_id in inactive_ids:
+                reason = "inactive_product_not_reactivated"
+
+        product_url = None
+        if reason is None:
+            try:
+                product_url = normalize_aliexpress_url(candidate.url, "product")
+                if extract_product_id(product_url) != product_id:
+                    reason = "invalid_product_url"
+            except HTTPException:
+                reason = "invalid_product_url"
+
+        values = candidate_daily_values(candidate, expected_dates) if reason is None else None
+        if reason is None and values is None:
+            reason = "incomplete_or_cumulative_ixspy"
+        if reason is None:
+            conflict = db.scalar(select(Product).where(Product.url == product_url))
+            if conflict is not None and conflict.store_id != store.id:
+                reason = "product_url_owned_by_other_store"
+
+        if reason is not None:
+            scan["skipped_ids"].append(product_id)
+            scan["skip_reasons"].append({"product_id": product_id, "reason": reason})
+        else:
+            eligible.append(
+                (candidate, product_url, values, orders_rank, sum(values.values()))
+            )
+
+    eligible.sort(key=lambda row: (-row[4], row[3]))
+    slots = max(0, 20 - len(active_products))
+    captured_at = datetime.now(timezone.utc)
+    for candidate, product_url, values, orders_rank, _ in eligible:
+        if slots <= 0:
+            product_id = candidate.platform_product_id
+            scan["skipped_ids"].append(product_id)
+            scan["skip_reasons"].append({"product_id": product_id, "reason": "pool_full"})
+            continue
+
+        product = Product(
+            store_id=store.id,
+            aliexpress_product_id=candidate.platform_product_id,
+            url=product_url,
+            title=clean_product_title(candidate.title),
+            discovery_source="chrome_extension_store",
+            discovery_rank=orders_rank,
+            discovered_at=captured_at,
+        )
+        db.add(product)
+        db.flush()
+        product_snapshot = save_store_product_snapshot(
+            db,
+            product,
+            captured_at=captured_at,
+            sold_count=None,
+            title=candidate.title,
+            source="CHROME_EXTENSION",
+            collector_name="chrome_extension_store",
+            collector_version=str(raw.get("extractor_version", "unknown"))[:32],
+            raw_payload={
+                "collection_mode": "store_page_pool_fill",
+                "rank": orders_rank,
+                "product_id": candidate.platform_product_id,
+                "url": product.url,
+                "title": candidate.title,
+                "main_image_url": candidate.image_url,
+                "extension_raw_data": raw,
+            },
+            historical_sales=candidate.historical_sales,
+            history_target_date=target_date,
+            history_source=candidate.history_source,
+            commit=False,
+        )
+        import_historical_sales(
+            db,
+            product.id,
+            product_snapshot.id,
+            candidate.historical_sales,
+            target_date=target_date,
+            commit=False,
+        )
+        calculate_product_daily_metrics(db, product.id, commit=False)
+        scan["added_ids"].append(candidate.platform_product_id)
+        slots -= 1
+
+    return True
 
 
 def save_monitored_store_observation(
@@ -27,25 +238,39 @@ def save_monitored_store_observation(
     ).order_by(Product.aliexpress_product_id)))
     target_ids = [product.aliexpress_product_id for product in targets]
     submitted_targets = raw.get("monitored_product_ids")
-    if (not target_ids or not isinstance(submitted_targets, list)
-            or sorted(submitted_targets) != target_ids):
+    if (
+        not isinstance(submitted_targets, list)
+        or not all(isinstance(product_id, str) for product_id in submitted_targets)
+        or sorted(submitted_targets) != target_ids
+    ):
         raise ValueError("监控商品 ID 已变化，请重新领取店铺任务")
     if raw.get("history_target_date") != item.run.target_date.isoformat():
         raise ValueError("采集日期与任务日期不一致")
     urls = raw.get("visited_page_urls")
-    if not isinstance(urls, list) or not urls or len(urls) > 10:
-        raise ValueError("店铺页访问记录缺失或超过上限")
-    for page_url in [payload.url, *urls]:
-        normalized = normalize_aliexpress_url(page_url, "store")
-        parsed = urlsplit(normalized)
-        if (extract_store_id(normalized) != store.aliexpress_store_id
-                or parsed.path != f"/store/{store.aliexpress_store_id}/pages/all-items.html"
-                or parse_qs(parsed.query).get("shop_sortType") != ["orders_desc"]):
-            raise ValueError("结果包含非目标店铺或非 Orders 排序页面")
+    if not isinstance(urls, list) or not urls:
+        raise ValueError("店铺页访问记录缺失")
+    normalized_visited = [_validated_orders_url(store, page_url) for page_url in [payload.url, *urls]]
+    candidate_page = payload.candidate_page
+    candidate_page_url = None
+    candidate_page_url_error = None
+    if candidate_page is not None:
+        try:
+            candidate_page_url = _validated_orders_url(store, candidate_page.page_url)
+        except ValueError as exc:
+            candidate_page_url_error = str(exc)
+    visited_identities = {_orders_url_identity(value) for value in normalized_visited}
+    if candidate_page is not None:
+        visited_identities.add(
+            _orders_url_identity(candidate_page_url or candidate_page.page_url)
+        )
+    if len(visited_identities) > 11:
+        raise ValueError("店铺任务访问的唯一 Orders 页面不能超过 11 页")
     if payload.platform_store_id != store.aliexpress_store_id:
         raise ValueError("店铺 ID 与任务不一致")
 
     expected = {item.run.target_date - timedelta(days=offset) for offset in range(1, 8)}
+    discovery_state = get_or_create_store_page_discovery_state(db, store)
+    cursor_before = discovery_state.next_page_url
     target_by_id = {product.aliexpress_product_id: product for product in targets}
     submitted: dict[str, tuple[object, dict]] = {}
     for candidate in payload.products:
@@ -73,6 +298,23 @@ def save_monitored_store_observation(
         "missing_ids": sorted(set(target_ids) - set(submitted)),
         "missing_dates": {},
         "visited_page_urls": urls,
+        "visited_unique_page_count": len(visited_identities),
+        "candidate_scan": {
+            "status": "not_requested",
+            "page_url": candidate_page.page_url if candidate_page else None,
+            "scan_complete": candidate_page.scan_complete if candidate_page else None,
+            "has_next_page": candidate_page.has_next_page if candidate_page else None,
+            "next_page_url": candidate_page.next_page_url if candidate_page else None,
+            "candidate_ids": [candidate.platform_product_id for candidate in candidate_page.candidates]
+            if candidate_page else [],
+            "added_ids": [],
+            "skipped_ids": [],
+            "skip_reasons": [],
+            "cursor_before": cursor_before,
+            "cursor_after": cursor_before,
+            "page_diagnostics": candidate_page.diagnostics if candidate_page else {},
+            "error": None,
+        },
     }
     snapshot = StoreSnapshot(
         store_id=store.id,
@@ -80,8 +322,8 @@ def save_monitored_store_observation(
         collector_name="chrome_extension_store",
         collector_version=str(raw.get("extractor_version", "unknown")),
         parse_status="partial",
-        candidate_count=len(submitted),
-        raw_payload={"collection_mode": "monitored_store_daily", "diagnostics": diagnostics},
+        candidate_count=len(submitted) + (len(candidate_page.candidates) if candidate_page else 0),
+        raw_payload={"collection_mode": "monitored_store_daily", "diagnostics": deepcopy(diagnostics)},
     )
     db.add(snapshot)
     db.flush()
@@ -130,9 +372,21 @@ def save_monitored_store_observation(
             metric.end_snapshot_id = product_snapshot.id if product_snapshot else None
             metric.calculation_method = "ixspy_visible_daily_increment" if observed else "ixspy_store_page_pending"
             metric.calculated_at = datetime.now(timezone.utc)
-    complete = not diagnostics["missing_dates"]
+    candidate_scan_complete = _process_candidate_page(
+        db,
+        store,
+        candidate_page,
+        item.run.target_date,
+        raw,
+        diagnostics["candidate_scan"],
+        candidate_page_url_error,
+    )
+    complete = not diagnostics["missing_dates"] and candidate_scan_complete
     snapshot.parse_status = "success" if complete else "partial"
-    snapshot.raw_payload = {"collection_mode": "monitored_store_daily", "diagnostics": diagnostics}
+    snapshot.raw_payload = {
+        "collection_mode": "monitored_store_daily",
+        "diagnostics": deepcopy(diagnostics),
+    }
     db.flush()
     for metric_date in sorted(expected):
         calculate_store_daily_metric(db, store.id, metric_date, commit=False)

@@ -213,7 +213,7 @@ def advance_store_page_cursor(
     return state
 
 
-def _candidate_values(
+def candidate_daily_values(
     candidate: BrowserStoreProduct, expected_dates: set[date]
 ) -> dict[date, int] | None:
     points = candidate.historical_sales
@@ -309,7 +309,7 @@ def save_store_page_candidates(
         except (HTTPException, ValueError) as exc:
             diagnostics.append({"product_id": product_id, "reason": "invalid_product_url"})
             continue
-        values = _candidate_values(candidate, expected_dates)
+        values = candidate_daily_values(candidate, expected_dates)
         if values is None:
             diagnostics.append({"product_id": product_id, "reason": "incomplete_or_cumulative_ixspy"})
             continue

@@ -1242,10 +1242,16 @@ def browser_collection_store_discovery(
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    candidate_status = diagnostics.get("candidate_scan", {}).get("status")
+    partial_reasons = []
+    if diagnostics["missing_dates"]:
+        partial_reasons.append(f"待补 {len(diagnostics['missing_dates'])} 件商品的七日日增量")
+    if candidate_status in {"incomplete", "rejected", "stale"}:
+        partial_reasons.append("候选商品页扫描未完成，游标未推进")
     run = finish_item(
         db, item, "SUCCEEDED" if complete else "PARTIAL",
         error_type=None if complete else "ixspy_store_page_pending",
-        error_message=None if complete else f"待补 {len(diagnostics['missing_dates'])} 件商品的七日日增量",
+        error_message=None if complete else "；".join(partial_reasons),
         commit=False,
     )
     db.commit()

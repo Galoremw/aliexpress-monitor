@@ -2031,3 +2031,295 @@ def test_pending_store_discovery_is_claimed_even_if_run_phase_was_advanced(clien
     assert response.json()["item"]["store_id"] == store["id"]
     assert response.json()["run"]["phase"] == "STORE_DISCOVERY"
     assert response.json()["item"]["status"] == "RUNNING"
+
+
+def _history_candidate(product_id, target_date, values=None, *, complete=True):
+    dates = [target_date - timedelta(days=offset) for offset in range(7, 0, -1)]
+    supplied = values or [2, 0, 3, 1, 4, 0, 2]
+    if not complete:
+        supplied = supplied[:6]
+    points = [
+        {"date": metric_date.isoformat(), "value": value, "value_type": "daily_increment"}
+        for metric_date, value in zip(dates, supplied)
+    ]
+    return {
+        "platform_product_id": product_id,
+        "url": f"https://www.aliexpress.com/item/{product_id}.html",
+        "title": f"Candidate {product_id}",
+        "historical_sales": points,
+        "history_source": "ixspy_visible_daily_increment",
+        "history_daily_capture_complete": complete,
+        "history_expected_dates": [metric_date.isoformat() for metric_date in dates],
+        "history_missing_dates": [] if complete else [dates[-1].isoformat()],
+    }
+
+
+def _daily_store_request(store_id, page_url, target_date, monitored_ids, candidate_page, histories=None):
+    histories = histories or {}
+    return {
+        "platform_store_id": store_id,
+        "url": page_url,
+        "products": [
+            {
+                "platform_product_id": product_id,
+                "url": f"https://www.aliexpress.com/item/{product_id}.html",
+                "historical_sales": [
+                    {"date": metric_date.isoformat(), "value": value, "value_type": "daily_increment"}
+                    for metric_date, value in values.items()
+                ],
+                "history_source": "ixspy_visible_daily_increment",
+            }
+            for product_id, values in histories.items()
+        ],
+        "raw_data": {
+            "collection_mode": "monitored_store_daily",
+            "monitored_product_ids": sorted(monitored_ids),
+            "visited_page_urls": [page_url],
+            "history_target_date": target_date.isoformat(),
+        },
+        "candidate_page": candidate_page,
+    }
+
+
+def _candidate_page(page_url, store_id, candidates, *, scan_complete=True):
+    return {
+        "page_url": page_url,
+        "has_next_page": True,
+        "next_page_url": (
+            f"https://www.aliexpress.com/store/{store_id}/pages/all-items.html"
+            "?page=2&sortType=bestmatch_sort&shop_sortType=orders_desc"
+        ),
+        "scan_complete": scan_complete,
+        "candidates": candidates,
+        "diagnostics": {"visible_product_count": len(candidates)},
+    }
+
+
+def test_underfilled_daily_store_adds_candidates_and_advances_cursor(client, db_session):
+    store = create_store(client, "990301")
+    tracked = [create_product(client, store["id"], f"1005009930{index:03d}") for index in range(19)]
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    low = _history_candidate("1005009931001", target_date, [1, 0, 1, 0, 1, 0, 1])
+    high = _history_candidate("1005009931002", target_date, [8, 0, 7, 0, 6, 0, 5])
+    payload = _daily_store_request(
+        "990301", page_url, target_date,
+        [product["aliexpress_product_id"] for product in tracked],
+        _candidate_page(page_url, "990301", [low, high]),
+    )
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    active_ids = {
+        product.aliexpress_product_id
+        for product in db_session.query(Product).filter_by(store_id=store["id"], status="active")
+    }
+    assert len(active_ids) == 20
+    assert high["platform_product_id"] in active_ids
+    assert low["platform_product_id"] not in active_ids
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert state.next_page_url.endswith("page=2&sortType=bestmatch_sort&shop_sortType=orders_desc")
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    assert snapshot.raw_payload["diagnostics"]["candidate_scan"]["added_ids"] == [
+        high["platform_product_id"]
+    ]
+
+
+def test_incomplete_candidate_is_skipped_and_valid_page_advances(client, db_session):
+    store = create_store(client, "990302")
+    tracked = create_product(client, store["id"], "1005009932001")
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    incomplete = _history_candidate("1005009932002", target_date, complete=False)
+    payload = _daily_store_request(
+        "990302", page_url, target_date, [tracked["aliexpress_product_id"]],
+        _candidate_page(page_url, "990302", [incomplete]),
+    )
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.query(Product).filter_by(store_id=store["id"], status="active").count() == 1
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert state.last_outcome == "advanced"
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    candidate_scan = snapshot.raw_payload["diagnostics"]["candidate_scan"]
+    assert candidate_scan["skipped_ids"] == [incomplete["platform_product_id"]]
+
+
+def test_candidate_scan_timeout_preserves_metrics_and_cursor(client, db_session):
+    store = create_store(client, "990303")
+    tracked = create_product(client, store["id"], "1005009933001")
+    target_date = date.today()
+    values = {
+        target_date - timedelta(days=offset): value
+        for offset, value in zip(range(1, 8), [2, 0, 3, 1, 4, 0, 2], strict=True)
+    }
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    candidate = _history_candidate("1005009933002", target_date)
+    payload = _daily_store_request(
+        "990303", page_url, target_date, [tracked["aliexpress_product_id"]],
+        _candidate_page(page_url, "990303", [candidate], scan_complete=False),
+        {tracked["aliexpress_product_id"]: values},
+    )
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    metrics = db_session.query(ProductDailyMetric).filter_by(product_id=tracked["id"]).all()
+    assert len(metrics) == 7
+    assert all(metric.is_estimable for metric in metrics)
+    assert db_session.query(Product).filter_by(store_id=store["id"]).count() == 1
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert state.next_page_url == page_url
+    assert state.last_outcome == "incomplete"
+    assert response.json()["items"][0]["status"] == "PARTIAL"
+
+
+def test_empty_pool_daily_store_accepts_candidate_page(client, db_session):
+    store = create_store(client, "990304")
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    candidate = _history_candidate("1005009934001", target_date)
+    payload = _daily_store_request(
+        "990304", page_url, target_date, [],
+        _candidate_page(page_url, "990304", [candidate]),
+    )
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.query(Product).filter_by(store_id=store["id"], status="active").count() == 1
+    metrics = db_session.query(ProductDailyMetric).filter(
+        ProductDailyMetric.product_id == db_session.query(Product.id).filter_by(store_id=store["id"]).scalar()
+    ).all()
+    assert len(metrics) == 7
+
+
+def test_full_pool_skips_candidate_page_without_advancing_cursor(client, db_session):
+    store = create_store(client, "990305")
+    tracked = [create_product(client, store["id"], f"1005009935{index:03d}") for index in range(20)]
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    candidate = _history_candidate("1005009935999", target_date)
+    payload = _daily_store_request(
+        "990305", page_url, target_date,
+        [product["aliexpress_product_id"] for product in tracked],
+        _candidate_page(page_url, "990305", [candidate]),
+    )
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.query(Product).filter_by(store_id=store["id"]).count() == 20
+    assert db_session.get(StorePageDiscoveryState, store["id"]).next_page_url == page_url
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    assert snapshot.raw_payload["diagnostics"]["candidate_scan"]["status"] == "pool_full"
+
+
+def test_candidate_page_url_limit_counts_unique_urls(client, db_session):
+    store = create_store(client, "990306")
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    first = claim_item(client).json()["item"]
+    first_url = first["discovery_page_url"]
+    eleven_urls = [
+        first_url,
+        *[
+            f"https://www.aliexpress.com/store/990306/pages/all-items.html"
+            f"?page={page}&sortType=bestmatch_sort&shop_sortType=orders_desc"
+            for page in range(2, 12)
+        ],
+    ]
+    payload = _daily_store_request(
+        "990306", first_url, target_date, [],
+        _candidate_page(first_url, "990306", []),
+    )
+    payload["raw_data"]["visited_page_urls"] = eleven_urls + [first_url, first_url]
+    accepted = client.post(
+        f"/api/browser-collection/items/{first['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    second_store = create_store(client, "990307")
+    client.post(f"/api/stores/{second_store['id']}/browser-collection")
+    second = claim_item(client).json()["item"]
+    second_url = second["discovery_page_url"]
+    twelve_urls = [
+        second_url,
+        *[
+            f"https://www.aliexpress.com/store/990307/pages/all-items.html"
+            f"?page={page}&sortType=bestmatch_sort&shop_sortType=orders_desc"
+            for page in range(2, 13)
+        ],
+    ]
+    too_many = _daily_store_request(
+        "990307", second_url, target_date, [],
+        _candidate_page(second_url, "990307", []),
+    )
+    too_many["raw_data"]["visited_page_urls"] = twelve_urls
+
+    rejected = client.post(
+        f"/api/browser-collection/items/{second['id']}/store-discovery",
+        json=add_claim_credentials(too_many),
+    )
+
+    assert rejected.status_code == 409
+
+
+def test_malformed_candidate_page_url_preserves_monitored_metrics(client, db_session):
+    store = create_store(client, "990308")
+    tracked = create_product(client, store["id"], "1005009938001")
+    target_date = date.today()
+    values = {
+        target_date - timedelta(days=offset): value
+        for offset, value in zip(range(1, 8), [2, 0, 3, 1, 4, 0, 2], strict=True)
+    }
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    candidate_page = _candidate_page(page_url, "990308", [])
+    candidate_page["page_url"] = "https://["
+    payload = _daily_store_request(
+        "990308", page_url, target_date, [tracked["aliexpress_product_id"]], candidate_page,
+        {tracked["aliexpress_product_id"]: values},
+    )
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    metrics = db_session.query(ProductDailyMetric).filter_by(product_id=tracked["id"]).all()
+    assert len(metrics) == 7
+    assert all(metric.is_estimable for metric in metrics)
+    assert db_session.get(StorePageDiscoveryState, store["id"]).next_page_url == page_url
+    assert response.json()["items"][0]["status"] == "PARTIAL"
