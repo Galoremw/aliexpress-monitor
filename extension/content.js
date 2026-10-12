@@ -3,6 +3,13 @@
   if (!collector) return;
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === "STORE_CANDIDATE_SCAN") {
+      Promise.resolve()
+        .then(() => collector.collectStoreCandidatePage(message))
+        .then(sendResponse)
+        .catch((error) => sendResponse({ state: "failed", message: error.message || "候选商品页读取失败" }));
+      return true;
+    }
     if (message?.type === "collect-visible-reviews") {
       collector.collectReviews(message.known_keys || [], message.max_new_reviews || 100)
         .then(sendResponse)

@@ -6,12 +6,15 @@ const test = require("node:test");
 
 const source = fs.readFileSync(path.join(__dirname, "../extension/content.js"), "utf8");
 
-function makeMessageListener(collect, sendRuntimeMessage = async () => ({ ok: true })) {
+function makeMessageListener(collect, sendRuntimeMessage = async () => ({ ok: true }), candidateScan = null) {
   let listener;
   const window = {};
   window.top = window;
   vm.runInNewContext(source, {
-    AliExpressMonitorPageCollector: { collect },
+    AliExpressMonitorPageCollector: {
+      collect,
+      collectStoreCandidatePage: candidateScan || (async () => ({ state: "failed", message: "not configured" })),
+    },
     chrome: {
       runtime: {
         onMessage: { addListener(callback) { listener = callback; } },
@@ -55,6 +58,38 @@ test("store selection responds when the collector returns a promise", async () =
   const result = await request(listener, "STORE_SELECT_PAGE");
   assert.equal(result.state, "ready");
   assert.equal(result.page_result.candidates.length, 0);
+});
+
+test("scheduled candidate scan routes its request to the page collector", async () => {
+  let received;
+  const expectedPageUrl = "https://www.aliexpress.com/store/1103845415/pages/all-items.html?shop_sortType=orders_desc&page=2";
+  const listener = makeMessageListener(
+    () => ({ state: "failed" }),
+    async () => ({ ok: true }),
+    async (message) => {
+      received = message;
+      return { state: "ready", page_result: { url: message.expectedPageUrl } };
+    },
+  );
+  const result = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("content script did not respond")), 1000);
+    assert.equal(listener({
+      type: "STORE_CANDIDATE_SCAN",
+      targetDate: "2026-10-12",
+      expectedStoreId: "1103845415",
+      expectedPageUrl,
+    }, null, (value) => {
+      clearTimeout(timer);
+      resolve(value);
+    }), true);
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(received)), {
+    type: "STORE_CANDIDATE_SCAN",
+    targetDate: "2026-10-12",
+    expectedStoreId: "1103845415",
+    expectedPageUrl,
+  });
+  assert.equal(result.page_result.url, expectedPageUrl);
 });
 
 test("synchronous collector errors return a failed response", async () => {

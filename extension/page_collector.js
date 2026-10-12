@@ -1,7 +1,7 @@
 (function () {
   if (globalThis.AliExpressMonitorPageCollector) return;
 
-  const PAGE_COLLECTOR_VERSION = "0.6.68";
+  const PAGE_COLLECTOR_VERSION = "0.6.74";
   const clean = (value) => value?.replace(/\s+/g, " ").trim() || null;
   const cleanProductTitle = (value) => {
     const title = clean(value);
@@ -1152,6 +1152,141 @@
     };
   }
 
+  async function collectStoreCandidatePage(message = {}) {
+    if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
+    const expectedStoreId = String(message.expectedStoreId || "");
+    const expectedPageUrl = String(message.expectedPageUrl || "");
+    const storeId = storeIdFromPage();
+    if (!expectedStoreId || !storeId || storeId !== expectedStoreId) {
+      return { state: "failed", message: "当前页面店铺 ID 与候选扫描任务不一致" };
+    }
+    const identityError = storeIdentityError(storeId);
+    if (identityError) return { state: "failed", message: identityError };
+    if (!storeOrdersSortSelected()) {
+      return { state: "failed", message: "候选扫描要求店铺商品页使用 Orders 排序" };
+    }
+    let expectedUrl;
+    try {
+      expectedUrl = new URL(expectedPageUrl);
+      if (expectedUrl.protocol !== "https:"
+        || !/(?:^|\.)aliexpress\.com$/i.test(expectedUrl.hostname)
+        || expectedUrl.pathname !== `/store/${storeId}/pages/all-items.html`
+        || expectedUrl.searchParams.get("shop_sortType") !== "orders_desc") {
+        throw new Error("invalid Orders URL");
+      }
+    } catch {
+      return { state: "failed", message: "候选页地址不是有效的店铺 Orders 页面" };
+    }
+    let currentUrl;
+    try {
+      currentUrl = new URL(location.href);
+    } catch {
+      return { state: "failed", message: "无法确认当前候选页地址" };
+    }
+    if (currentUrl.href !== expectedUrl.href) {
+      return { state: "failed", message: "当前页面不是后端指定的候选页地址" };
+    }
+    let latest = scanStoreProducts();
+    let stableRounds = 0;
+    for (let round = 0; round < 12 && stableRounds < 2; round += 1) {
+      const previousCount = latest.products.length;
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "instant" });
+      const grew = await waitForStoreGrowth(previousCount, 900);
+      latest = scanStoreProducts();
+      stableRounds = grew || latest.products.length > previousCount ? 0 : stableRounds + 1;
+      if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
+    }
+
+    const candidates = latest.products.slice(0, 50);
+    const pageScan = {
+      url: currentUrl.href,
+      candidate_node_count: latest.candidateNodeCount,
+      visible_product_count: latest.products.length,
+      candidate_count: candidates.length,
+      candidate_ids: candidates.map((candidate) => candidate.platform_product_id),
+      candidate_limit_reached: latest.products.length > candidates.length,
+      has_next_page: storeHasNextPage(),
+      next_page_url: storeNextPageUrl(storeId),
+    };
+    const diagnostics = { page_scan: pageScan, chart_reads: [] };
+    if (!candidates.length) {
+      return {
+        state: "ready",
+        page_result: {
+          platform_store_id: storeId,
+          url: currentUrl.href,
+          candidates,
+          has_next_page: pageScan.has_next_page,
+          next_page_url: pageScan.next_page_url,
+          scan_complete: false,
+          diagnostics: { ...diagnostics, outcome: "product_cards_unavailable" },
+        },
+      };
+    }
+    if (pageScan.candidate_limit_reached) {
+      return {
+        state: "ready",
+        page_result: {
+          platform_store_id: storeId,
+          url: currentUrl.href,
+          candidates: [],
+          has_next_page: pageScan.has_next_page,
+          next_page_url: pageScan.next_page_url,
+          scan_complete: false,
+          diagnostics: { ...diagnostics, outcome: "candidate_limit_exceeded" },
+        },
+      };
+    }
+
+    for (const [index, product] of candidates.entries()) {
+      if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证", diagnostics };
+      product.orders_rank = index + 1;
+      let history;
+      let retryPasses = 0;
+      let readError = null;
+      try {
+        ({ history, retryPasses } = await collectStoreProductHistoryWithRetry(
+          product, message.targetDate, index === 0 ? 6000 : 800,
+        ));
+      } catch (error) {
+        if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证", diagnostics };
+        history = unavailableStoreHistory(message.targetDate, "ixspy_store_candidate_chart_read_error");
+        readError = String(error?.message || error).slice(0, 300);
+      }
+      const chartRead = {
+        product_id: product.platform_product_id,
+        outcome: history.daily_capture_complete ? "complete" : history.points?.length ? "partial" : "unavailable",
+        source: history.source || (history.points?.length ? "ixspy_visible_daily_increment" : "ixspy_data_unavailable"),
+        point_count: history.points?.length || 0,
+        missing_dates: history.missing_dates || expectedDailyDates(message.targetDate),
+        retry_passes: retryPasses,
+        ...(readError ? { error: readError } : {}),
+      };
+      diagnostics.chart_reads.push(chartRead);
+      if (history.challenge) return { state: "challenge", message: "AliExpress 要求人工完成验证", diagnostics };
+      if (history.login_required) {
+        return { state: "ixspy_login", message: "IXSPY 登录需要人工完成", diagnostics };
+      }
+      product.historical_sales = history.points || [];
+      product.history_source = product.historical_sales.length ? "ixspy_visible_daily_increment" : history.source;
+      product.history_daily_capture_complete = Boolean(history.daily_capture_complete);
+      product.history_expected_dates = history.expected_dates || expectedDailyDates(message.targetDate);
+      product.history_missing_dates = history.missing_dates || product.history_expected_dates;
+    }
+    return {
+      state: "ready",
+      page_result: {
+        platform_store_id: storeId,
+        url: currentUrl.href,
+        candidates,
+        has_next_page: pageScan.has_next_page,
+        next_page_url: pageScan.next_page_url,
+        scan_complete: true,
+        diagnostics,
+      },
+    };
+  }
+
   async function collectStoreSelectionPage(targetDate = localDateString(), options = {}) {
     if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
     const storeId = storeIdFromPage();
@@ -1402,6 +1537,7 @@
         : collectStore(targetDate || localDateString()))
       : collectProduct(45000, targetDate || localDateString()),
     collectReviews,
+    collectStoreCandidatePage,
     readProduct,
     isChallengePage,
   };

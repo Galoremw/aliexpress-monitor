@@ -57,6 +57,7 @@ function makeWorkerHarness({
   const windowRemoves = [];
   const requests = [];
   const collectionMessages = [];
+  const candidateScanMessages = [];
   const notifications = [];
   const pendingTimers = [];
   let nextTabId = 10;
@@ -135,6 +136,7 @@ function makeWorkerHarness({
       async group() { return groupId; },
       async sendMessage(_tabId, message) {
         if (message.type === "collect-visible-page") collectionMessages.push({ ...message });
+        if (message.type === "STORE_CANDIDATE_SCAN") candidateScanMessages.push({ ...message });
         if (message.type === "dianxiaomi-check-ready") return { state: "ready" };
         if (message.type === "dianxiaomi-submit-links") return collectionResult || { state: "succeeded" };
         return collectionResults?.length ? collectionResults.shift()
@@ -255,7 +257,7 @@ function makeWorkerHarness({
   return {
     chrome, context, listeners, storage, queue, dianxiaomiQueue: dianxiaomiItems,
     createdTabs, updatedTabs, removedTabs, windowUpdates, windowCreates, windowRemoves,
-    requests, notifications, collectionMessages, pendingTimers, flush,
+    requests, notifications, collectionMessages, candidateScanMessages, pendingTimers, flush,
     get focusedWindowId() { return focusedWindowId; },
     setCollectionResult(value) { currentCollectionResult = value; },
     setHeartbeatConflict(value) { currentHeartbeatConflict = value; },
@@ -395,6 +397,115 @@ test("store worker merges two Orders pages without opening product detail URLs",
   assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [firstUrl, secondUrl]);
   assert.equal(worker.updatedTabs.some((update) => /\/item\//.test(update.url || "")), false);
   assert.equal(worker.collectionMessages.length, 2);
+});
+
+test("empty monitored pool scans exactly the backend cursor page without opening product details", async () => {
+  const firstUrl = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const cursorUrl = `${firstUrl}&page=2`;
+  const worker = makeWorkerHarness({ collectionResults: [{
+    state: "ready",
+    page_result: {
+      platform_store_id: "123456",
+      url: cursorUrl,
+      candidates: [{ platform_product_id: "1005000000000009", historical_sales: [] }],
+      has_next_page: true,
+      next_page_url: `${firstUrl}&page=3`,
+      scan_complete: true,
+      diagnostics: { chart_reads: [{ product_id: "1005000000000009", outcome: "unavailable" }] },
+    },
+  }] });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: firstUrl, active: true });
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 405,
+    run_id: 9,
+    target_url: firstUrl,
+    discovery_page_url: cursorUrl,
+    target_date: "2026-09-29",
+    monitored_product_ids: [],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.products)), []);
+  assert.equal(result.payload.candidate_page.page_url, cursorUrl);
+  assert.equal(result.payload.candidate_page.scan_complete, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [cursorUrl]);
+  assert.equal(worker.collectionMessages.length, 0, "an empty pool does not invoke the monitored-product reader");
+  assert.equal(worker.candidateScanMessages.length, 1);
+  assert.equal(worker.candidateScanMessages[0].expectedPageUrl, cursorUrl);
+  assert.deepEqual(worker.updatedTabs.map((update) => update.url), [cursorUrl]);
+  assert.equal(worker.updatedTabs.some((update) => /\/item\//.test(update.url || "")), false);
+});
+
+test("store worker reuses a visited cursor URL and submits candidate diagnostics once", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({ collectionResults: [
+    { state: "ready", page_result: { platform_store_id: "123456", url, products: [], has_next_page: false } },
+    { state: "ready", page_result: {
+      platform_store_id: "123456", url,
+      candidates: [{ platform_product_id: "1005000000000009", historical_sales: [] }],
+      has_next_page: false, next_page_url: null, scan_complete: true,
+      diagnostics: { chart_reads: [{ product_id: "1005000000000009", outcome: "unavailable" }] },
+    } },
+  ] });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 406, run_id: 9, target_url: url, discovery_page_url: url,
+    target_date: "2026-09-29", monitored_product_ids: ["1005000000000001"],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.payload.candidate_page.page_url, url);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [url]);
+  assert.equal(worker.candidateScanMessages.length, 1);
+  assert.equal(worker.updatedTabs.length, 0, "the current cursor page is reused without navigation");
+  assert.equal(worker.updatedTabs.some((update) => /\/item\//.test(update.url || "")), false);
+});
+
+test("candidate page timeout submits an incomplete candidate scan without advancing the page", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc&page=2";
+  const worker = makeWorkerHarness({ collectionResult: new Promise(() => {}) });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const collecting = worker.context.collectStorePages(tab.id, {
+    id: 407, run_id: 9,
+    target_url: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+    discovery_page_url: url, target_date: "2026-09-29", monitored_product_ids: [],
+  });
+  await worker.flush();
+  assert.equal(worker.candidateScanMessages.length, 1);
+  const timeout = worker.pendingTimers.find((timer) => timer.delay === 4 * 60 * 1000);
+  assert.ok(timeout, "candidate scan uses the bounded page response timeout");
+  timeout.callback();
+  const result = await collecting;
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.payload.candidate_page.scan_complete, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.candidate_page.candidates)), []);
+  assert.equal(result.payload.candidate_page.diagnostics.outcome, "page_response_timeout");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [url]);
+});
+
+test("incomplete candidate page never forwards its partial candidates to the backend", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc&page=2";
+  const worker = makeWorkerHarness({ collectionResult: {
+    state: "ready",
+    page_result: {
+      platform_store_id: "123456", url,
+      candidates: [{ platform_product_id: "1005000000000009", historical_sales: [] }],
+      has_next_page: true, next_page_url: `${url}&page=3`, scan_complete: false,
+      diagnostics: { outcome: "page_structure_incomplete" },
+    },
+  } });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 408, run_id: 9,
+    target_url: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+    discovery_page_url: url, target_date: "2026-09-29", monitored_product_ids: [],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.payload.candidate_page.scan_complete, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.candidate_page.candidates)), []);
+  assert.equal(result.payload.candidate_page.next_page_url, `${url}&page=3`);
 });
 
 test("store worker stops at a cross-store next link and leaves missing IDs pending", async () => {

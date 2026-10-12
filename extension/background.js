@@ -557,6 +557,21 @@ async function sendCollectMessage(
   }
 }
 
+async function sendStoreCandidateScanMessage(tabId, targetDate, storeId, pageUrl) {
+  const message = {
+    type: "STORE_CANDIDATE_SCAN",
+    targetDate,
+    expectedStoreId: storeId,
+    expectedPageUrl: pageUrl,
+  };
+  try {
+    return await chrome.tabs.sendMessage(tabId, message);
+  } catch {
+    await injectCollector(tabId);
+    return chrome.tabs.sendMessage(tabId, message);
+  }
+}
+
 function safeStoreOrdersUrl(url, storeId) {
   try {
     const parsed = new URL(url);
@@ -666,8 +681,8 @@ async function waitForStorePage(tabId, expectedUrl) {
 async function collectStorePages(tabId, item) {
   const storeId = new URL(item.target_url).pathname.match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
   const targets = [...new Set((item.monitored_product_ids || []).map(String))].sort();
-  if (!storeId || !targets.length || !safeStoreOrdersUrl(item.target_url, storeId)) {
-    return { state: "failed", message: "店铺任务缺少 Orders 地址或监控商品 ID" };
+  if (!storeId || !safeStoreOrdersUrl(item.target_url, storeId)) {
+    return { state: "failed", message: "店铺任务缺少有效的 Orders 地址" };
   }
   const targetSet = new Set(targets);
   const { key: progressKey, progress, products } = await loadStoreProgress(item, storeId, targets);
@@ -675,7 +690,7 @@ async function collectStorePages(tabId, item) {
   const visitedThisAttempt = new Set();
   const startedAt = Date.now();
   let collectionInterrupted = false;
-  for (let page = 0; page < 10 && Date.now() - startedAt < STORE_COLLECTION_WORK_MS; page += 1) {
+  for (let page = 0; targets.length && page < 10 && Date.now() - startedAt < STORE_COLLECTION_WORK_MS; page += 1) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab || !safeStoreOrdersUrl(tab.url, storeId) || visitedThisAttempt.has(tab.url)) break;
     visitedThisAttempt.add(tab.url);
@@ -720,6 +735,105 @@ async function collectStorePages(tabId, item) {
     await chrome.tabs.update(tabId, { url: nextUrl, active: true });
     await waitForStorePage(tabId, nextUrl);
   }
+
+  let candidatePage = null;
+  const discoveryUrl = item.discovery_page_url;
+  if (targets.length < 20 && discoveryUrl) {
+    const incompleteCandidatePage = (outcome, message = null, diagnostics = {}) => ({
+      page_url: discoveryUrl,
+      has_next_page: false,
+      next_page_url: null,
+      scan_complete: false,
+      candidates: [],
+      diagnostics: { outcome, ...(message ? { message: String(message).slice(0, 300) } : {}), ...diagnostics },
+    });
+    if (!safeStoreOrdersUrl(discoveryUrl, storeId)) {
+      candidatePage = incompleteCandidatePage("invalid_cursor_url");
+    } else {
+      const cursorIsVisited = visited.has(discoveryUrl);
+      if (!cursorIsVisited && visited.size >= 11) {
+        candidatePage = incompleteCandidatePage("unique_page_limit_reached");
+      } else if (Date.now() - startedAt >= STORE_COLLECTION_WORK_MS) {
+        candidatePage = incompleteCandidatePage("work_budget_exceeded");
+      } else {
+        let pageReady = false;
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
+        if (!tab) {
+          candidatePage = incompleteCandidatePage("collector_tab_unavailable");
+        } else {
+          try {
+            if (tab.url !== discoveryUrl) {
+              await chrome.tabs.update(tabId, { url: discoveryUrl, active: true });
+              await waitForStorePage(tabId, discoveryUrl);
+            }
+            pageReady = true;
+          } catch (error) {
+            candidatePage = incompleteCandidatePage("page_load_timeout", error?.message);
+          }
+        }
+        if (pageReady) {
+          const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+          if (!currentTab || currentTab.url !== discoveryUrl || !safeStoreOrdersUrl(currentTab.url, storeId)) {
+            candidatePage = incompleteCandidatePage("cursor_page_mismatch");
+          } else {
+            visited.add(discoveryUrl);
+            addVisitedStorePage(progress, discoveryUrl);
+            try {
+              const response = await withTimeout(
+                sendStoreCandidateScanMessage(tabId, item.target_date, storeId, discoveryUrl),
+                STORE_PAGE_RESPONSE_TIMEOUT_MS,
+                "店铺候选页读取超时",
+              );
+              if (response?.state === "challenge" || response?.state === "ixspy_login") {
+                return response;
+              }
+              const pageResult = response?.page_result;
+              if (response?.state !== "ready" || !pageResult) {
+                candidatePage = incompleteCandidatePage(
+                  "page_scan_failed", response?.message || "候选页未能完整读取",
+                  response?.diagnostics ? { collector: response.diagnostics } : {},
+                );
+              } else if (String(pageResult.platform_store_id) !== storeId || pageResult.url !== discoveryUrl) {
+                candidatePage = incompleteCandidatePage("page_identity_mismatch", null, {
+                  actual_store_id: pageResult.platform_store_id || null,
+                  actual_url: pageResult.url || null,
+                });
+              } else {
+                const scanComplete = pageResult.scan_complete === true;
+                const nextPageUrl = safeStoreOrdersUrl(pageResult.next_page_url, storeId)
+                  ? pageResult.next_page_url
+                  : null;
+                candidatePage = {
+                  page_url: discoveryUrl,
+                  has_next_page: Boolean(pageResult.has_next_page),
+                  next_page_url: nextPageUrl,
+                  scan_complete: scanComplete,
+                  candidates: scanComplete && Array.isArray(pageResult.candidates)
+                    ? pageResult.candidates.slice(0, 50)
+                    : [],
+                  diagnostics: pageResult.diagnostics || {},
+                };
+                if (pageResult.has_next_page && !nextPageUrl) {
+                  candidatePage.scan_complete = false;
+                  candidatePage.candidates = [];
+                  candidatePage.diagnostics = {
+                    ...candidatePage.diagnostics,
+                    outcome: "invalid_next_page_url",
+                  };
+                }
+              }
+            } catch (error) {
+              candidatePage = incompleteCandidatePage(
+                error?.code === "COLLECTION_TIMEOUT" ? "page_response_timeout" : "page_scan_error",
+                error?.message,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
   const orderedProducts = targets.map((productId) => products.get(productId)).filter(Boolean);
   return {
     state: "ready",
@@ -727,6 +841,7 @@ async function collectStorePages(tabId, item) {
       platform_store_id: storeId,
       url: item.target_url,
       products: orderedProducts,
+      ...(candidatePage ? { candidate_page: candidatePage } : {}),
       raw_data: {
         collection_mode: "monitored_store_daily",
         monitored_product_ids: targets,

@@ -566,6 +566,67 @@ test("store selection page refuses to rank candidates unless Orders sorting is a
   assert.match(result.message, /Orders/i);
 });
 
+test("scheduled candidate scan reads the current Orders page and diagnoses missing charts without zeroes", async () => {
+  const collector = loadStoreCollector({ extraProductIds: ["1005009999999999"] });
+  assert.equal(typeof collector.collectStoreCandidatePage, "function");
+  const result = await collector.collectStoreCandidatePage({
+    targetDate,
+    expectedStoreId: "123456",
+    expectedPageUrl: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.scan_complete, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.page_result.candidates.map((candidate) => candidate.platform_product_id))),
+    [productId, "1005009999999999"]);
+  assert.equal(result.page_result.candidates[0].historical_sales.length, 7);
+  assert.equal(result.page_result.candidates[1].history_daily_capture_complete, false);
+  assert.equal(result.page_result.candidates[1].historical_sales.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.page_result.diagnostics.chart_reads.map((read) => read.product_id))),
+    [productId, "1005009999999999"]);
+  assert.equal(result.page_result.diagnostics.chart_reads[1].outcome, "unavailable");
+});
+
+test("scheduled candidate scan rejects wrong store, sort, and cursor URL", async () => {
+  const expectedPageUrl = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const mismatch = await loadStoreCollector({ visibleStoreId: "1103845415" }).collectStoreCandidatePage({
+    targetDate, expectedStoreId: "123456", expectedPageUrl,
+  });
+  assert.equal(mismatch.state, "failed");
+  assert.match(mismatch.message, /店铺 ID/);
+
+  const wrongSort = await loadStoreCollector({ ordersSorted: false }).collectStoreCandidatePage({
+    targetDate, expectedStoreId: "123456", expectedPageUrl,
+  });
+  assert.equal(wrongSort.state, "failed");
+  assert.match(wrongSort.message, /Orders/);
+
+  const wrongUrl = await loadStoreCollector().collectStoreCandidatePage({
+    targetDate,
+    expectedStoreId: "123456",
+    expectedPageUrl: `${expectedPageUrl}&page=2`,
+  });
+  assert.equal(wrongUrl.state, "failed");
+  assert.match(wrongUrl.message, /候选页地址/);
+
+});
+
+test("candidate scan rejects an over-limit page without forwarding partial candidates", async () => {
+  const collector = loadStoreCollector({
+    extraProductIds: Array.from({ length: 50 }, (_, index) => `100500999999${String(index).padStart(4, "0")}`),
+  });
+  const result = await collector.collectStoreCandidatePage({
+    targetDate,
+    expectedStoreId: "123456",
+    expectedPageUrl: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.scan_complete, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.page_result.candidates)), []);
+  assert.equal(result.page_result.diagnostics.outcome, "candidate_limit_exceeded");
+});
+
 test("store collectors reject an alias URL when the visible storefront ID differs", async () => {
   for (const mode of ["STORE_SELECT_PAGE", "STORE", "STORE_TEST"]) {
     const result = await loadStoreCollector({ visibleStoreId: "1103845415" }).collect(mode, targetDate);
