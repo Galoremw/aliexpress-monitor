@@ -18,7 +18,9 @@ from app.db.models import (
     ProductDailyMetric,
     ProductSnapshot,
     Store,
+    StorePageDiscoveryState,
 )
+from app.services.store_page_discovery import get_or_create_store_page_discovery_state
 
 
 ITEM_TERMINAL_STATUSES = {"SUCCEEDED", "PARTIAL", "FAILED", "SKIPPED"}
@@ -258,11 +260,13 @@ def ensure_browser_collection_run(
     run = BrowserCollectionRun(target_date=selected_date, trigger=trigger)
     db.add(run)
     db.flush()
-    stores = list(db.scalars(
-        select(Store).join(Product).where(Store.status == "active", Product.status == "active")
-        .distinct().order_by(Store.id)
-    ))
+    stores = list(
+        db.scalars(select(Store).where(Store.status == "active").order_by(Store.id))
+    )
     for position, store in enumerate(stores, start=1):
+        get_or_create_store_page_discovery_state(
+            db, store, first_orders_url=_store_collection_url(store)
+        )
         db.add(
             BrowserCollectionItem(
                 run=run,
@@ -284,13 +288,11 @@ def queue_all_store_collections(
     db: Session,
 ) -> tuple[BrowserCollectionRun, int, int, int]:
     """Queue active monitored stores for an explicit manual collection request."""
-    stores = list(db.scalars(
-        select(Store).join(Product).where(
-            Store.status == "active", Product.status == "active"
-        ).distinct().order_by(Store.id)
-    ))
+    stores = list(
+        db.scalars(select(Store).where(Store.status == "active").order_by(Store.id))
+    )
     if not stores:
-        raise ValueError("当前没有已加入监控商品的活跃店铺")
+        raise ValueError("当前没有活跃监控店铺")
 
     run = get_today_run(db)
     if run is not None and run.status in {"PAUSED", "NEEDS_VERIFICATION"}:
@@ -305,6 +307,9 @@ def queue_all_store_collections(
     queued_count = 0
     reused_count = 0
     for store in stores:
+        get_or_create_store_page_discovery_state(
+            db, store, first_orders_url=_store_collection_url(store)
+        )
         key = f"store:{store.id}"
         item = existing.get(key)
         if item is None:
@@ -348,8 +353,9 @@ def queue_store_collection(
     db: Session, store: Store
 ) -> tuple[BrowserCollectionRun, int, int, bool]:
     """Queue one store-page read without opening product detail pages."""
-    if not db.scalar(select(Product.id).where(Product.store_id == store.id, Product.status == "active").limit(1)):
-        raise ValueError("该店铺尚无监控商品，请先按近 7 日增量筛选入池")
+    get_or_create_store_page_discovery_state(
+        db, store, first_orders_url=_store_collection_url(store)
+    )
     run = get_today_run(db)
     if run is None:
         run = BrowserCollectionRun(target_date=_target_date(), trigger="MANUAL")
@@ -636,6 +642,10 @@ def claim_next_item(
     item.claim_token = secrets.token_urlsafe(32)
     item.error_type = None
     item.error_message = None
+    if item.target_type == "STORE" and item.store is not None:
+        get_or_create_store_page_discovery_state(
+            db, item.store, first_orders_url=_store_collection_url(item.store)
+        )
     run.status = "RUNNING"
     run.started_at = run.started_at or now
     run.completed_at = None
@@ -904,12 +914,15 @@ def record_heartbeat(
 def serialize_item(item: BrowserCollectionItem, *, include_targets: bool = False) -> dict:
     title = item.product.title if item.product else item.store.name if item.store else None
     targets: list[str] = []
+    discovery_page_url = None
     if include_targets and item.target_type == "STORE" and item.store_id is not None:
         session = object_session(item)
         if session is not None:
             targets = sorted(session.scalars(select(Product.aliexpress_product_id).where(
                 Product.store_id == item.store_id, Product.status == "active"
             )).all())
+            state = session.get(StorePageDiscoveryState, item.store_id)
+            discovery_page_url = state.next_page_url if state is not None else None
     return {
         "id": item.id,
         "run_id": item.run_id,
@@ -928,6 +941,7 @@ def serialize_item(item: BrowserCollectionItem, *, include_targets: bool = False
         "error_type": item.error_type,
         "error_message": item.error_message,
         "monitored_product_ids": targets,
+        "discovery_page_url": discovery_page_url,
     }
 
 

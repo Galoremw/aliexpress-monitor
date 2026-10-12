@@ -316,6 +316,7 @@ class BrowserCollectionItemRead(BaseModel):
     error_type: str | None
     error_message: str | None
     monitored_product_ids: list[str] = Field(default_factory=list)
+    discovery_page_url: str | None = None
 
 
 class BrowserCollectionRunRead(BaseModel):

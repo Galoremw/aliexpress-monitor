@@ -9,10 +9,15 @@ from app.db.models import (
     ProductDailyMetric,
     ProductSnapshot,
     Store,
+    StorePageDiscoveryState,
     StoreSnapshot,
 )
 from app.services.browser_collection import _products_with_recent_history_for_date
 from app.services.metrics import calculate_product_daily_metrics
+from app.services.store_page_discovery import (
+    advance_store_page_cursor,
+    get_or_create_store_page_discovery_state,
+)
 
 _last_claim_credentials = None
 
@@ -640,10 +645,14 @@ def test_ensure_daily_run_is_idempotent_and_starts_with_store_tasks(client, db_s
     assert items[0].store_id == store["id"]
 
 
-def test_daily_run_excludes_stores_without_monitored_products(client, db_session):
-    create_store(client, "990102")
+def test_scheduled_run_includes_active_store_without_products(client, db_session):
+    empty = create_store(client, "990102")
     selected = create_store(client, "990103")
     create_product(client, selected["id"], "1005009910301")
+    inactive = create_store(client, "990109")
+    create_product(client, inactive["id"], "1005009910901")
+    db_session.get(Store, inactive["id"]).status = "inactive"
+    db_session.commit()
 
     response = client.post(
         "/api/browser-collection/runs/ensure",
@@ -652,8 +661,9 @@ def test_daily_run_excludes_stores_without_monitored_products(client, db_session
 
     assert response.status_code == 200
     items = db_session.query(BrowserCollectionItem).all()
-    assert len(items) == 1
-    assert items[0].store_id == selected["id"]
+    assert {item.store_id for item in items} == {empty["id"], selected["id"]}
+    assert len(items) == 2
+    assert all(item.target_type == "STORE" for item in items)
 
 
 def test_store_claim_contains_only_active_monitored_ids(client, db_session):
@@ -672,13 +682,47 @@ def test_store_claim_contains_only_active_monitored_ids(client, db_session):
     assert claim["monitored_product_ids"] == ["1005009910602"]
 
 
-def test_store_button_requires_existing_monitoring_pool(client, db_session):
+def test_manual_store_collection_queues_empty_pool_for_discovery(client, db_session):
     store = create_store(client, "990108")
 
     response = client.post(f"/api/stores/{store['id']}/browser-collection")
 
-    assert response.status_code == 409
-    assert db_session.query(BrowserCollectionItem).count() == 0
+    assert response.status_code == 200, response.text
+    assert response.json()["queued_count"] == 1
+    item = claim_item(client).json()["item"]
+    assert item["target_type"] == "STORE"
+    assert item["monitored_product_ids"] == []
+    assert item["discovery_page_url"].endswith("shop_sortType=orders_desc")
+    assert db_session.query(BrowserCollectionItem).count() == 1
+
+
+def test_store_claim_exposes_persisted_discovery_cursor(client, db_session):
+    store = create_store(client, "990110")
+    state = get_or_create_store_page_discovery_state(
+        db_session, db_session.get(Store, store["id"])
+    )
+    next_url = (
+        f"https://www.aliexpress.com/store/{store['aliexpress_store_id']}/pages/all-items.html"
+        "?page=4&sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
+    advance_store_page_cursor(
+        db_session,
+        db_session.get(Store, store["id"]),
+        scanned_url=state.next_page_url,
+        has_next_page=True,
+        next_page_url=next_url,
+        scan_complete=True,
+    )
+    db_session.commit()
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+
+    claim = claim_item(client).json()["item"]
+
+    assert claim["store_id"] == store["id"]
+    assert claim["monitored_product_ids"] == []
+    assert claim["discovery_page_url"] == next_url
+    persisted = db_session.get(StorePageDiscoveryState, store["id"])
+    assert persisted.next_page_url == next_url
 
 
 def test_manual_store_intake_rejects_empty_daily_mode_payload(client, db_session):
