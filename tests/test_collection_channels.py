@@ -4,7 +4,14 @@ from zoneinfo import ZoneInfo
 
 from app.collectors.base import CollectorResult
 from app.collectors.dependencies import get_collector
-from app.db.models import CollectionAttempt, ManualCollectionTask, Product, ProductSnapshot, StoreSnapshot
+from app.db.models import (
+    CollectionAttempt,
+    ManualCollectionTask,
+    Product,
+    ProductSnapshot,
+    StorePageDiscoveryState,
+    StoreSnapshot,
+)
 
 
 def create_product(client, product_id="100500700"):
@@ -30,6 +37,64 @@ def extension_payload(product_id="100500700", sold_count=88):
         "review_count": 321,
         "captured_at": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
         "raw_data": {"extractor_version": "extension-test"},
+    }
+
+
+def _ranked_page_candidate(store_id: str, index: int, *, values=None, complete=True):
+    product_id = f"10050199{store_id[-3:]}{index:03d}"
+    dates = [f"2026-10-{day:02d}" for day in range(5, 12)]
+    values = list(values if values is not None else range(index + 1, index + 8))
+    points = [
+        {"date": day, "value": value, "value_type": "daily_increment"}
+        for day, value in zip(dates, values)
+    ]
+    if not complete:
+        points.pop()
+    return {
+        "platform_product_id": product_id,
+        "url": f"https://www.aliexpress.com/item/{product_id}.html",
+        "title": f"Candidate {index}",
+        "history_source": "ixspy_visible_daily_increment",
+        "history_daily_capture_complete": True,
+        "history_expected_dates": dates,
+        "history_missing_dates": [] if complete else [dates[-1]],
+        "historical_sales": points,
+    }
+
+
+def _ranked_page_payload(store_id: str, candidates, *, page=1, has_next_page=True):
+    next_page_url = None
+    if has_next_page:
+        next_page_url = (
+            f"https://www.aliexpress.com/store/{store_id}/pages/all-items.html"
+            f"?page={page + 1}&sortType=bestmatch_sort&shop_sortType=orders_desc"
+        )
+    return {
+        "platform_store_id": store_id,
+        "url": (
+            f"https://www.aliexpress.com/store/{store_id}/pages/all-items.html"
+            f"?page={page}&sortType=bestmatch_sort&shop_sortType=orders_desc"
+        ),
+        "products": candidates,
+        "raw_data": {
+            "extractor_version": "extension-store-selection-test",
+            "collection_mode": "top_7d_increment_selection",
+            "selection_method": "ixspy_visible_latest_7_day_increment_sum",
+            "order_sort_verified": True,
+            "scan_complete": True,
+            "has_next_page": has_next_page,
+            "next_page_url": next_page_url,
+            "candidate_count": 30,
+            "unique_candidate_count": 30,
+            "history_target_date": "2026-10-12",
+            "selection": [
+                {
+                    "product_id": candidate["platform_product_id"],
+                    "orders_rank": index + 1,
+                }
+                for index, candidate in enumerate(candidates)
+            ],
+        },
     }
 
 
@@ -145,7 +210,7 @@ def test_browser_extension_store_discovery_adds_top_twenty_links(client, db_sess
     } == {f"https://ae01.alicdn.com/kf/{index}.jpg" for index in range(20)}
 
 
-def test_ranked_store_enrollment_requires_twenty_when_store_has_at_least_twenty_known_products(client, db_session):
+def test_ranked_store_enrollment_preserves_overfilled_pool(client, db_session):
     store = client.post(
         "/api/stores",
         json={"name": "Ranked Store", "url": "https://www.aliexpress.com/store/770708"},
@@ -166,7 +231,7 @@ def test_ranked_store_enrollment_requires_twenty_when_store_has_at_least_twenty_
 
     payload = {
         "platform_store_id": "770708",
-        "url": "https://www.aliexpress.com/store/770708?shop_sortType=orders_desc",
+        "url": "https://www.aliexpress.com/store/770708/pages/all-items.html?shop_sortType=orders_desc",
         "products": [
             {
                 "platform_product_id": item.aliexpress_product_id,
@@ -176,26 +241,33 @@ def test_ranked_store_enrollment_requires_twenty_when_store_has_at_least_twenty_
         ],
         "raw_data": {
             "collection_mode": "top_7d_increment_selection",
+            "order_sort_verified": True,
+            "scan_complete": True,
+            "has_next_page": False,
+            "next_page_url": None,
+            "history_target_date": "2026-10-12",
+            "candidate_count": 21,
             "unique_candidate_count": 21,
         },
     }
 
     response = client.post("/api/collection/browser-extension/store", json=payload)
 
-    assert response.status_code == 409
-    assert "20" in response.json()["detail"]
+    assert response.status_code == 201, response.text
+    assert response.json()["added_count"] == 0
+    assert response.json()["deactivated_count"] == 0
     assert all(item.status == "active" for item in products)
 
 
-def test_ranked_store_enrollment_rejects_incomplete_ixspy_histories_even_when_flagged_complete(client, db_session):
+def test_ranked_store_enrollment_skips_incomplete_histories_even_when_flagged_complete(client, db_session):
     store = client.post(
         "/api/stores",
         json={"name": "Incomplete Ranked Store", "url": "https://www.aliexpress.com/store/770712"},
     ).json()
     products = []
     expected_dates = [
-        "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25",
-        "2026-09-26", "2026-09-27", "2026-09-28",
+            "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+            "2026-10-09", "2026-10-10", "2026-10-11",
     ]
     for index in range(20):
         product_id = f"10050077074{index:02d}"
@@ -216,8 +288,8 @@ def test_ranked_store_enrollment_rejects_incomplete_ixspy_histories_even_when_fl
         history_dates = expected_dates
         if index == 18:
             history_dates = [
-                "2026-09-22", "2026-09-23", "2026-09-25", "2026-09-26",
-                "2026-09-27", "2026-09-28", "2026-09-29",
+                "2026-10-05", "2026-10-06", "2026-10-08", "2026-10-09",
+                "2026-10-10", "2026-10-11", "2026-10-12",
             ]
         selected.append({
             "platform_product_id": product.aliexpress_product_id,
@@ -235,23 +307,31 @@ def test_ranked_store_enrollment_rejects_incomplete_ixspy_histories_even_when_fl
         "/api/collection/browser-extension/store",
         json={
             "platform_store_id": "770712",
-            "url": "https://www.aliexpress.com/store/770712?shop_sortType=orders_desc&page=2",
+            "url": "https://www.aliexpress.com/store/770712/pages/all-items.html?shop_sortType=orders_desc",
             "products": selected,
             "raw_data": {
                 "collection_mode": "top_7d_increment_selection",
+                "order_sort_verified": True,
+                "scan_complete": True,
+                "has_next_page": False,
+                "next_page_url": None,
+                "history_target_date": "2026-10-12",
+                "candidate_count": 20,
                 "selection_method": "ixspy_visible_latest_7_day_increment_sum",
                 "unique_candidate_count": 20,
             },
         },
     )
 
-    assert response.status_code == 409
-    assert "完整" in response.json()["detail"]
+    assert response.status_code == 201, response.text
+    assert response.json()["added_count"] == 0
+    assert response.json()["existing_count"] == 18
+    assert response.json()["skipped_count"] == 2
     assert all(item.status == "active" for item in products)
     assert db_session.query(ProductSnapshot).filter(
         ProductSnapshot.product_id.in_([item.id for item in products])
-    ).count() == 0
-    assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 0
+    ).count() == 18
+    assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 1
 
 
 def test_ranked_store_enrollment_uses_current_candidate_count_not_inactive_history(client, db_session):
@@ -273,8 +353,8 @@ def test_ranked_store_enrollment_uses_current_candidate_count_not_inactive_histo
     db_session.commit()
 
     expected_dates = [
-        "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25",
-        "2026-09-26", "2026-09-27", "2026-09-28",
+        "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+        "2026-10-09", "2026-10-10", "2026-10-11",
     ]
     candidates = []
     for index in range(7):
@@ -294,10 +374,16 @@ def test_ranked_store_enrollment_uses_current_candidate_count_not_inactive_histo
         "/api/collection/browser-extension/store",
         json={
             "platform_store_id": "770710",
-            "url": "https://www.aliexpress.com/store/770710?shop_sortType=orders_desc",
+            "url": "https://www.aliexpress.com/store/770710/pages/all-items.html?shop_sortType=orders_desc",
             "products": candidates,
             "raw_data": {
                 "collection_mode": "top_7d_increment_selection",
+                "order_sort_verified": True,
+                "scan_complete": True,
+                "has_next_page": False,
+                "next_page_url": None,
+                "history_target_date": "2026-10-12",
+                "candidate_count": 30,
                 "selection_method": "ixspy_visible_latest_7_day_increment_sum",
                 "unique_candidate_count": 7,
             },
@@ -313,7 +399,7 @@ def test_ranked_store_enrollment_uses_current_candidate_count_not_inactive_histo
     }
 
 
-def test_ranked_store_enrollment_reactivates_exact_top_twenty_from_fifty_one_inactive_products(client, db_session):
+def test_ranked_store_enrollment_does_not_reactivate_inactive_products(client, db_session):
     store = client.post(
         "/api/stores",
         json={"name": "Re-ranked Store", "url": "https://www.aliexpress.com/store/770720"},
@@ -333,8 +419,8 @@ def test_ranked_store_enrollment_reactivates_exact_top_twenty_from_fifty_one_ina
     db_session.commit()
 
     expected_dates = [
-        "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25",
-        "2026-09-26", "2026-09-27", "2026-09-28",
+        "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+        "2026-10-09", "2026-10-10", "2026-10-11",
     ]
     selected_ranks = list(range(50, 30, -1))
     selection = []
@@ -357,10 +443,16 @@ def test_ranked_store_enrollment_reactivates_exact_top_twenty_from_fifty_one_ina
         "/api/collection/browser-extension/store",
         json={
             "platform_store_id": "770720",
-            "url": "https://www.aliexpress.com/store/770720?shop_sortType=orders_desc&page=2",
+            "url": "https://www.aliexpress.com/store/770720/pages/all-items.html?shop_sortType=orders_desc",
             "products": selection,
             "raw_data": {
                 "collection_mode": "top_7d_increment_selection",
+                "order_sort_verified": True,
+                "scan_complete": True,
+                "has_next_page": True,
+                "next_page_url": "https://www.aliexpress.com/store/770720/pages/all-items.html?page=2&shop_sortType=orders_desc",
+                "history_target_date": "2026-10-12",
+                "candidate_count": 30,
                 "selection_method": "ixspy_visible_latest_7_day_increment_sum",
                 "unique_candidate_count": 51,
                 "selection": [
@@ -376,23 +468,16 @@ def test_ranked_store_enrollment_reactivates_exact_top_twenty_from_fifty_one_ina
     )
 
     assert response.status_code == 201, response.text
-    assert response.json()["existing_count"] == 20
+    assert response.json()["existing_count"] == 0
+    assert response.json()["added_count"] == 0
+    assert response.json()["skipped_count"] == 20
     assert response.json()["deactivated_count"] == 0
-    active_products = list(
-        db_session.query(Product)
-        .filter_by(store_id=store["id"], status="active")
-        .order_by(Product.discovery_rank)
-    )
-    assert [item.aliexpress_product_id for item in active_products] == [
-        products_by_rank[index].aliexpress_product_id for index in selected_ranks
-    ]
-    assert db_session.query(Product).filter_by(store_id=store["id"], status="inactive").count() == 31
-    assert db_session.query(ProductSnapshot).filter(
-        ProductSnapshot.product_id.in_([item.id for item in active_products])
-    ).count() == 20
+    assert db_session.query(Product).filter_by(store_id=store["id"], status="active").count() == 0
+    assert db_session.query(Product).filter_by(store_id=store["id"], status="inactive").count() == 51
+    assert db_session.query(ProductSnapshot).count() == 0
 
 
-def test_ranked_store_enrollment_deactivates_unselected_without_deleting_history(client, db_session):
+def test_ranked_store_enrollment_never_deactivates_unselected_products(client, db_session):
     store = client.post(
         "/api/stores",
         json={"name": "Ranked Store", "url": "https://www.aliexpress.com/store/770709"},
@@ -422,11 +507,11 @@ def test_ranked_store_enrollment_deactivates_unselected_without_deleting_history
             "url": item.url,
             "history_source": "ixspy_visible_daily_increment",
             "history_daily_capture_complete": True,
-            "history_expected_dates": ["2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25", "2026-09-26", "2026-09-27", "2026-09-28"],
+            "history_expected_dates": ["2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09", "2026-10-10", "2026-10-11"],
             "historical_sales": [
                     {"date": day, "value": index, "value_type": "daily_increment"}
                 for day, index in zip(
-                    ["2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25", "2026-09-26", "2026-09-27", "2026-09-28"],
+                    ["2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08", "2026-10-09", "2026-10-10", "2026-10-11"],
                     range(7),
                 )
             ],
@@ -435,10 +520,16 @@ def test_ranked_store_enrollment_deactivates_unselected_without_deleting_history
     ]
     payload = {
         "platform_store_id": "770709",
-        "url": "https://www.aliexpress.com/store/770709?shop_sortType=orders_desc&page=2",
+        "url": "https://www.aliexpress.com/store/770709/pages/all-items.html?shop_sortType=orders_desc",
         "products": selection,
         "raw_data": {
             "collection_mode": "top_7d_increment_selection",
+            "order_sort_verified": True,
+            "scan_complete": True,
+            "has_next_page": False,
+            "next_page_url": None,
+            "history_target_date": "2026-10-12",
+            "candidate_count": 30,
             "unique_candidate_count": 21,
             "selection": [
                 {"product_id": item["platform_product_id"], "selection_rank": index + 1, "selection_reason": "latest_7d_increment"}
@@ -450,15 +541,15 @@ def test_ranked_store_enrollment_deactivates_unselected_without_deleting_history
     response = client.post("/api/collection/browser-extension/store", json=payload)
 
     assert response.status_code == 201, response.text
-    assert response.json()["deactivated_count"] == 1
+    assert response.json()["deactivated_count"] == 0
     assert all(item.status == "active" for item in products[:20])
-    assert products[-1].status == "inactive"
+    assert products[-1].status == "active"
     assert db_session.query(ProductSnapshot).filter_by(product_id=products[-1].id).count() == 1
     store_snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
     assert store_snapshot.raw_payload["raw_data"]["selection"][0]["selection_rank"] == 1
 
 
-def test_ranked_store_enrollment_replaces_manual_and_store_page_products_exactly(client, db_session):
+def test_ranked_store_enrollment_preserves_mixed_source_pool_members(client, db_session):
     store = client.post(
         "/api/stores",
         json={"name": "Mixed Source Store", "url": "https://www.aliexpress.com/store/770721"},
@@ -478,8 +569,8 @@ def test_ranked_store_enrollment_replaces_manual_and_store_page_products_exactly
     db_session.commit()
 
     expected_dates = [
-        "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25",
-        "2026-09-26", "2026-09-27", "2026-09-28",
+        "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+        "2026-10-09", "2026-10-10", "2026-10-11",
     ]
     selected = [
         {
@@ -500,10 +591,16 @@ def test_ranked_store_enrollment_replaces_manual_and_store_page_products_exactly
         "/api/collection/browser-extension/store",
         json={
             "platform_store_id": "770721",
-            "url": "https://www.aliexpress.com/store/770721?shop_sortType=orders_desc",
+            "url": "https://www.aliexpress.com/store/770721/pages/all-items.html?shop_sortType=orders_desc",
             "products": selected,
             "raw_data": {
                 "collection_mode": "top_7d_increment_selection",
+                "order_sort_verified": True,
+                "scan_complete": True,
+                "has_next_page": False,
+                "next_page_url": None,
+                "history_target_date": "2026-10-12",
+                "candidate_count": 30,
                 "unique_candidate_count": 22,
             },
         },
@@ -511,13 +608,10 @@ def test_ranked_store_enrollment_replaces_manual_and_store_page_products_exactly
 
     assert response.status_code == 201, response.text
     active_products = db_session.query(Product).filter_by(store_id=store["id"], status="active").all()
-    assert {item.aliexpress_product_id for item in active_products} == {
-        item["platform_product_id"] for item in selected
-    }
-    assert len(active_products) == 20
-    assert products[19].status == "active"
-    assert products[20].status == "inactive"
-    assert products[21].status == "inactive"
+    assert len(active_products) == 21
+    assert products[19].status == "inactive"
+    assert products[20].status == "active"
+    assert products[21].status == "active"
 
 
 def test_ranked_store_enrollment_rejects_conflicting_candidate_without_partial_pool(client, db_session):
@@ -552,8 +646,8 @@ def test_ranked_store_enrollment_rejects_conflicting_candidate_without_partial_p
     db_session.commit()
 
     expected_dates = [
-        "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25",
-        "2026-09-26", "2026-09-27", "2026-09-28",
+            "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+            "2026-10-09", "2026-10-10", "2026-10-11",
     ]
     candidates = []
     for index in range(20):
@@ -574,10 +668,16 @@ def test_ranked_store_enrollment_rejects_conflicting_candidate_without_partial_p
         "/api/collection/browser-extension/store",
         json={
             "platform_store_id": "770717",
-            "url": "https://www.aliexpress.com/store/770717?shop_sortType=orders_desc&page=2",
+            "url": "https://www.aliexpress.com/store/770717/pages/all-items.html?shop_sortType=orders_desc",
             "products": candidates,
             "raw_data": {
                 "collection_mode": "top_7d_increment_selection",
+                "order_sort_verified": True,
+                "scan_complete": True,
+                "has_next_page": False,
+                "next_page_url": None,
+                "history_target_date": "2026-10-12",
+                "candidate_count": 30,
                 "selection_method": "ixspy_visible_latest_7_day_increment_sum",
                 "unique_candidate_count": 20,
             },
@@ -585,7 +685,7 @@ def test_ranked_store_enrollment_rejects_conflicting_candidate_without_partial_p
     )
 
     assert response.status_code == 409
-    assert "未修改监控池" in response.json()["detail"]
+    assert "其他监控店铺" in response.json()["detail"]
     assert db_session.query(Product).filter_by(store_id=store["id"]).count() == 51
     assert all(item.status == "inactive" for item in historical_products)
     assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 0
@@ -606,7 +706,7 @@ def test_ranked_store_enrollment_rejects_cumulative_like_daily_history(client, d
         "/api/collection/browser-extension/store",
         json={
             "platform_store_id": "770725",
-            "url": "https://www.aliexpress.com/store/770725?shop_sortType=orders_desc",
+            "url": "https://www.aliexpress.com/store/770725/pages/all-items.html?shop_sortType=orders_desc",
             "products": [{
                 "platform_product_id": "1005007707250",
                 "url": "https://www.aliexpress.com/item/1005007707250.html",
@@ -621,14 +721,22 @@ def test_ranked_store_enrollment_rejects_cumulative_like_daily_history(client, d
             }],
             "raw_data": {
                 "collection_mode": "top_7d_increment_selection",
+                "order_sort_verified": True,
+                "scan_complete": True,
+                "has_next_page": False,
+                "next_page_url": None,
+                "history_target_date": "2026-10-08",
+                "candidate_count": 1,
                 "unique_candidate_count": 1,
             },
         },
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 201, response.text
+    assert response.json()["added_count"] == 0
+    assert response.json()["skipped_count"] == 1
     assert db_session.query(Product).filter_by(store_id=store["id"]).count() == 0
-    assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 0
+    assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 1
 
 
 def test_product_without_store_is_added_to_custom_monitoring_store(client):
@@ -753,3 +861,142 @@ def test_collection_progress_tracks_manual_snapshot_and_next_product(client, db_
     status = client.get("/api/collection/status/today")
     assert status.status_code == 200
     assert status.json()["manual_completed"] == 1
+
+
+def test_ranked_selection_enrolls_fewer_than_twenty_complete_candidates(client, db_session):
+    store_id = "770730"
+    store = client.post(
+        "/api/stores",
+        json={"name": "Pagewise Store", "url": f"https://www.aliexpress.com/store/{store_id}"},
+    ).json()
+    candidates = [_ranked_page_candidate(store_id, index) for index in range(3)]
+
+    response = client.post(
+        "/api/collection/browser-extension/store",
+        json=_ranked_page_payload(store_id, candidates),
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["added_count"] == 3
+    assert response.json()["deactivated_count"] == 0
+    assert db_session.query(Product).filter_by(store_id=store["id"], status="active").count() == 3
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert "page=2" in state.next_page_url
+
+
+def test_zero_eligible_page_is_recorded_and_cursor_saved(client, db_session):
+    store_id = "770731"
+    store = client.post(
+        "/api/stores",
+        json={"name": "No Eligible Page", "url": f"https://www.aliexpress.com/store/{store_id}"},
+    ).json()
+    payload = _ranked_page_payload(store_id, [])
+
+    response = client.post("/api/collection/browser-extension/store", json=payload)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["added_count"] == 0
+    assert response.json()["continuation_saved"] is True
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    assert snapshot.parse_status == "success"
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert "page=2" in state.next_page_url
+
+
+def test_repeated_submission_and_overfilled_pool_are_append_only(client, db_session):
+    store_id = "770732"
+    store = client.post(
+        "/api/stores",
+        json={"name": "Repeated Page Store", "url": f"https://www.aliexpress.com/store/{store_id}"},
+    ).json()
+    first = _ranked_page_candidate(store_id, 0)
+    second = _ranked_page_candidate(store_id, 1)
+    first_payload = _ranked_page_payload(store_id, [first])
+    first_response = client.post("/api/collection/browser-extension/store", json=first_payload)
+    assert first_response.status_code == 201, first_response.text
+
+    repeated_payload = _ranked_page_payload(store_id, [first, second])
+    repeated_response = client.post("/api/collection/browser-extension/store", json=repeated_payload)
+
+    assert repeated_response.status_code == 201, repeated_response.text
+    assert repeated_response.json()["added_count"] == 1
+    assert repeated_response.json()["existing_count"] == 1
+    assert db_session.query(Product).filter_by(store_id=store["id"], status="active").count() == 2
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert "page=2" in state.next_page_url
+
+    overfilled_store_id = "770733"
+    overfilled_store = client.post(
+        "/api/stores",
+        json={
+            "name": "Legacy Overfilled Store",
+            "url": f"https://www.aliexpress.com/store/{overfilled_store_id}",
+        },
+    ).json()
+    existing = [
+        Product(
+            store_id=overfilled_store["id"],
+            aliexpress_product_id=f"10050199800{index:02d}",
+            url=f"https://www.aliexpress.com/item/10050199800{index:02d}.html",
+            discovery_source="manual",
+        )
+        for index in range(21)
+    ]
+    db_session.add_all(existing)
+    db_session.commit()
+
+    overfilled_response = client.post(
+        "/api/collection/browser-extension/store",
+        json=_ranked_page_payload(
+            overfilled_store_id, [_ranked_page_candidate(overfilled_store_id, 99)]
+        ),
+    )
+
+    assert overfilled_response.status_code == 201, overfilled_response.text
+    assert overfilled_response.json()["added_count"] == 0
+    assert overfilled_response.json()["deactivated_count"] == 0
+    assert db_session.query(Product).filter_by(store_id=overfilled_store["id"], status="active").count() == 21
+
+
+def test_incomplete_or_cumulative_candidates_do_not_mutate_pool(client, db_session):
+    store_id = "770734"
+    store = client.post(
+        "/api/stores",
+        json={"name": "Invalid Candidate Page", "url": f"https://www.aliexpress.com/store/{store_id}"},
+    ).json()
+    incomplete = _ranked_page_candidate(store_id, 0, complete=False)
+    cumulative = _ranked_page_candidate(store_id, 1, values=range(2400, 2407))
+
+    response = client.post(
+        "/api/collection/browser-extension/store",
+        json=_ranked_page_payload(store_id, [incomplete, cumulative]),
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["added_count"] == 0
+    assert response.json()["skipped_count"] == 2
+    assert db_session.query(Product).filter_by(store_id=store["id"], status="active").count() == 0
+    assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 1
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert "page=2" in state.next_page_url
+
+
+def test_invalid_or_stale_page_does_not_mutate_pool_or_cursor(client, db_session):
+    store_id = "770735"
+    store = client.post(
+        "/api/stores",
+        json={"name": "Stale Page Store", "url": f"https://www.aliexpress.com/store/{store_id}"},
+    ).json()
+    page_one = _ranked_page_payload(store_id, [])
+    assert client.post("/api/collection/browser-extension/store", json=page_one).status_code == 201
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    cursor_before = state.next_page_url
+
+    stale_payload = _ranked_page_payload(
+        store_id, [_ranked_page_candidate(store_id, 1)], page=3
+    )
+    response = client.post("/api/collection/browser-extension/store", json=stale_payload)
+
+    assert response.status_code == 409
+    assert db_session.query(Product).filter_by(store_id=store["id"]).count() == 0
+    assert state.next_page_url == cursor_before

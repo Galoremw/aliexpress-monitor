@@ -157,7 +157,10 @@ class BrowserStoreDiscoveryRequest(BaseModel):
 
     @model_validator(mode="after")
     def require_products_for_discovery(self) -> "BrowserStoreDiscoveryRequest":
-        if not self.products and self.raw_data.get("collection_mode") != "monitored_store_daily":
+        if not self.products and self.raw_data.get("collection_mode") not in {
+            "monitored_store_daily",
+            "top_7d_increment_selection",
+        }:
             raise ValueError("店铺商品发现结果不能为空")
         return self
 
@@ -172,6 +175,7 @@ class BrowserStoreDiscoveryRead(BaseModel):
     product_links: list[str]
     status: str
     error_message: str | None = None
+    continuation_saved: bool = False
 
 
 class ManualCollectionRequest(BrowserExtensionCollectionRequest):

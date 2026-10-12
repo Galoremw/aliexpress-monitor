@@ -80,6 +80,7 @@ from app.services.historical_metrics import (
     looks_cumulative_like_daily_values,
 )
 from app.services.monitored_store_collection import save_monitored_store_observation
+from app.services.store_page_discovery import save_store_page_candidates
 from app.services.product_presentation import clean_product_title
 from app.services.store_discovery import discover_store_products, store_top_products
 from app.services.collection_progress import build_collection_progress, manual_completed_product_ids
@@ -639,6 +640,30 @@ def discover_store_from_browser_extension(
     payload: BrowserStoreDiscoveryRequest,
     db: Session = Depends(get_db),
 ) -> dict:
+    if payload.raw_data.get("collection_mode") == "top_7d_increment_selection":
+        store = db.scalar(
+            select(Store).where(Store.aliexpress_store_id == payload.platform_store_id)
+        )
+        if store is None:
+            raise HTTPException(status_code=404, detail="该店铺尚未加入监控")
+        try:
+            return save_store_page_candidates(
+                db,
+                store,
+                page_url=payload.url,
+                candidates=payload.products,
+                has_next_page=payload.raw_data.get("has_next_page"),
+                next_page_url=payload.raw_data.get("next_page_url"),
+                scan_complete=payload.raw_data.get("scan_complete") is True,
+                source="CHROME_EXTENSION",
+                raw_data=payload.raw_data,
+            )
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="店铺页面商品已发生重复，未修改监控池") from exc
     if not payload.products:
         raise HTTPException(status_code=409, detail="店铺商品发现结果不能为空")
     return _save_store_observation(db, payload)
