@@ -188,16 +188,56 @@ test("allows a small store when all products have complete seven-day histories",
   assert.equal(pageDecision([page]), "submit");
 });
 
-test("does not submit a smaller-than-twenty pool while more Orders pages remain", () => {
+test("submits eligible products from the current page while saving its continuation", () => {
   const page = {
     platform_store_id: "770700",
+    url: "https://www.aliexpress.com/store/770700/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc",
     has_next_page: true,
+    next_page_url: "https://www.aliexpress.com/store/770700/pages/all-items.html?page=2&sortType=bestmatch_sort&shop_sortType=orders_desc",
+    raw_data: { history_target_date: "2026-09-29" },
     candidates: Array.from({ length: 12 }, (_, index) =>
       candidate(`245${String(index).padStart(2, "0")}`, Array(7).fill(index), index + 1)),
   };
 
   assert.equal(pageDecision([page]), "continue");
-  assert.throws(() => buildStoreSelectionPayload([page]), /more Orders pages remain/i);
+  const payload = buildStoreSelectionPayload([page]);
+  assert.equal(payload.products.length, 12);
+  assert.equal(payload.raw_data.candidate_count, 12);
+  assert.equal(payload.raw_data.has_next_page, true);
+  assert.equal(payload.raw_data.next_page_url, page.next_page_url);
+});
+
+test("submits a valid page snapshot when no candidate has a complete history", () => {
+  const page = {
+    platform_store_id: "770719",
+    url: "https://www.aliexpress.com/store/770719/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc",
+    has_next_page: true,
+    next_page_url: "https://www.aliexpress.com/store/770719/pages/all-items.html?page=2&sortType=bestmatch_sort&shop_sortType=orders_desc",
+    raw_data: { history_target_date: "2026-09-29" },
+    candidates: [candidate("85001", [4], 1, false), candidate("85002", [0], 2, false)],
+  };
+
+  const payload = buildStoreSelectionPayload([page]);
+
+  assert.equal(payload.products.length, 0);
+  assert.equal(payload.raw_data.candidate_count, 2);
+  assert.equal(payload.raw_data.readable_history_candidates, 0);
+  assert.equal(payload.raw_data.has_next_page, true);
+  assert.equal(payload.raw_data.next_page_url, page.next_page_url);
+  assert.equal(payload.raw_data.history_target_date, "2026-09-29");
+  assert.ok(page.candidates.every((item) => item.historical_sales.length === 1));
+});
+
+test("does not submit a current page when its detected continuation URL is missing", () => {
+  const page = {
+    platform_store_id: "770720",
+    url: "https://www.aliexpress.com/store/770720/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc",
+    has_next_page: true,
+    raw_data: { history_target_date: "2026-09-29" },
+    candidates: [candidate("86001", Array(7).fill(1), 1)],
+  };
+
+  assert.throws(() => buildStoreSelectionPayload([page]), /没有可保存的下一页链接/);
 });
 
 test("continues to a third Orders page when fewer than twenty candidates have been seen", () => {
@@ -376,7 +416,7 @@ test("builds a top-twenty store enrollment payload from two Orders pages with au
   const payload = buildStoreSelectionPayload([firstPage, secondPage]);
 
   assert.equal(payload.platform_store_id, "770701");
-  assert.equal(payload.raw_data.extractor_version, "extension-store-selection-0.6.71");
+  assert.equal(payload.raw_data.extractor_version, "extension-store-selection-0.6.74");
   assert.equal(payload.products.length, 20);
   assert.equal(payload.raw_data.candidate_pages_scanned, 2);
   assert.equal(payload.raw_data.readable_history_candidates, 24);
@@ -444,7 +484,7 @@ test("does not combine pages from different stores", () => {
   ]), /same store/i);
 });
 
-test("refuses to build a full pool when unreadable charts leave fewer than twenty rankable candidates", () => {
+test("submits the readable subset when unreadable charts leave fewer than twenty candidates", () => {
   const firstPage = {
     platform_store_id: "770711",
     url: "https://www.aliexpress.com/store/770711?shop_sortType=orders_desc&page=1",
@@ -458,5 +498,7 @@ test("refuses to build a full pool when unreadable charts leave fewer than twent
       candidate(`720${String(index).padStart(2, "0")}`, Array(7).fill(index), index + 11, index < 9)),
   };
 
-  assert.throws(() => buildStoreSelectionPayload([firstPage, secondPage]), /20.*complete/i);
+  const payload = buildStoreSelectionPayload([firstPage, secondPage]);
+  assert.equal(payload.products.length, 19);
+  assert.equal(payload.raw_data.readable_history_candidates, 19);
 });

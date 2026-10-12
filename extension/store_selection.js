@@ -189,12 +189,10 @@
       .map((candidate) => String(candidate.platform_product_id || ""))
       .filter(Boolean)).size;
     const selected = rankStoreSelectionCandidates(candidates, limit);
-    const requiredCount = Math.min(Math.max(0, Number(limit) || 0), uniqueCandidateCount);
-    if (!requiredCount || selected.length < requiredCount) {
-      throw new Error(`store selection requires ${requiredCount} complete seven-day IXSPY histories; found ${selected.length}`);
-    }
-    if (uniqueCandidateCount < Number(limit) && pages[pages.length - 1].has_next_page) {
-      throw new Error("store selection cannot submit a smaller pool while more Orders pages remain");
+    const lastPage = pages[pages.length - 1];
+    const nextPageUrl = lastPage.next_page_url || lastPage.raw_data?.next_page_url || null;
+    if (pages.length === 1 && lastPage.has_next_page && !nextPageUrl) {
+      throw new Error("当前 Orders 页检测到下一页，但没有可保存的下一页链接；未提交");
     }
     const products = selected.map((candidate) => ({
       platform_product_id: String(candidate.platform_product_id),
@@ -212,12 +210,17 @@
       url: pages[pages.length - 1].url || pages[0].url,
       products,
       raw_data: {
-        extractor_version: "extension-store-selection-0.6.71",
+        extractor_version: "extension-store-selection-0.6.74",
         collection_mode: "top_7d_increment_selection",
         selection_method: "ixspy_visible_latest_7_day_increment_sum",
         order_sort_verified: true,
+        scan_complete: true,
+        has_next_page: Boolean(lastPage.has_next_page),
+        next_page_url: nextPageUrl,
+        history_target_date: lastPage.raw_data?.history_target_date || null,
+        candidate_count: uniqueCandidateCount,
         candidate_pages_scanned: pages.length,
-        candidate_count: candidates.length,
+        total_candidate_count: candidates.length,
         unique_candidate_count: uniqueCandidateCount,
         readable_history_candidates: readableCount,
         orders_fallback_count: 0,

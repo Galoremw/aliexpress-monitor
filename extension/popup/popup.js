@@ -138,16 +138,26 @@ async function submitStoreSelection(storeId, storageKey, progress) {
   });
   await chrome.storage.local.remove(storageKey);
   const selection = progress.pending_payload.raw_data.selection || [];
-  const completeCount = selection.filter((item) => item.history_daily_capture_complete).length;
-  showResult(`入池完成：${response.added_count} 新增，${response.existing_count} 更新；七日完整 ${completeCount}/${selection.length}。`);
+  const candidateCount = Number(progress.pending_payload.raw_data.candidate_count) || 0;
+  const completeCount = Number(progress.pending_payload.raw_data.readable_history_candidates) || 0;
+  const unreadableCount = Math.max(0, candidateCount - completeCount);
+  const skippedCount = (Number(response.skipped_count) || 0) + unreadableCount;
+  const continuation = response.continuation_saved
+    ? "已保存续页"
+    : progress.pending_payload.raw_data.has_next_page ? "续页未保存" : "已到末页";
+  showResult(`本页入池完成：${response.added_count} 新增，${response.existing_count} 更新，${skippedCount} 跳过；七日完整 ${completeCount}/${candidateCount}，${continuation}。`);
+}
+
+function samePageUrl(left, right) {
+  try {
+    return new URL(left).href === new URL(right).href;
+  } catch {
+    return false;
+  }
 }
 
 async function collectAndSelectStorePage(tab) {
-  if (!storeSelection?.buildStoreSelectionPayload
-    || !storeSelection?.getStoreSelectionPageDecision
-    || !storeSelection?.mergeStoreSelectionPage
-    || !storeSelection?.getStoreSelectionRetrySkipIds
-    || !storeSelection?.mergeStoreSelectionRetryPage) {
+  if (!storeSelection?.buildStoreSelectionPayload) {
     throw new Error("扩展缺少店铺商品排序模块，请重新加载扩展");
   }
   const storeId = tab.url.match(/\/store\/(\d+)/i)?.[1]
@@ -161,64 +171,26 @@ async function collectAndSelectStorePage(tab) {
   const saved = await chrome.storage.local.get(storageKey);
   const progress = saved[storageKey];
   if (progress?.pending_payload) {
+    if (!samePageUrl(progress.pending_payload.url, tab.url)) {
+      showResult("上一页提交未确认。请返回原 Orders 页面重试；本次未读取或提交当前页。", true);
+      return;
+    }
     await submitStoreSelection(storeId, storageKey, progress);
     return;
   }
 
   const targetDate = localDateString();
-  const previousPage = progress?.pages?.find((item) => item.url === tab.url);
-  const skipProductIds = storeSelection.getStoreSelectionRetrySkipIds(
-    previousPage, tab.url, targetDate,
-  );
   const collected = await collectVisiblePage(tab.id, "STORE_SELECT_PAGE", {
     target_date: targetDate,
-    skip_product_ids: skipProductIds,
   });
   if (collected?.state === "challenge") throw new Error("AliExpress 要求验证，请人工完成后再试");
   if (collected?.state === "ixspy_login") throw new Error("IXSPY 登录已过期，请在当前页面正常登录后重试");
   if (!collected?.page_result) throw new Error(collected?.message || "没有读到当前页候选数据");
-  const page = storeSelection.mergeStoreSelectionRetryPage(previousPage, collected.page_result);
+  const page = collected.page_result;
   if (page.platform_store_id !== storeId) throw new Error("页面店铺 ID 与候选数据不一致");
-
-  const pages = progress?.pages || [];
-  const combinedPages = storeSelection.mergeStoreSelectionPage(pages, page);
-  const decision = storeSelection.getStoreSelectionPageDecision(combinedPages, 20);
-  const allCandidates = combinedPages.flatMap((item) => item.candidates || []);
-  const candidateCount = new Set(allCandidates
-    .map((candidate) => String(candidate.platform_product_id || ""))
-    .filter(Boolean)).size;
-  const completeCandidates = storeSelection.rankStoreSelectionCandidates(
-    allCandidates,
-    Number.MAX_SAFE_INTEGER,
-  );
-  const completeCount = completeCandidates.length;
-  const savedProgress = { pages: combinedPages, saved_at: new Date().toISOString() };
-
-  if (decision === "window_mismatch") {
-    await chrome.storage.local.set({ [storageKey]: savedProgress });
-    showResult("各页的 IXSPY 近 7 日日期范围不一致，未提交。请返回较早读取的 Orders 页面重读；同一页重读会更新暂存数据。", true);
-    return;
-  }
-  if (decision === "continue") {
-    await chrome.storage.local.set({ [storageKey]: savedProgress });
-    showResult(`已读取 ${combinedPages.length} 页：${candidateCount} 件候选中有 ${completeCount} 件具备完整七日数据。未完整候选不会阻塞翻页，也不参与排名。请保持 Orders 排序，切换到下一页后再点一次；完整数据达到 20 件后才会入池。`);
-    return;
-  }
-  if (decision === "incomplete") {
-    await chrome.storage.local.set({ [storageKey]: savedProgress });
-    const completeIds = new Set(completeCandidates.map((item) => String(item.platform_product_id)));
-    const incomplete = [...new Map(allCandidates
-      .filter((item) => !completeIds.has(String(item.platform_product_id)))
-      .map((item) => [String(item.platform_product_id), item])).values()];
-    const missingDetails = incomplete.slice(0, 8)
-      .map((item) => `${item.platform_product_id} ${item.historical_sales?.length || 0}/7 (${item.history_source || "未识别图表"})`)
-      .join("；");
-    showResult(`已读完 ${combinedPages.length} 页：${candidateCount} 件候选中仅 ${completeCount} 件有完整七日 IXSPY 数据；未提交，原监控池未修改。缺失商品：${missingDetails}${incomplete.length > 8 ? `；另有 ${incomplete.length - 8} 件` : ""}。若还有下一页，请保持 Orders 排序并切换到下一页继续；若已到末页，可重读当前页补读未完整商品。`, true);
-    return;
-  }
-
-  const payload = storeSelection.buildStoreSelectionPayload(combinedPages, 20);
-  const pending = { pages: combinedPages, pending_payload: payload, saved_at: new Date().toISOString() };
+  if (!samePageUrl(page.url, tab.url)) throw new Error("读取结果不是当前活动标签页，未提交");
+  const payload = storeSelection.buildStoreSelectionPayload([page], 20);
+  const pending = { pending_payload: payload, saved_at: new Date().toISOString() };
   await submitStoreSelection(storeId, storageKey, pending);
 }
 

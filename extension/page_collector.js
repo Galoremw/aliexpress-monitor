@@ -1200,6 +1200,7 @@
         url: location.href,
         candidates,
         has_next_page: storeHasNextPage(),
+        next_page_url: storeNextPageUrl(storeId),
         raw_data: {
           extractor_version: `extension-store-selection-${PAGE_COLLECTOR_VERSION}`,
           history_provider: "IXSPY_VISIBLE_UI",
