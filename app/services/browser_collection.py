@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -63,16 +64,28 @@ def _worker_is_online(worker: BrowserCollectionWorker | None, now: datetime) -> 
     return bool(heartbeat and now - heartbeat <= HEARTBEAT_FRESHNESS)
 
 
+def _store_collection_id(store: Store) -> str | None:
+    if store.aliexpress_store_id and store.aliexpress_store_id.isdigit():
+        return store.aliexpress_store_id
+    match = re.search(r"^/store/(\d+)(?:/|$)", urlsplit(store.url).path)
+    return match.group(1) if match else None
+
+
 def _store_collection_url(store: Store) -> str:
-    if store.aliexpress_store_id:
+    store_id = _store_collection_id(store)
+    if store_id:
         return (
-            f"https://www.aliexpress.com/store/{store.aliexpress_store_id}/pages/all-items.html"
+            f"https://www.aliexpress.com/store/{store_id}/pages/all-items.html"
             "?sortType=bestmatch_sort&shop_sortType=orders_desc"
         )
     parsed = urlsplit(store.url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     query.update({"sortType": "bestmatch_sort", "shop_sortType": "orders_desc"})
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), ""))
+
+
+def _supports_store_page_collection(store: Store) -> bool:
+    return _store_collection_id(store) is not None
 
 
 def _refresh_counts(run: BrowserCollectionRun) -> None:
@@ -260,9 +273,11 @@ def ensure_browser_collection_run(
     run = BrowserCollectionRun(target_date=selected_date, trigger=trigger)
     db.add(run)
     db.flush()
-    stores = list(
-        db.scalars(select(Store).where(Store.status == "active").order_by(Store.id))
-    )
+    stores = [
+        store
+        for store in db.scalars(select(Store).where(Store.status == "active").order_by(Store.id))
+        if _supports_store_page_collection(store)
+    ]
     for position, store in enumerate(stores, start=1):
         get_or_create_store_page_discovery_state(
             db, store, first_orders_url=_store_collection_url(store)
@@ -288,11 +303,13 @@ def queue_all_store_collections(
     db: Session,
 ) -> tuple[BrowserCollectionRun, int, int, int]:
     """Queue active monitored stores for an explicit manual collection request."""
-    stores = list(
-        db.scalars(select(Store).where(Store.status == "active").order_by(Store.id))
-    )
+    stores = [
+        store
+        for store in db.scalars(select(Store).where(Store.status == "active").order_by(Store.id))
+        if _supports_store_page_collection(store)
+    ]
     if not stores:
-        raise ValueError("当前没有活跃监控店铺")
+        raise ValueError("当前没有可按店铺页采集的活跃监控店铺")
 
     run = get_today_run(db)
     if run is not None and run.status in {"PAUSED", "NEEDS_VERIFICATION"}:
@@ -353,6 +370,8 @@ def queue_store_collection(
     db: Session, store: Store
 ) -> tuple[BrowserCollectionRun, int, int, bool]:
     """Queue one store-page read without opening product detail pages."""
+    if not _supports_store_page_collection(store):
+        raise ValueError("自定义监控容器没有 AliExpress 店铺商品页，不能按店铺采集")
     get_or_create_store_page_discovery_state(
         db, store, first_orders_url=_store_collection_url(store)
     )

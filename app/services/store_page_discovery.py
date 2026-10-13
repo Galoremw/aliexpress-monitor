@@ -19,6 +19,7 @@ from app.services.snapshots import save_store_product_snapshot
 
 
 _STORE_PATH = re.compile(r"^/store/(\d+)/pages/all-items\.html$")
+_STORE_ROOT_PATH = re.compile(r"^/store/(\d+)/?$")
 _FIRST_PAGE_KEYS = {"page", "pagenum", "pageno"}
 
 
@@ -74,11 +75,22 @@ def _validate_orders_url(store: Store, value: str) -> str:
     ):
         raise ValueError("店铺 Orders 页面必须使用 HTTPS AliExpress 地址")
     match = _STORE_PATH.fullmatch(parsed.path)
+    root_match = _STORE_ROOT_PATH.fullmatch(parsed.path)
     store_id = _platform_store_id(store)
-    if not match or match.group(1) != store_id:
+    route_match = match or root_match
+    if route_match is None:
+        raise ValueError("店铺 Orders 页面路径无效")
+    if route_match.group(1) != store_id:
         raise ValueError("店铺 Orders 页面 ID 与监控店铺不一致")
     query = parse_qsl(parsed.query, keep_blank_values=True)
-    if [value for key, value in query if key == "shop_sortType"] != ["orders_desc"]:
+    if root_match:
+        sort_values = [
+            value for key, value in query
+            if key.lower() in {"sorttype", "shop_sorttype"}
+        ]
+        if not sort_values or any(value != "orders_desc" for value in sort_values):
+            raise ValueError("店铺页面必须按 Orders 降序排列")
+    elif [value for key, value in query if key == "shop_sortType"] != ["orders_desc"]:
         raise ValueError("店铺页面必须按 Orders 降序排列")
     page_values = [
         item
@@ -87,7 +99,18 @@ def _validate_orders_url(store: Store, value: str) -> str:
     ]
     if len(page_values) > 1 or any(not item.isdigit() or int(item) < 1 for item in page_values):
         raise ValueError("店铺分页参数无效")
-    return urlunsplit(("https", parsed.netloc.lower(), parsed.path, urlencode(query), ""))
+    path = parsed.path
+    if root_match:
+        path = f"/store/{store_id}/pages/all-items.html"
+        query = [
+            (key, value)
+            for key, value in query
+            if key.lower() not in {"sorttype", "shop_sorttype"}
+        ]
+        query.extend(
+            [("sortType", "bestmatch_sort"), ("shop_sortType", "orders_desc")]
+        )
+    return urlunsplit(("https", parsed.netloc.lower(), path, urlencode(query), ""))
 
 
 def _orders_page_identity(value: str) -> tuple[str, tuple[tuple[str, str], ...]]:
@@ -102,8 +125,11 @@ def _orders_page_identity(value: str) -> tuple[str, tuple[tuple[str, str], ...]]
         for key, item in query
         if key.lower() not in _FIRST_PAGE_KEYS | {"spm"}
     ]
-    if page == "1":
-        remaining.append(("page", "1"))
+    try:
+        normalized_page = str(int(page))
+    except (TypeError, ValueError):
+        normalized_page = page
+    remaining.append(("page", normalized_page))
     if not any(key == "sorttype" for key, _ in remaining):
         remaining.append(("sorttype", "bestmatch_sort"))
     return parsed.path, tuple(sorted(remaining))
@@ -111,6 +137,14 @@ def _orders_page_identity(value: str) -> tuple[str, tuple[tuple[str, str], ...]]
 
 def _same_orders_page(left: str, right: str) -> bool:
     return _orders_page_identity(left) == _orders_page_identity(right)
+
+
+def _orders_page_number(value: str) -> int:
+    return int(next(
+        (item for key, item in parse_qsl(urlsplit(value).query, keep_blank_values=True)
+         if key.lower() in _FIRST_PAGE_KEYS),
+        "1",
+    ))
 
 
 def get_or_create_store_page_discovery_state(
@@ -147,6 +181,7 @@ def advance_store_page_cursor(
     has_next_page: bool,
     next_page_url: str | None,
     scan_complete: bool,
+    pagination_known: bool = True,
     error: str | None = None,
 ) -> StorePageDiscoveryState:
     state = get_or_create_store_page_discovery_state(db, store)
@@ -177,6 +212,13 @@ def advance_store_page_cursor(
         db.flush()
         return state
 
+    if not pagination_known:
+        state.last_outcome = "pagination_unknown"
+        state.last_error = "店铺分页控件未能确认是否存在下一页"
+        state.last_scanned_at = datetime.now(timezone.utc)
+        db.flush()
+        return state
+
     if has_next_page:
         if not next_page_url:
             state.last_outcome = "rejected"
@@ -193,6 +235,11 @@ def advance_store_page_cursor(
         if _same_orders_page(next_url, scanned):
             state.last_outcome = "rejected"
             state.last_error = "下一页 URL 与当前页相同"
+            db.flush()
+            return state
+        if _orders_page_number(next_url) <= _orders_page_number(scanned):
+            state.last_outcome = "rejected"
+            state.last_error = "下一页 URL 页码未向前推进"
             db.flush()
             return state
         state.next_page_url = next_url
@@ -259,6 +306,7 @@ def save_store_page_candidates(
         raise ValueError("店铺页面扫描未完整结束")
     if not isinstance(has_next_page, bool) or raw_data.get("has_next_page") is not has_next_page:
         raise ValueError("店铺分页诊断无效")
+    pagination_known = raw_data.get("pagination_known") is True
 
     normalized_page = _validate_orders_url(store, page_url)
     normalized_next = None
@@ -342,8 +390,9 @@ def save_store_page_candidates(
         has_next_page=has_next_page,
         next_page_url=normalized_next,
         scan_complete=True,
+        pagination_known=pagination_known,
     )
-    if cursor_result.last_outcome not in {"advanced", "wrapped", "duplicate"}:
+    if cursor_result.last_outcome not in {"advanced", "wrapped", "duplicate", "pagination_unknown"}:
         raise ValueError(cursor_result.last_error or "店铺页游标未能安全保存")
 
     active_products = list(
@@ -415,7 +464,7 @@ def save_store_page_candidates(
             "store_url": normalized_page,
             "cursor_before": cursor_before,
             "cursor_after": cursor_result.next_page_url,
-            "continuation_saved": True,
+            "continuation_saved": cursor_result.last_outcome != "pagination_unknown",
             "candidate_ids": [item.platform_product_id for item in candidates],
             "candidate_diagnostics": diagnostics,
             "products": [
@@ -477,5 +526,5 @@ def save_store_page_candidates(
         "product_links": links,
         "status": "success",
         "error_message": None,
-        "continuation_saved": True,
+        "continuation_saved": cursor_result.last_outcome != "pagination_unknown",
     }

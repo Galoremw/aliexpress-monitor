@@ -1,7 +1,7 @@
 (function () {
   if (globalThis.AliExpressMonitorPageCollector) return;
 
-  const PAGE_COLLECTOR_VERSION = "0.6.74";
+  const PAGE_COLLECTOR_VERSION = "0.6.76";
   const clean = (value) => value?.replace(/\s+/g, " ").trim() || null;
   const cleanProductTitle = (value) => {
     const title = clean(value);
@@ -714,12 +714,18 @@
   }
 
   function storeHasNextPage() {
+    return storePaginationStatus(storeIdFromPage()).has_next_page;
+  }
+
+  function storePaginationStatus(storeId) {
+    const nextPageUrl = storeId ? storeNextPageUrl(storeId) : null;
+    if (nextPageUrl) return { known: true, has_next_page: true, next_page_url: nextPageUrl };
     const controls = [
       ...document.querySelectorAll('a[rel="next"], a[aria-label*="next" i], button[aria-label*="next" i], [class*="pagination" i] a, [class*="pagination" i] button, [class*="pagination" i] [role="button"]'),
       ...document.querySelectorAll("a, button, [role='button']"),
     ];
-    return controls.some((node) => {
-      if (!visible(node) || node.disabled || node.getAttribute?.("aria-disabled") === "true") return false;
+    for (const node of controls) {
+      if (!visible(node)) continue;
       const rel = clean(node.getAttribute?.("rel") || "") || "";
       const label = [node.innerText, node.textContent, node.getAttribute?.("aria-label"), node.getAttribute?.("title"), node.getAttribute?.("rel")]
         .map((value) => clean(value) || "")
@@ -728,8 +734,15 @@
       const ancestorClasses = [node.parentElement?.className, node.parentElement?.parentElement?.className]
         .map((value) => String(value || "")).join(" ");
       const inPagination = /pag(?:e|ination|ing)/i.test(`${nodeClass} ${ancestorClasses}`);
-      return /^next$/i.test(rel) || (inPagination && /(?:\bnext\b|下一页|下页|›|»|❯|→)/i.test(label));
-    });
+      if (!(/^next$/i.test(rel) || (inPagination && /(?:\bnext\b|下一页|下页|›|»|❯|→)/i.test(label)))) continue;
+      const disabled = Boolean(node.disabled)
+        || node.getAttribute?.("aria-disabled") === "true"
+        || /\bdisabled\b/i.test(nodeClass);
+      return disabled
+        ? { known: true, has_next_page: false, next_page_url: null }
+        : { known: true, has_next_page: true, next_page_url: null };
+    }
+    return { known: false, has_next_page: false, next_page_url: null };
   }
 
   function storeNextPageUrl(storeId) {
@@ -740,9 +753,11 @@
     for (const node of controls) {
       if (!visible(node) || node.disabled || node.getAttribute?.("aria-disabled") === "true") continue;
       const parentClass = `${node.className || ""} ${node.parentElement?.className || ""}`;
-      const label = `${node.innerText || ""} ${node.getAttribute?.("aria-label") || ""} ${node.getAttribute?.("rel") || ""}`;
-      if (!/pagination|rel/i.test(parentClass + (node.getAttribute?.("rel") || ""))
-          && !/next|下一页|下页|›|»|❯|→/i.test(label)) continue;
+      const rel = clean(node.getAttribute?.("rel") || "") || "";
+      const label = `${node.innerText || ""} ${node.textContent || ""} ${node.getAttribute?.("aria-label") || ""} ${node.getAttribute?.("title") || ""} ${rel}`;
+      const direction = `${parentClass} ${label}`;
+      if (/\b(?:prev(?:ious)?|first|last)\b|上一页|上页|第一页|末页/i.test(direction)
+          || !(/\bnext\b|下一页|下页|›|»|❯|→/i.test(direction) || /^next$/i.test(rel))) continue;
       const href = node.href || node.getAttribute?.("href");
       if (!href) continue;
       try {
@@ -942,7 +957,7 @@
     };
   }
 
-  async function waitForStoreChart(productId, timeoutMs = 2200) {
+  async function waitForStoreChart(productId, timeoutMs = 6000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       if (isChallengePage()) return { challenge: true };
@@ -971,7 +986,7 @@
     try {
       if (!miniChart || !visible(miniChart)) {
         trigger.click();
-        const miniDeadline = Date.now() + 1800;
+        const miniDeadline = Date.now() + 4000;
         while (Date.now() < miniDeadline) {
           if (isChallengePage()) return { challenge: true };
           miniChart = storeMiniChart(product.platform_product_id);
@@ -984,7 +999,7 @@
       }
       const more = await waitForStoreMoreAction(
         miniChart, trigger, product.platform_product_id,
-        Math.min(5000, Math.max(700, setupWaitMs)),
+        Math.min(5000, Math.max(1400, setupWaitMs)),
       );
       if (!more) return unavailableStoreHistory(targetDate, "ixspy_store_card_more_action_missing");
       more.click();
@@ -1097,17 +1112,39 @@
 
   async function waitForMonitoredStorePageReady(timeoutMs = 20000) {
     const deadline = Date.now() + timeoutMs;
+    const startedAt = Date.now();
     let lastMessage = "店铺 ID 或 Orders 排序未就绪";
+    let verifiedStoreId = null;
     while (Date.now() < deadline) {
       if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
       const storeId = storeIdFromPage();
       const identityError = storeId ? storeIdentityError(storeId) : null;
       if (identityError) return { state: "failed", message: identityError };
       if (storeId && !identityError && storeOrdersSortSelected()) {
-        return { state: "ready", storeId };
+        verifiedStoreId = storeId;
+        const scan = scanStoreProducts();
+        if (scan.products.length) {
+          return {
+            state: "ready",
+            storeId,
+            productCardsReady: true,
+            productCardWaitMs: Date.now() - startedAt,
+          };
+        }
+        lastMessage = "商品卡片尚未加载";
       }
-      lastMessage = !storeId ? "尚未识别店铺 ID" : "店铺 Orders 排序尚未就绪";
+      if (!verifiedStoreId) {
+        lastMessage = !storeId ? "尚未识别店铺 ID" : "店铺 Orders 排序尚未就绪";
+      }
       await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (verifiedStoreId) {
+      return {
+        state: "ready",
+        storeId: verifiedStoreId,
+        productCardsReady: false,
+        productCardWaitMs: Date.now() - startedAt,
+      };
     }
     return { state: "failed", message: `店铺页面在 20 秒内未就绪：${lastMessage}` };
   }
@@ -1129,10 +1166,35 @@
       if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
     }
     const products = latest.products.filter((product) => targetIds.has(product.platform_product_id));
+    const pagination = storePaginationStatus(storeId);
+    const pageScan = {
+      url: location.href,
+      product_cards_ready: readiness.productCardsReady,
+      product_card_wait_ms: readiness.productCardWaitMs,
+      candidate_node_count: latest.candidateNodeCount,
+      visible_product_count: latest.products.length,
+      visible_product_ids: latest.products.map((product) => product.platform_product_id),
+      matched_product_ids: products.map((product) => product.platform_product_id),
+      unmatched_target_ids: [...targetIds].filter((id) => !latest.products.some((product) => product.platform_product_id === id)),
+      pagination_known: pagination.known,
+      has_next_page: pagination.has_next_page,
+      next_page_url: pagination.next_page_url,
+    };
+    const chartReads = [];
     for (const [index, product] of products.entries()) {
-      const { history } = await collectStoreProductHistoryWithRetry(product, targetDate, index === 0 ? 6000 : 800);
-      if (history.challenge) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
-      if (history.login_required) return { state: "ixspy_login", message: "IXSPY 登录需要人工完成" };
+      const { history, retryPasses } = await collectStoreProductHistoryWithRetry(product, targetDate, index === 0 ? 6000 : 800);
+      const chartRead = {
+        product_id: product.platform_product_id,
+        outcome: history.daily_capture_complete ? "complete" : history.points?.length ? "partial" : "unavailable",
+        source: history.source || (history.points?.length ? "ixspy_visible_daily_increment" : "ixspy_data_unavailable"),
+        point_count: history.points?.length || 0,
+        missing_dates: history.missing_dates || expectedDailyDates(targetDate),
+        retry_passes: retryPasses,
+      };
+      chartReads.push(chartRead);
+      product.history_read_diagnostic = chartRead;
+      if (history.challenge) return { state: "challenge", message: "AliExpress 要求人工完成验证", diagnostics: { page_scan: pageScan, chart_reads: chartReads } };
+      if (history.login_required) return { state: "ixspy_login", message: "IXSPY 登录需要人工完成", diagnostics: { page_scan: pageScan, chart_reads: chartReads } };
       product.historical_sales = history.points || [];
       product.history_source = product.historical_sales.length ? "ixspy_visible_daily_increment" : history.source;
       product.history_daily_capture_complete = Boolean(history.daily_capture_complete);
@@ -1148,6 +1210,7 @@
         products,
         has_next_page: storeHasNextPage(),
         next_page_url: storeNextPageUrl(storeId),
+        diagnostics: { page_scan: pageScan, chart_reads: chartReads },
       },
     };
   }
@@ -1198,6 +1261,7 @@
     }
 
     const candidates = latest.products.slice(0, 50);
+    const pagination = storePaginationStatus(storeId);
     const pageScan = {
       url: currentUrl.href,
       candidate_node_count: latest.candidateNodeCount,
@@ -1205,8 +1269,9 @@
       candidate_count: candidates.length,
       candidate_ids: candidates.map((candidate) => candidate.platform_product_id),
       candidate_limit_reached: latest.products.length > candidates.length,
-      has_next_page: storeHasNextPage(),
-      next_page_url: storeNextPageUrl(storeId),
+      pagination_known: pagination.known,
+      has_next_page: pagination.has_next_page,
+      next_page_url: pagination.next_page_url,
     };
     const diagnostics = { page_scan: pageScan, chart_reads: [] };
     if (!candidates.length) {
@@ -1216,6 +1281,7 @@
           platform_store_id: storeId,
           url: currentUrl.href,
           candidates,
+          pagination_known: pageScan.pagination_known,
           has_next_page: pageScan.has_next_page,
           next_page_url: pageScan.next_page_url,
           scan_complete: false,
@@ -1230,6 +1296,7 @@
           platform_store_id: storeId,
           url: currentUrl.href,
           candidates: [],
+          pagination_known: pageScan.pagination_known,
           has_next_page: pageScan.has_next_page,
           next_page_url: pageScan.next_page_url,
           scan_complete: false,
@@ -1279,6 +1346,7 @@
         platform_store_id: storeId,
         url: currentUrl.href,
         candidates,
+        pagination_known: pageScan.pagination_known,
         has_next_page: pageScan.has_next_page,
         next_page_url: pageScan.next_page_url,
         scan_complete: true,
@@ -1328,14 +1396,16 @@
       product.history_expected_dates = history.expected_dates || expectedDailyDates(targetDate);
       product.history_missing_dates = history.missing_dates || product.history_expected_dates;
     }
+    const pagination = storePaginationStatus(storeId);
     return {
       state: "ready",
       page_result: {
         platform_store_id: storeId,
         url: location.href,
         candidates,
-        has_next_page: storeHasNextPage(),
-        next_page_url: storeNextPageUrl(storeId),
+        pagination_known: pagination.known,
+        has_next_page: pagination.has_next_page,
+        next_page_url: pagination.next_page_url,
         raw_data: {
           extractor_version: `extension-store-selection-${PAGE_COLLECTOR_VERSION}`,
           history_provider: "IXSPY_VISIBLE_UI",
@@ -1343,7 +1413,8 @@
           history_target_date: targetDate,
           page_candidate_count: candidates.length,
           visible_link_count: latest.products.length,
-          next_page_detected: storeHasNextPage(),
+          pagination_known: pagination.known,
+          next_page_detected: pagination.has_next_page,
         },
       },
     };

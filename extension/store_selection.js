@@ -188,7 +188,7 @@
       .filter((candidate) => completeHistory(candidate) !== null)
       .map((candidate) => String(candidate.platform_product_id || ""))
       .filter(Boolean)).size;
-    const selected = rankStoreSelectionCandidates(candidates, limit);
+    const selected = rankStoreSelectionCandidates(candidates, Number.MAX_SAFE_INTEGER);
     const lastPage = pages[pages.length - 1];
     const nextPageUrl = lastPage.next_page_url || lastPage.raw_data?.next_page_url || null;
     if (pages.length === 1 && lastPage.has_next_page && !nextPageUrl) {
@@ -210,11 +210,12 @@
       url: pages[pages.length - 1].url || pages[0].url,
       products,
       raw_data: {
-        extractor_version: "extension-store-selection-0.6.74",
+        extractor_version: "extension-store-selection-0.6.76",
         collection_mode: "top_7d_increment_selection",
         selection_method: "ixspy_visible_latest_7_day_increment_sum",
         order_sort_verified: true,
         scan_complete: true,
+        pagination_known: lastPage.pagination_known === true,
         has_next_page: Boolean(lastPage.has_next_page),
         next_page_url: nextPageUrl,
         history_target_date: lastPage.raw_data?.history_target_date || null,

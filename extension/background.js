@@ -259,6 +259,7 @@ async function automationState() {
     "challengePaused",
     "challengeProvider",
     "firstProductPresentedRunId",
+    "browserCollectionWorkerMode",
   ]);
 }
 
@@ -320,17 +321,20 @@ async function ensureIdleAutomationTab(workerWindow, state) {
   return idleTab;
 }
 
-async function ensureAutomationWindow({ ensureIdle = true } = {}) {
+async function ensureAutomationWindow({ ensureIdle = true, focus = null } = {}) {
   const state = await automationState();
-  const windowState = state.browserCollectionIsolatedProfileAuthorized === true ? "normal" : "minimized";
+  const foregroundCollection = focus ?? state.browserCollectionWorkerMode === true;
+  const windowState = foregroundCollection
+    ? "maximized"
+    : state.browserCollectionIsolatedProfileAuthorized === true ? "normal" : "minimized";
   let workerWindow = state.automationWindowId && state.automationWindowBackground
     ? await chrome.windows.get(state.automationWindowId).catch(() => null)
     : null;
   if (workerWindow?.id) {
-    await chrome.windows.update(workerWindow.id, { focused: false, state: windowState }).catch(() => undefined);
+    await chrome.windows.update(workerWindow.id, { focused: foregroundCollection, state: windowState }).catch(() => undefined);
   } else {
     workerWindow = await chrome.windows.create({
-      focused: false,
+      focused: foregroundCollection,
       state: windowState,
       type: "normal",
       url: "about:blank",
@@ -356,9 +360,10 @@ async function guardAutomationWindowFocus(windowId) {
     || Number.isInteger(state.foregroundSingleTestItemId)
     || !Number.isFinite(Number(state.automationWindowFocusGuardUntil))
     || Number(state.automationWindowFocusGuardUntil) < Date.now()) return;
+  const foregroundCollection = state.browserCollectionWorkerMode === true;
   await chrome.windows.update(windowId, {
-    focused: false,
-    state: state.browserCollectionIsolatedProfileAuthorized === true
+    focused: foregroundCollection,
+    state: foregroundCollection ? "maximized" : state.browserCollectionIsolatedProfileAuthorized === true
       || state.automationItem?.target_type === "STORE" ? "normal" : "minimized",
   }).catch(() => undefined);
   await chrome.storage.local.remove("automationWindowFocusGuardUntil");
@@ -607,6 +612,8 @@ function newStoreProgress(item, storeId, targets) {
     target_ids: targets,
     products: {},
     visited_page_urls: [],
+    page_scans: [],
+    chart_reads: [],
   };
 }
 
@@ -616,6 +623,8 @@ async function loadStoreProgress(item, storeId, targets) {
   const progress = storeProgressForItem(stored[key], item, storeId, targets)
     ? stored[key]
     : newStoreProgress(item, storeId, targets);
+  if (!Array.isArray(progress.page_scans)) progress.page_scans = [];
+  if (!Array.isArray(progress.chart_reads)) progress.chart_reads = [];
   const products = new Map(Object.entries(progress.products)
     .filter(([productId]) => targets.includes(productId)));
   return { key, progress, products };
@@ -632,6 +641,21 @@ function mergeStoreProduct(products, product) {
 function addVisitedStorePage(progress, pageUrl) {
   if (pageUrl && !progress.visited_page_urls.includes(pageUrl)) {
     progress.visited_page_urls.push(pageUrl);
+  }
+}
+
+function mergeStoreDiagnosticRecord(records, diagnostic, key, limit) {
+  if (!diagnostic || !diagnostic[key]) return Array.isArray(records) ? records : [];
+  const existing = Array.isArray(records) ? records : [];
+  return [...existing.filter((record) => record?.[key] !== diagnostic[key]), diagnostic].slice(-limit);
+}
+
+function mergeStoreDiagnostics(progress, diagnostics) {
+  if (diagnostics?.page_scan) {
+    progress.page_scans = mergeStoreDiagnosticRecord(progress.page_scans, diagnostics.page_scan, "url", 10);
+  }
+  for (const chartRead of diagnostics?.chart_reads || []) {
+    progress.chart_reads = mergeStoreDiagnosticRecord(progress.chart_reads, chartRead, "product_id", 20);
   }
 }
 
@@ -660,6 +684,11 @@ async function saveStoreProductProgress(message, sender, sendResponse) {
     const { key, progress, products } = await loadStoreProgress(item, storeId, targets);
     mergeStoreProduct(products, product);
     progress.products = Object.fromEntries(products);
+    if (product.history_read_diagnostic) {
+      progress.chart_reads = mergeStoreDiagnosticRecord(
+        progress.chart_reads, product.history_read_diagnostic, "product_id", 20,
+      );
+    }
     addVisitedStorePage(progress, pageUrl);
     await chrome.storage.local.set({ [key]: progress });
     sendResponse({ ok: true });
@@ -668,14 +697,18 @@ async function saveStoreProductProgress(message, sender, sendResponse) {
   }
 }
 
-async function waitForStorePage(tabId, expectedUrl) {
-  const deadline = Date.now() + 30000;
+async function waitForStorePage(tabId, expectedUrl, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (tab?.status === "complete" && tab.url === expectedUrl) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error("店铺下一页未在限定时间内加载完成");
+}
+
+function storeCollectionWorkRemaining(startedAt) {
+  return Math.max(0, STORE_COLLECTION_WORK_MS - (Date.now() - startedAt));
 }
 
 async function collectStorePages(tabId, item) {
@@ -690,9 +723,18 @@ async function collectStorePages(tabId, item) {
   const visitedThisAttempt = new Set();
   const startedAt = Date.now();
   let collectionInterrupted = false;
-  for (let page = 0; targets.length && page < 10 && Date.now() - startedAt < STORE_COLLECTION_WORK_MS; page += 1) {
+  for (let page = 0; targets.length && products.size < targets.length
+    && page < 10 && Date.now() - startedAt < STORE_COLLECTION_WORK_MS; page += 1) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab || !safeStoreOrdersUrl(tab.url, storeId) || visitedThisAttempt.has(tab.url)) break;
+    const pageResponseBudgetMs = Math.min(
+      STORE_PAGE_RESPONSE_TIMEOUT_MS,
+      storeCollectionWorkRemaining(startedAt),
+    );
+    if (pageResponseBudgetMs <= 0) {
+      collectionInterrupted = true;
+      break;
+    }
     visitedThisAttempt.add(tab.url);
     visited.add(tab.url);
     addVisitedStorePage(progress, tab.url);
@@ -704,7 +746,7 @@ async function collectStorePages(tabId, item) {
             itemId: item.id,
             claimToken: (await automationState()).automationClaimToken,
           }),
-        STORE_PAGE_RESPONSE_TIMEOUT_MS,
+        pageResponseBudgetMs,
         "店铺列表页读取超时",
       );
     } catch (error) {
@@ -712,10 +754,32 @@ async function collectStorePages(tabId, item) {
       const latest = await loadStoreProgress(item, storeId, targets);
       for (const product of latest.products.values()) mergeStoreProduct(products, product);
       for (const pageUrl of latest.progress.visited_page_urls) visited.add(pageUrl);
+      for (const scan of latest.progress.page_scans) {
+        progress.page_scans = mergeStoreDiagnosticRecord(progress.page_scans, scan, "url", 10);
+      }
+      for (const chartRead of latest.progress.chart_reads) {
+        progress.chart_reads = mergeStoreDiagnosticRecord(progress.chart_reads, chartRead, "product_id", 20);
+      }
       collectionInterrupted = true;
       break;
     }
-    if (response?.state !== "ready" || !response.page_result) return response;
+    const diagnostics = response?.diagnostics || response?.page_result?.diagnostics;
+    mergeStoreDiagnostics(progress, diagnostics);
+    if (response?.state !== "ready" || !response.page_result) {
+      const latest = await loadStoreProgress(item, storeId, targets);
+      for (const product of latest.products.values()) mergeStoreProduct(products, product);
+      for (const pageUrl of latest.progress.visited_page_urls) visited.add(pageUrl);
+      for (const scan of latest.progress.page_scans) {
+        progress.page_scans = mergeStoreDiagnosticRecord(progress.page_scans, scan, "url", 10);
+      }
+      for (const chartRead of latest.progress.chart_reads) {
+        progress.chart_reads = mergeStoreDiagnosticRecord(progress.chart_reads, chartRead, "product_id", 20);
+      }
+      progress.products = Object.fromEntries(products);
+      progress.visited_page_urls = [...visited];
+      await chrome.storage.local.set({ [progressKey]: progress });
+      return response;
+    }
     const result = response.page_result;
     if (result.platform_store_id !== storeId || result.url !== tab.url) {
       return { state: "failed", message: "店铺列表页与目标店铺不匹配" };
@@ -726,21 +790,28 @@ async function collectStorePages(tabId, item) {
       }
       mergeStoreProduct(products, product);
     }
+    mergeStoreDiagnostics(progress, result.diagnostics);
     progress.products = Object.fromEntries(products);
     progress.visited_page_urls = [...visited];
     await chrome.storage.local.set({ [progressKey]: progress });
     if (products.size === targets.length || !result.has_next_page) break;
     const nextUrl = result.next_page_url;
     if (!nextUrl || !safeStoreOrdersUrl(nextUrl, storeId) || visitedThisAttempt.has(nextUrl)) break;
+    const navigationBudgetMs = Math.min(30000, storeCollectionWorkRemaining(startedAt));
+    if (navigationBudgetMs <= 0) {
+      collectionInterrupted = true;
+      break;
+    }
     await chrome.tabs.update(tabId, { url: nextUrl, active: true });
-    await waitForStorePage(tabId, nextUrl);
+    await waitForStorePage(tabId, nextUrl, navigationBudgetMs);
   }
 
   let candidatePage = null;
   const discoveryUrl = item.discovery_page_url;
-  if (targets.length < 20 && discoveryUrl) {
+  if (!collectionInterrupted && targets.length < 20 && discoveryUrl) {
     const incompleteCandidatePage = (outcome, message = null, diagnostics = {}) => ({
       page_url: discoveryUrl,
+      pagination_known: false,
       has_next_page: false,
       next_page_url: null,
       scan_complete: false,
@@ -753,7 +824,7 @@ async function collectStorePages(tabId, item) {
       const cursorIsVisited = visited.has(discoveryUrl);
       if (!cursorIsVisited && visited.size >= 11) {
         candidatePage = incompleteCandidatePage("unique_page_limit_reached");
-      } else if (Date.now() - startedAt >= STORE_COLLECTION_WORK_MS) {
+      } else if (storeCollectionWorkRemaining(startedAt) <= 0) {
         candidatePage = incompleteCandidatePage("work_budget_exceeded");
       } else {
         let pageReady = false;
@@ -764,7 +835,9 @@ async function collectStorePages(tabId, item) {
           try {
             if (tab.url !== discoveryUrl) {
               await chrome.tabs.update(tabId, { url: discoveryUrl, active: true });
-              await waitForStorePage(tabId, discoveryUrl);
+              const navigationBudgetMs = Math.min(30000, storeCollectionWorkRemaining(startedAt));
+              if (navigationBudgetMs <= 0) throw new Error("店铺任务工作时间预算已用完");
+              await waitForStorePage(tabId, discoveryUrl, navigationBudgetMs);
             }
             pageReady = true;
           } catch (error) {
@@ -779,9 +852,14 @@ async function collectStorePages(tabId, item) {
             visited.add(discoveryUrl);
             addVisitedStorePage(progress, discoveryUrl);
             try {
+              const responseBudgetMs = Math.min(
+                STORE_PAGE_RESPONSE_TIMEOUT_MS,
+                storeCollectionWorkRemaining(startedAt),
+              );
+              if (responseBudgetMs <= 0) throw new Error("店铺任务工作时间预算已用完");
               const response = await withTimeout(
                 sendStoreCandidateScanMessage(tabId, item.target_date, storeId, discoveryUrl),
-                STORE_PAGE_RESPONSE_TIMEOUT_MS,
+                responseBudgetMs,
                 "店铺候选页读取超时",
               );
               if (response?.state === "challenge" || response?.state === "ixspy_login") {
@@ -805,6 +883,7 @@ async function collectStorePages(tabId, item) {
                   : null;
                 candidatePage = {
                   page_url: discoveryUrl,
+                  pagination_known: pageResult.pagination_known === true,
                   has_next_page: Boolean(pageResult.has_next_page),
                   next_page_url: nextPageUrl,
                   scan_complete: scanComplete,
@@ -834,6 +913,7 @@ async function collectStorePages(tabId, item) {
     }
   }
 
+  const workerIdentity = await browserCollectionWorkerIdentity();
   const orderedProducts = targets.map((productId) => products.get(productId)).filter(Boolean);
   return {
     state: "ready",
@@ -844,8 +924,12 @@ async function collectStorePages(tabId, item) {
       ...(candidatePage ? { candidate_page: candidatePage } : {}),
       raw_data: {
         collection_mode: "monitored_store_daily",
+        worker_id: workerIdentity.worker_id,
+        worker_label: workerIdentity.worker_label,
         monitored_product_ids: targets,
         visited_page_urls: [...visited],
+        page_scans: progress.page_scans.slice(-10),
+        chart_reads: progress.chart_reads.slice(-20),
         history_target_date: item.target_date,
         extractor_version: chrome.runtime.getManifest().version,
         ...(collectionInterrupted ? { collection_interrupted: true } : {}),
@@ -1012,7 +1096,9 @@ async function minimizeAutomationWindow() {
   if (state.automationWindowBackground && state.automationWindowId) {
     await chrome.windows.update(state.automationWindowId, {
       focused: false,
-      state: state.browserCollectionIsolatedProfileAuthorized === true ? "normal" : "minimized",
+      state: state.browserCollectionWorkerMode === true
+        ? "minimized"
+        : state.browserCollectionIsolatedProfileAuthorized === true ? "normal" : "minimized",
     }).catch(() => undefined);
   }
 }
@@ -1055,7 +1141,11 @@ async function pauseForIxspyLogin(tabId, message) {
 async function presentChallengeTab(tabId) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab?.windowId) return;
-  await chrome.windows.update(tab.windowId, { focused: true, state: "normal" }).catch(() => undefined);
+  const state = await automationState();
+  await chrome.windows.update(tab.windowId, {
+    focused: true,
+    state: state.browserCollectionWorkerMode === true ? "maximized" : "normal",
+  }).catch(() => undefined);
   await chrome.tabs.update(tabId, { active: true }).catch(() => undefined);
 }
 
@@ -1177,7 +1267,12 @@ async function processAutomationTabInternal(tabId, generation = null) {
   }
   if (item.target_type === "STORE") {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab?.windowId) await chrome.windows.update(tab.windowId, { focused: false, state: "normal" }).catch(() => undefined);
+    if (tab?.windowId) {
+      await chrome.windows.update(tab.windowId, {
+        focused: state.browserCollectionWorkerMode === true,
+        state: state.browserCollectionWorkerMode === true ? "maximized" : "normal",
+      }).catch(() => undefined);
+    }
   }
   const result = await withTimeout(
     item.target_type === "STORE"
@@ -1286,7 +1381,8 @@ async function openAutomationItem(item, taskKind = "PRODUCT", knownKeys = [], { 
   let state = await automationState();
   if (prefetch && state.prefetchedItem) return;
   if (!prefetch && state.automationItem) return;
-  const workerWindow = await ensureAutomationWindow({ ensureIdle: !prefetch });
+  const singleProductCheck = !prefetch && item.target_key === `product:${item.product_id}:single`;
+  const workerWindow = await ensureAutomationWindow({ ensureIdle: !prefetch, focus: singleProductCheck ? false : null });
   if (!workerWindow) throw new Error("请先在本机 Chrome 打开一个普通窗口，再继续后台采集");
   if (!prefetch) await focusWindowForSingleProductTest(item, workerWindow.id, prefetch, { deferFocus: true });
   const currentState = await automationState();

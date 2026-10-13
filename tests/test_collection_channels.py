@@ -82,6 +82,7 @@ def _ranked_page_payload(store_id: str, candidates, *, page=1, has_next_page=Tru
             "selection_method": "ixspy_visible_latest_7_day_increment_sum",
             "order_sort_verified": True,
             "scan_complete": True,
+            "pagination_known": True,
             "has_next_page": has_next_page,
             "next_page_url": next_page_url,
             "candidate_count": 30,
@@ -243,6 +244,7 @@ def test_ranked_store_enrollment_preserves_overfilled_pool(client, db_session):
             "collection_mode": "top_7d_increment_selection",
             "order_sort_verified": True,
             "scan_complete": True,
+            "pagination_known": True,
             "has_next_page": False,
             "next_page_url": None,
             "history_target_date": "2026-10-12",
@@ -313,6 +315,7 @@ def test_ranked_store_enrollment_skips_incomplete_histories_even_when_flagged_co
                 "collection_mode": "top_7d_increment_selection",
                 "order_sort_verified": True,
                 "scan_complete": True,
+                "pagination_known": True,
                 "has_next_page": False,
                 "next_page_url": None,
                 "history_target_date": "2026-10-12",
@@ -380,6 +383,7 @@ def test_ranked_store_enrollment_uses_current_candidate_count_not_inactive_histo
                 "collection_mode": "top_7d_increment_selection",
                 "order_sort_verified": True,
                 "scan_complete": True,
+                "pagination_known": True,
                 "has_next_page": False,
                 "next_page_url": None,
                 "history_target_date": "2026-10-12",
@@ -449,6 +453,7 @@ def test_ranked_store_enrollment_does_not_reactivate_inactive_products(client, d
                 "collection_mode": "top_7d_increment_selection",
                 "order_sort_verified": True,
                 "scan_complete": True,
+                "pagination_known": True,
                 "has_next_page": True,
                 "next_page_url": "https://www.aliexpress.com/store/770720/pages/all-items.html?page=2&shop_sortType=orders_desc",
                 "history_target_date": "2026-10-12",
@@ -475,6 +480,92 @@ def test_ranked_store_enrollment_does_not_reactivate_inactive_products(client, d
     assert db_session.query(Product).filter_by(store_id=store["id"], status="active").count() == 0
     assert db_session.query(Product).filter_by(store_id=store["id"], status="inactive").count() == 51
     assert db_session.query(ProductSnapshot).count() == 0
+
+
+def test_ranked_store_enrollment_skips_inactive_candidate_before_filling_vacancy(client, db_session):
+    store = client.post(
+        "/api/stores",
+        json={"name": "Fill Vacancy Store", "url": "https://www.aliexpress.com/store/770722"},
+    ).json()
+    inactive_id = "10050077072200"
+    inactive = Product(
+        store_id=store["id"],
+        aliexpress_product_id=inactive_id,
+        url=f"https://www.aliexpress.com/item/{inactive_id}.html",
+        status="inactive",
+    )
+    db_session.add(inactive)
+    db_session.commit()
+    expected_dates = [
+        "2026-10-05", "2026-10-06", "2026-10-07", "2026-10-08",
+        "2026-10-09", "2026-10-10", "2026-10-11",
+    ]
+    candidates = []
+    for index in range(21):
+        product_id = inactive_id if index == 0 else f"100500770722{index:02d}"
+        candidates.append({
+            "platform_product_id": product_id,
+            "url": f"https://www.aliexpress.com/item/{product_id}.html",
+            "title": f"Candidate {index}",
+            "history_source": "ixspy_visible_daily_increment",
+            "history_daily_capture_complete": True,
+            "history_expected_dates": expected_dates,
+            "history_missing_dates": [],
+            "historical_sales": [
+                {"date": day, "value": 21 - index, "value_type": "daily_increment"}
+                for day in expected_dates
+            ],
+        })
+    response = client.post(
+        "/api/collection/browser-extension/store",
+        json={
+            "platform_store_id": "770722",
+            "url": "https://www.aliexpress.com/store/770722/pages/all-items.html?shop_sortType=orders_desc",
+            "products": candidates,
+            "raw_data": {
+                "collection_mode": "top_7d_increment_selection",
+                "order_sort_verified": True,
+                "scan_complete": True,
+                "pagination_known": True,
+                "has_next_page": False,
+                "next_page_url": None,
+                "history_target_date": "2026-10-12",
+                "candidate_count": 21,
+                "selection": [
+                    {"product_id": item["platform_product_id"], "orders_rank": index + 1}
+                    for index, item in enumerate(candidates)
+                ],
+            },
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    active_ids = {
+        product.aliexpress_product_id
+        for product in db_session.query(Product).filter_by(store_id=store["id"], status="active")
+    }
+    assert len(active_ids) == 20
+    assert inactive_id not in active_ids
+    assert candidates[-1]["platform_product_id"] in active_ids
+
+
+def test_manual_store_page_enrolls_products_but_does_not_wrap_when_pagination_is_unknown(client, db_session):
+    store = client.post(
+        "/api/stores",
+        json={"name": "Unknown Pagination Store", "url": "https://www.aliexpress.com/store/770723"},
+    ).json()
+    candidate = _ranked_page_candidate("770723", 1)
+    payload = _ranked_page_payload("770723", [candidate], has_next_page=False)
+    payload["raw_data"]["pagination_known"] = False
+
+    response = client.post("/api/collection/browser-extension/store", json=payload)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["added_count"] == 1
+    assert response.json()["continuation_saved"] is False
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert state.next_page_url == state.first_orders_url
+    assert state.last_outcome == "pagination_unknown"
 
 
 def test_ranked_store_enrollment_never_deactivates_unselected_products(client, db_session):
@@ -526,6 +617,7 @@ def test_ranked_store_enrollment_never_deactivates_unselected_products(client, d
             "collection_mode": "top_7d_increment_selection",
             "order_sort_verified": True,
             "scan_complete": True,
+            "pagination_known": True,
             "has_next_page": False,
             "next_page_url": None,
             "history_target_date": "2026-10-12",
@@ -597,6 +689,7 @@ def test_ranked_store_enrollment_preserves_mixed_source_pool_members(client, db_
                 "collection_mode": "top_7d_increment_selection",
                 "order_sort_verified": True,
                 "scan_complete": True,
+                "pagination_known": True,
                 "has_next_page": False,
                 "next_page_url": None,
                 "history_target_date": "2026-10-12",
@@ -674,6 +767,7 @@ def test_ranked_store_enrollment_rejects_conflicting_candidate_without_partial_p
                 "collection_mode": "top_7d_increment_selection",
                 "order_sort_verified": True,
                 "scan_complete": True,
+                "pagination_known": True,
                 "has_next_page": False,
                 "next_page_url": None,
                 "history_target_date": "2026-10-12",
@@ -723,6 +817,7 @@ def test_ranked_store_enrollment_rejects_cumulative_like_daily_history(client, d
                 "collection_mode": "top_7d_increment_selection",
                 "order_sort_verified": True,
                 "scan_complete": True,
+                "pagination_known": True,
                 "has_next_page": False,
                 "next_page_url": None,
                 "history_target_date": "2026-10-08",

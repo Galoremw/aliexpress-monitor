@@ -501,6 +501,47 @@ def test_queued_store_writes_observed_and_pending_without_changing_pool(client, 
     assert metrics[target_date - timedelta(days=3)].reason == "ixspy_store_page_pending"
 
 
+def test_queued_store_persists_page_chart_and_worker_diagnostics(client, db_session):
+    store = create_store(client, "990149")
+    product = create_product(client, store["id"], "1005009914901")
+    target_date = date.today()
+    payload = monitored_store_payload("990149", product["aliexpress_product_id"], target_date, {})
+    payload["raw_data"].update({
+        "worker_id": "worker-second-pc",
+        "worker_label": "第二台电脑",
+        "page_scans": [{
+            "url": payload["url"],
+            "candidate_node_count": 3,
+            "visible_product_count": 2,
+            "matched_product_ids": [product["aliexpress_product_id"]],
+            "unmatched_target_ids": [],
+            "has_next_page": False,
+            "next_page_url": None,
+        }],
+        "chart_reads": [{
+            "product_id": product["aliexpress_product_id"],
+            "outcome": "partial",
+            "source": "ixspy_store_product_chart_unavailable",
+            "point_count": 0,
+        }],
+    })
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    diagnostics = snapshot.raw_payload["diagnostics"]
+    assert diagnostics["worker_id"] == "worker-second-pc"
+    assert diagnostics["worker_label"] == "第二台电脑"
+    assert diagnostics["page_scans"][0]["candidate_node_count"] == 3
+    assert diagnostics["chart_reads"][0]["source"] == "ixspy_store_product_chart_unavailable"
+
+
 def test_queued_store_rejects_stale_targets_before_any_metric_write(client, db_session):
     store = create_store(client, "990143")
     product = create_product(client, store["id"], "1005009914301")
@@ -666,6 +707,41 @@ def test_scheduled_run_includes_active_store_without_products(client, db_session
     assert all(item.target_type == "STORE" for item in items)
 
 
+def test_scheduled_run_skips_custom_monitor_container_but_queues_real_stores(client, db_session):
+    store = create_store(client, "990111")
+    custom_product = client.post(
+        "/api/products",
+        json={"aliexpress_product_id": "1005009911101"},
+    )
+    assert custom_product.status_code == 201
+
+    response = client.post(
+        "/api/browser-collection/runs/ensure",
+        json={"target_date": "2026-09-22", "trigger": "MANUAL"},
+    )
+
+    assert response.status_code == 200, response.text
+    items = db_session.query(BrowserCollectionItem).all()
+    assert [item.store_id for item in items] == [store["id"]]
+    assert db_session.query(StorePageDiscoveryState).filter_by(
+        store_id=custom_product.json()["store_id"]
+    ).one_or_none() is None
+
+
+def test_collect_all_queues_real_stores_when_custom_monitor_container_exists(client, db_session):
+    store = create_store(client, "990112")
+    custom_product = client.post(
+        "/api/products",
+        json={"aliexpress_product_id": "1005009911201"},
+    )
+    assert custom_product.status_code == 201
+
+    response = client.post("/api/browser-collection/runs/collect-all")
+
+    assert response.status_code == 200, response.text
+    assert {item.store_id for item in db_session.query(BrowserCollectionItem).all()} == {store["id"]}
+
+
 def test_store_claim_contains_only_active_monitored_ids(client, db_session):
     selected = create_store(client, "990106")
     other = create_store(client, "990107")
@@ -729,6 +805,10 @@ def test_manual_store_intake_rejects_empty_daily_mode_payload(client, db_session
     store = create_store(client, "990148")
     product = create_product(client, store["id"], "1005009914801")
     payload = monitored_store_payload("990148", product["aliexpress_product_id"], date.today(), {})
+    inactive = create_store(client, "990109")
+    create_product(client, inactive["id"], "1005009910901")
+    db_session.get(Store, inactive["id"]).status = "inactive"
+    db_session.commit()
     payload["products"] = []
 
     response = client.post("/api/collection/browser-extension/store", json=payload)
@@ -2084,6 +2164,7 @@ def _daily_store_request(store_id, page_url, target_date, monitored_ids, candida
 def _candidate_page(page_url, store_id, candidates, *, scan_complete=True):
     return {
         "page_url": page_url,
+        "pagination_known": True,
         "has_next_page": True,
         "next_page_url": (
             f"https://www.aliexpress.com/store/{store_id}/pages/all-items.html"
@@ -2215,6 +2296,39 @@ def test_empty_pool_daily_store_accepts_candidate_page(client, db_session):
         ProductDailyMetric.product_id == db_session.query(Product.id).filter_by(store_id=store["id"]).scalar()
     ).all()
     assert len(metrics) == 7
+
+
+def test_candidate_page_with_unknown_pagination_fills_pool_without_wrapping_cursor(client, db_session):
+    store = create_store(client, "990313")
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    candidate = _history_candidate("1005009931301", target_date)
+    candidate_page = _candidate_page(page_url, "990313", [candidate])
+    candidate_page.update(
+        pagination_known=False,
+        has_next_page=False,
+        next_page_url=None,
+    )
+    payload = _daily_store_request("990313", page_url, target_date, [], candidate_page)
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.query(Product).filter_by(
+        store_id=store["id"], status="active", aliexpress_product_id=candidate["platform_product_id"]
+    ).count() == 1
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert state.next_page_url == page_url
+    assert state.last_outcome == "pagination_unknown"
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    candidate_scan = snapshot.raw_payload["diagnostics"]["candidate_scan"]
+    assert candidate_scan["status"] == "pagination_unknown"
+    assert candidate_scan["cursor_after"] == page_url
 
 
 def test_full_pool_skips_candidate_page_without_advancing_cursor(client, db_session):

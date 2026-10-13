@@ -29,6 +29,13 @@ from app.services.store_page_discovery import (
 )
 
 
+def _diagnostic_records(raw: dict, key: str, limit: int) -> list[dict]:
+    records = raw.get(key)
+    if not isinstance(records, list):
+        return []
+    return [record for record in records[:limit] if isinstance(record, dict)]
+
+
 def _validated_orders_url(store: Store, value: str) -> str:
     try:
         normalized = normalize_aliexpress_url(value, "store")
@@ -101,6 +108,7 @@ def _process_candidate_page(
         has_next_page=page.has_next_page,
         next_page_url=page.next_page_url,
         scan_complete=page.scan_complete,
+        pagination_known=page.pagination_known,
         error=page_url_error or "IXSPY 候选商品图表页读取未完成",
     )
     scan["cursor_before"] = cursor_before
@@ -108,7 +116,7 @@ def _process_candidate_page(
     scan["error"] = cursor.last_error
     scan["status"] = cursor.last_outcome or "rejected"
 
-    if cursor.last_outcome not in {"advanced", "wrapped"}:
+    if cursor.last_outcome not in {"advanced", "wrapped", "pagination_unknown"}:
         reason = "candidate_page_incomplete" if cursor.last_outcome == "incomplete" else "cursor_not_advanced"
         for candidate in page.candidates:
             scan["skipped_ids"].append(candidate.platform_product_id)
@@ -299,10 +307,15 @@ def save_monitored_store_observation(
         "missing_dates": {},
         "visited_page_urls": urls,
         "visited_unique_page_count": len(visited_identities),
+        "worker_id": raw.get("worker_id")[:128] if isinstance(raw.get("worker_id"), str) else None,
+        "worker_label": raw.get("worker_label")[:128] if isinstance(raw.get("worker_label"), str) else None,
+        "page_scans": _diagnostic_records(raw, "page_scans", 10),
+        "chart_reads": _diagnostic_records(raw, "chart_reads", 20),
         "candidate_scan": {
             "status": "not_requested",
             "page_url": candidate_page.page_url if candidate_page else None,
             "scan_complete": candidate_page.scan_complete if candidate_page else None,
+            "pagination_known": candidate_page.pagination_known if candidate_page else None,
             "has_next_page": candidate_page.has_next_page if candidate_page else None,
             "next_page_url": candidate_page.next_page_url if candidate_page else None,
             "candidate_ids": [candidate.platform_product_id for candidate in candidate_page.candidates]

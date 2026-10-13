@@ -25,6 +25,8 @@ function makeWorkerHarness({
   activeTabActivationStealsFocus = false,
   claimsHeld = false,
   heartbeatConflict = false,
+  clockNow = () => Date.now(),
+  cloneStorage = false,
 } = {}) {
   const listeners = {
     message: eventSlot(),
@@ -36,6 +38,7 @@ function makeWorkerHarness({
     focusChanged: eventSlot(),
   };
   const storage = {};
+  const cloneStorageValue = (value) => cloneStorage ? structuredClone(value) : value;
   if (expiredToken) {
     storage.apiAccessToken = expiredToken;
     storage.apiAccessTokens = { "http://127.0.0.1:8000": expiredToken };
@@ -100,11 +103,12 @@ function makeWorkerHarness({
     storage: {
       local: {
         async get(keys) {
-          if (typeof keys === "string") return { [keys]: storage[keys] };
-          if (Array.isArray(keys)) return Object.fromEntries(keys.filter((key) => key in storage).map((key) => [key, storage[key]]));
-          return { ...storage };
+          if (typeof keys === "string") return { [keys]: cloneStorageValue(storage[keys]) };
+          if (Array.isArray(keys)) return Object.fromEntries(keys.filter((key) => key in storage)
+            .map((key) => [key, cloneStorageValue(storage[key])]));
+          return Object.fromEntries(Object.entries(storage).map(([key, value]) => [key, cloneStorageValue(value)]));
         },
-        async set(values) { Object.assign(storage, values); },
+        async set(values) { Object.assign(storage, cloneStorageValue(values)); },
         async remove(keys) { for (const key of Array.isArray(keys) ? keys : [keys]) delete storage[key]; },
       },
     },
@@ -154,11 +158,11 @@ function makeWorkerHarness({
         windowStates.set(8, options.state || "normal");
         const tab = { id: nextTabId++, windowId: 8, url: options.url || "about:blank", status: "complete", active: true };
         tabs.set(tab.id, tab);
-        if (windowCreationStealsFocus) focusedWindowId = 8;
+        if (options.focused === true || windowCreationStealsFocus) focusedWindowId = 8;
         return { id: 8, type: "normal", state: options.state || "normal", focused: focusedWindowId === 8 };
       },
       async update(id, changes) {
-        windowUpdates.push({ id, ...changes });
+        windowUpdates.push({ id, ...changes, collectionMessageCount: collectionMessages.length });
         if (changes.state) windowStates.set(id, changes.state);
         if (changes.focused === true) focusedWindowId = id;
         else if (changes.focused === false && focusedWindowId === id) focusedWindowId = 7;
@@ -178,12 +182,15 @@ function makeWorkerHarness({
     webNavigation: { onCommitted: listeners.committed, onHistoryStateUpdated: listeners.history },
   };
 
+  const WorkerDate = class extends Date {
+    static now() { return clockNow(); }
+  };
   const context = {
     chrome,
     crypto: { randomUUID: () => `test-worker-${++workerIdSequence}` },
     URL,
     Map,
-    Date,
+    Date: WorkerDate,
     Promise,
     setTimeout(callback, delay) { pendingTimers.push({ callback, delay }); return pendingTimers.length; },
     setInterval() { return 0; },
@@ -380,11 +387,23 @@ test("store worker merges two Orders pages without opening product detail URLs",
   const worker = makeWorkerHarness({ collectionResults: [
     { state: "ready", page_result: { platform_store_id: "123456", url: firstUrl,
       products: [{ platform_product_id: "1005000000000001", historical_sales: [] }],
+      diagnostics: {
+        page_scan: { url: firstUrl, candidate_node_count: 4, visible_product_count: 3,
+          matched_product_ids: ["1005000000000001"], unmatched_target_ids: ["1005000000000002"] },
+        chart_reads: [{ product_id: "1005000000000001", outcome: "partial", source: "ixspy_store_product_chart_unavailable", point_count: 0 }],
+      },
       has_next_page: true, next_page_url: secondUrl } },
     { state: "ready", page_result: { platform_store_id: "123456", url: secondUrl,
       products: [{ platform_product_id: "1005000000000002", historical_sales: [] }],
+      diagnostics: {
+        page_scan: { url: secondUrl, candidate_node_count: 5, visible_product_count: 4,
+          matched_product_ids: ["1005000000000002"], unmatched_target_ids: [] },
+        chart_reads: [{ product_id: "1005000000000002", outcome: "complete", source: "ixspy_visible_daily_increment", point_count: 7 }],
+      },
       has_next_page: false, next_page_url: null } },
   ] });
+  worker.storage.browserCollectionLocalProfileEnabled = false;
+  worker.storage.browserCollectionRemoteProfileEnabled = true;
   const tab = await worker.chrome.tabs.create({ windowId: 8, url: firstUrl, active: true });
   const result = await worker.context.collectStorePages(tab.id, {
     target_url: firstUrl, target_date: "2026-09-29",
@@ -395,6 +414,11 @@ test("store worker merges two Orders pages without opening product detail URLs",
   assert.deepEqual(JSON.parse(JSON.stringify(result.payload.products.map((product) => product.platform_product_id))),
     ["1005000000000001", "1005000000000002"]);
   assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [firstUrl, secondUrl]);
+  assert.ok(result.payload.raw_data.worker_id);
+  assert.ok(result.payload.raw_data.worker_label);
+  assert.equal(result.payload.raw_data.page_scans.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.chart_reads.map((read) => read.outcome))),
+    ["partial", "complete"]);
   assert.equal(worker.updatedTabs.some((update) => /\/item\//.test(update.url || "")), false);
   assert.equal(worker.collectionMessages.length, 2);
 });
@@ -526,13 +550,138 @@ test("store worker stops at a cross-store next link and leaves missing IDs pendi
 
 test("store worker returns a challenge without submitting partial data", async () => {
   const firstUrl = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
-  const worker = makeWorkerHarness({ collectionResults: [{ state: "challenge", message: "verification" }] });
+  const worker = makeWorkerHarness({ collectionResults: [{
+    state: "challenge",
+    message: "verification",
+    diagnostics: {
+      page_scan: { url: firstUrl, candidate_node_count: 6, visible_product_count: 5 },
+      chart_reads: [{ product_id: "1005000000000001", outcome: "partial", source: "ixspy_visible_daily_increment", point_count: 2 }],
+    },
+  }] });
   const tab = await worker.chrome.tabs.create({ windowId: 8, url: firstUrl, active: true });
   const result = await worker.context.collectStorePages(tab.id, {
-    target_url: firstUrl, target_date: "2026-09-29", monitored_product_ids: ["1005000000000001"],
+    id: 401, run_id: 9, target_url: firstUrl, target_date: "2026-09-29", monitored_product_ids: ["1005000000000001"],
   });
   assert.equal(result.state, "challenge");
   assert.equal(result.payload, undefined);
+  const progress = worker.storage["browserCollectionStoreProgress:401"];
+  assert.ok(progress);
+  assert.equal(progress.page_scans[0].candidate_node_count, 6);
+  assert.equal(progress.chart_reads[0].point_count, 2);
+});
+
+test("challenge response preserves product progress saved during the active page read", async () => {
+  let finishRead;
+  const pendingRead = new Promise((resolve) => { finishRead = resolve; });
+  const worker = makeWorkerHarness({ collectionResult: pendingRead, cloneStorage: true });
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const productId = "1005000000000041";
+  const item = {
+    id: 411, run_id: 9, target_url: url, target_date: "2026-09-29",
+    monitored_product_ids: [productId],
+  };
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  worker.storage.automationItem = { ...item, target_type: "STORE" };
+  worker.storage.automationTabId = tab.id;
+  worker.storage.automationClaimToken = "claim-411";
+  const collecting = worker.context.collectStorePages(tab.id, item);
+  await worker.flush();
+
+  const product = {
+    platform_product_id: productId,
+    url: `https://www.aliexpress.com/item/${productId}.html`,
+    historical_sales: [{ date: "2026-09-28", value: 5, value_type: "daily_increment" }],
+  };
+  const progressAck = await new Promise((resolve) => {
+    const handled = worker.listeners.message.callback({
+      type: "store-collection-product-progress",
+      item_id: item.id,
+      claim_token: "claim-411",
+      product,
+    }, { tab: { id: tab.id, url } }, resolve);
+    if (!handled) resolve({ not_handled: true });
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(progressAck)), { ok: true });
+  finishRead({
+    state: "challenge",
+    message: "verification",
+    diagnostics: { chart_reads: [{ product_id: productId, outcome: "partial", point_count: 1 }] },
+  });
+
+  const result = await collecting;
+  const saved = worker.storage["browserCollectionStoreProgress:411"];
+  assert.equal(result.state, "challenge");
+  assert.ok(saved.products[productId], "the incremental product checkpoint survives the challenge response");
+});
+
+test("candidate discovery resumes after challenge without an empty monitored-page request", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const productId = "1005000000000042";
+  const worker = makeWorkerHarness({ collectionResults: [
+    { state: "ready", page_result: { platform_store_id: "123456", url,
+      products: [{ platform_product_id: productId, historical_sales: [{ date: "2026-09-28", value: 4 }] }],
+      has_next_page: false, next_page_url: null } },
+    { state: "challenge", message: "verification" },
+  ] });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const item = {
+    id: 412, run_id: 9, target_url: url, discovery_page_url: url,
+    target_date: "2026-09-29", monitored_product_ids: [productId],
+  };
+
+  const firstAttempt = await worker.context.collectStorePages(tab.id, item);
+  assert.equal(firstAttempt.state, "challenge");
+  assert.ok(worker.storage["browserCollectionStoreProgress:412"].products[productId]);
+
+  worker.setCollectionResult({ state: "ready", page_result: {
+    platform_store_id: "123456", url, candidates: [], scan_complete: true,
+    pagination_known: true, has_next_page: false, next_page_url: null,
+  } });
+  const resumed = worker.context.collectStorePages(tab.id, item);
+  await worker.flush();
+  const result = await resumed;
+
+  assert.equal(result.state, "ready");
+  assert.equal(worker.collectionMessages.length, 1, "completed monitored targets are not sent again as an empty request");
+  assert.equal(worker.candidateScanMessages.length, 2, "the candidate page is retried after verification");
+});
+
+test("selected remote worker foregrounds the maximized store collector then backgrounds it after the task", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({ collectionResult: {
+    state: "ready",
+    page_result: { platform_store_id: "123456", url, products: [], has_next_page: false },
+  } });
+  worker.storage.browserCollectionWorkerMode = true;
+  worker.storage.browserCollectionRemoteProfileEnabled = true;
+  worker.storage.automationWindowId = 8;
+  worker.storage.automationWindowOwned = true;
+  worker.storage.automationWindowBackground = true;
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  worker.storage.automationTabId = tab.id;
+  worker.storage.automationItem = {
+    id: 402,
+    run_id: 9,
+    target_type: "STORE",
+    target_key: "store:123456",
+    target_url: url,
+    target_date: "2026-09-29",
+    monitored_product_ids: ["1005000000000001"],
+  };
+  worker.storage.automationClaimToken = "claim-402";
+  worker.storage.automationTaskKind = "STORE";
+
+  await worker.context.processAutomationTabInternal(tab.id);
+
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true
+    && update.collectionMessageCount === 0), "the selected worker window is focused before collection begins");
+  assert.equal(worker.windowUpdates.some((update) => update.focused === false && update.collectionMessageCount === 0), false,
+    "the worker window must not be blurred before IXSPY collection");
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true
+    && update.state === "maximized"), "the store chart is read in a maximized foreground window");
+  const finalWindowUpdate = worker.windowUpdates.filter((update) => update.id === 8).at(-1);
+  assert.equal(finalWindowUpdate.focused, false);
+  assert.equal(finalWindowUpdate.state, "minimized", "the finished worker window moves behind the dashboard");
 });
 
 test("store worker returns a partial payload when the first page exceeds its response budget", async () => {
@@ -552,6 +701,52 @@ test("store worker returns a partial payload when the first page exceeds its res
   assert.deepEqual(JSON.parse(JSON.stringify(result.payload.products)), []);
   assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [url]);
   assert.equal(result.payload.raw_data.collection_interrupted, true);
+});
+
+test("monitored-page timeout does not start a candidate scan on the same IXSPY controls", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({ collectionResult: new Promise(() => {}) });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const collecting = worker.context.collectStorePages(tab.id, {
+    id: 409, run_id: 9, target_url: url, discovery_page_url: url,
+    target_date: "2026-09-29", monitored_product_ids: ["1005000000000001"],
+  });
+  await worker.flush();
+  worker.pendingTimers.find((timer) => timer.delay === 4 * 60 * 1000).callback();
+  await worker.flush();
+  const candidateScanStarted = worker.candidateScanMessages.length > 0;
+  if (candidateScanStarted) {
+    worker.pendingTimers.filter((timer) => timer.delay === 4 * 60 * 1000).at(-1)?.callback();
+  }
+  const result = await collecting;
+
+  assert.equal(candidateScanStarted, false);
+  assert.equal(result.payload.raw_data.collection_interrupted, true);
+});
+
+test("candidate page response timeout is bounded by the remaining store work budget", async () => {
+  let clockReads = 0;
+  const worker = makeWorkerHarness({
+    collectionResult: new Promise(() => {}),
+    clockNow: () => (clockReads++ === 0 ? 0 : 7 * 60 * 1000),
+  });
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc&page=2";
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const collecting = worker.context.collectStorePages(tab.id, {
+    id: 410, run_id: 9,
+    target_url: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+    discovery_page_url: url, target_date: "2026-09-29", monitored_product_ids: [],
+  });
+  await worker.flush();
+  const boundedTimeout = worker.pendingTimers.find((timer) => timer.delay === 60 * 1000);
+  const unboundedTimeout = worker.pendingTimers.find((timer) => timer.delay === 4 * 60 * 1000);
+  const timeout = boundedTimeout || unboundedTimeout;
+  assert.ok(timeout, "candidate scan has a bounded response timeout");
+  timeout.callback();
+  const result = await collecting;
+
+  assert.ok(boundedTimeout, "a scan starting at minute seven only receives the remaining one-minute budget");
+  assert.equal(result.payload.candidate_page.scan_complete, false);
 });
 
 test("store timeout submits saved product progress instead of restarting the whole store", async () => {
@@ -655,7 +850,7 @@ test("expired authorization asks for dashboard login when renewal is unavailable
   assert.match(worker.notifications[0].message, /登录本地监控台/);
 });
 
-test("scheduled items reuse the blank page in a visible unfocused worker window and close completed tabs", async () => {
+test("scheduled items reuse the blank page in a maximized foreground worker window and close completed tabs", async () => {
   const worker = makeWorkerHarness();
   await worker.listeners.message.callback({
     type: "dashboard-context",
@@ -670,8 +865,8 @@ test("scheduled items reuse the blank page in a visible unfocused worker window 
 
   const firstTab = await worker.chrome.tabs.get(worker.storage.automationTabId);
   assert.equal(worker.windowCreates.length, 1);
-  assert.equal(worker.windowCreates[0].focused, false);
-  assert.equal(worker.windowCreates[0].state, "normal");
+  assert.equal(worker.windowCreates[0].focused, true);
+  assert.equal(worker.windowCreates[0].state, "maximized");
   assert.equal(worker.windowCreates[0].type, "normal");
   assert.equal(worker.windowCreates[0].url, "about:blank");
   assert.equal(firstTab.windowId, 8);
@@ -705,8 +900,12 @@ test("scheduled items reuse the blank page in a visible unfocused worker window 
     ["about:blank"],
   );
   assert.deepEqual(worker.windowRemoves, [], "collection does not close the worker window");
-  assert.equal(worker.windowUpdates.some((update) => update.focused === true), false);
-  assert.ok(worker.windowUpdates.every((update) => update.id === 8 && update.state === "normal"));
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true));
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true && update.state === "maximized"),
+    "the worker stays maximized and focused while the item is processed");
+  const finalWorkerWindowUpdate = worker.windowUpdates.filter((update) => update.id === 8).at(-1);
+  assert.equal(finalWorkerWindowUpdate.focused, false);
+  assert.equal(finalWorkerWindowUpdate.state, "minimized", "the completed worker window moves behind the dashboard");
 });
 
 test("closes tracked collection tabs even if worker-window ownership flags were lost", async () => {
@@ -997,7 +1196,7 @@ test("store-page batch gets a longer bounded response window", async () => {
   assert.equal(worker.pendingTimers.some((timer) => timer.delay === 90 * 1000), false);
   assert.equal(worker.collectionMessages[0].target_type, "STORE");
   assert.deepEqual(JSON.parse(JSON.stringify(worker.collectionMessages[0].monitored_product_ids)), ["1005000000000001"]);
-  assert.ok(worker.windowUpdates.some((update) => update.state === "normal" && update.focused === false));
+  assert.ok(worker.windowUpdates.some((update) => update.state === "maximized" && update.focused === true));
 });
 
 test("an alarm discards a hung promise after the backend settles its item and continues", async () => {
@@ -1019,7 +1218,7 @@ test("an alarm discards a hung promise after the backend settles its item and co
   assert.ok(nextTab.url.endsWith("100000000102.html"));
 });
 
-test("manual start leaves the dashboard window alone and creates a background worker window", async () => {
+test("manual start leaves the dashboard window alone and maximizes the focused worker window", async () => {
   const worker = makeWorkerHarness();
   worker.storage.automationWindowId = 99;
   worker.storage.automationWindowOwned = true;
@@ -1054,10 +1253,12 @@ test("manual start leaves the dashboard window alone and creates a background wo
     "the queue uses the initially blank worker tab");
   assert.equal((await worker.chrome.tabs.get(10)).windowId, 8);
   assert.equal((await worker.chrome.tabs.get(10)).active, true, "product is active inside its own window");
-  assert.equal(worker.windowUpdates.some((update) => update.focused === true), false);
+  assert.equal(worker.windowCreates[0].focused, true);
+  assert.equal(worker.windowCreates[0].state, "maximized");
+  assert.equal(worker.windowUpdates.some((update) => update.id === 7 && update.focused === true), false);
 });
 
-test("isolated collection stays visible without switching the user's active Chrome window", async () => {
+test("selected collector uses a maximized foreground window without replacing the dashboard", async () => {
   const worker = makeWorkerHarness({ dedicatedProfile: false });
   worker.listeners.message.callback({
     type: "dashboard-context",
@@ -1071,13 +1272,13 @@ test("isolated collection stays visible without switching the user's active Chro
   await worker.flush();
 
   assert.equal(worker.windowCreates.length, 1);
-  assert.equal(worker.windowCreates[0].focused, false);
-  assert.equal(worker.windowCreates[0].state, "normal");
+  assert.equal(worker.windowCreates[0].focused, true);
+  assert.equal(worker.windowCreates[0].state, "maximized");
   assert.equal(worker.windowUpdates.some((update) => update.id === 7), false);
   assert.equal((await worker.chrome.tabs.get(worker.storage.automationTabId)).active, true);
 });
 
-test("keeps the isolated worker visible but unfocused if Chrome delays surfacing it", async () => {
+test("keeps the selected collector window in front while collection is running", async () => {
   let finishCollection;
   const collectionGate = new Promise((resolve) => { finishCollection = resolve; });
   const worker = makeWorkerHarness({
@@ -1098,8 +1299,9 @@ test("keeps the isolated worker visible but unfocused if Chrome delays surfacing
   await worker.flush();
   worker.listeners.focusChanged.callback(8);
   await worker.flush();
-  assert.equal(worker.focusedWindowId, 7, "the worker yields focus to the previously foreground app");
-  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.state === "normal" && update.focused === false));
+  assert.equal(worker.focusedWindowId, 8, "the idle collector machine keeps the task window in front");
+  assert.equal(worker.windowCreates[0].state, "maximized");
+  assert.ok(!worker.windowUpdates.some((update) => update.id === 8 && update.focused === false));
 
   const startTimer = worker.pendingTimers.find((timer) => timer.delay === 500 && !timer.executed);
   startTimer.executed = true;
@@ -1107,11 +1309,12 @@ test("keeps the isolated worker visible but unfocused if Chrome delays surfacing
   await worker.flush();
   finishCollection({ state: "ready", payload: { sold_count: 20, captured_at: "2026-09-30T10:00:00+08:00" } });
   await worker.flush();
-
-  assert.equal(worker.focusedWindowId, 7, "promoting the next product tab does not leave the collector in front");
+  const finalWorkerUpdate = worker.windowUpdates.filter((update) => update.id === 8).at(-1);
+  assert.equal(finalWorkerUpdate.state, "minimized", "the worker backgrounds only after collection finishes");
+  assert.equal(finalWorkerUpdate.focused, false);
 });
 
-test("verification restores the worker window and shows the challenge tab without resizing it", async () => {
+test("verification restores the maximized worker window and shows the challenge tab", async () => {
   const worker = makeWorkerHarness({
     collectionResult: { state: "challenge", message: "请完成人工验证" },
   });
@@ -1130,7 +1333,7 @@ test("verification restores the worker window and shows the challenge tab withou
   worker.listeners.updated.callback(challengeTab.id, { status: "complete" }, challengeTab);
   await worker.flush();
 
-  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true && update.state === "normal"));
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true && update.state === "maximized"));
   assert.ok(worker.updatedTabs.some((update) => update.id === challengeTab.id && update.active === true));
   assert.equal(worker.removedTabs.includes(challengeTab.id), false,
     "keeps the challenge page open for human verification");
@@ -1173,6 +1376,9 @@ test("store verification resumes with identity probe instead of legacy first-20 
   assert.equal(worker.collectionMessages.filter((message) => message.target_type === "STORE"
     && !message.monitored_product_ids).length, 0);
   assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/store-discovery"));
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8
+    && update.focused === true && update.state === "maximized"),
+  "store collection and its verification page use the maximized worker window");
 });
 
 test("IXSPY login expiry foregrounds the visible login page, pauses safely, and resumes the same item", async () => {
@@ -1207,6 +1413,9 @@ test("IXSPY login expiry foregrounds the visible login page, pauses safely, and 
   assert.equal(worker.removedTabs.includes(loginTab.id), false, "keeps the page open while login is pending");
   assert.equal(worker.notifications.some((notice) => notice.title === "IXSPY 需要登录" && notice.requireInteraction), true);
   assert.ok(worker.updatedTabs.some((update) => update.id === loginTab.id && update.active === true));
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8
+    && update.focused === true && update.state === "maximized"),
+  "IXSPY login verification is presented in the maximized worker window");
   assert.equal(worker.requests.some((request) => request.pathname.endsWith("/snapshot")), false);
 
   worker.setCollectionResult({ state: "ready", payload: { sold_count: 22, captured_at: "2026-09-28T09:00:00+08:00" } });
@@ -1237,7 +1446,7 @@ test("a redirect to the AliExpress punish route pauses the task and foregrounds 
   await worker.flush();
 
   assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/challenge"));
-  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true && update.state === "normal"));
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true && update.state === "maximized"));
   assert.ok(worker.updatedTabs.some((update) => update.id === challengeTab.id && update.active === true));
 });
 
@@ -1260,7 +1469,7 @@ test("polling recovers a challenge page that was already open during extension r
   await worker.flush();
 
   assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/challenge"));
-  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true && update.state === "normal"));
+  assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true && update.state === "maximized"));
   assert.ok(worker.updatedTabs.some((update) => update.id === challengeTab.id && update.active === true));
 });
 
@@ -1295,7 +1504,7 @@ test("alarm wake discovers a LAN dashboard and polls its same-origin API", async
     && request.origin === origin));
 });
 
-test("scheduled collection creates an unfocused worker window instead of taking over the user's window", async () => {
+test("authorized worker collection uses a maximized foreground window without resizing the dashboard", async () => {
   const worker = makeWorkerHarness({ dedicatedProfile: false });
   await worker.flush();
   worker.storage.browserCollectionIsolatedProfileAuthorized = true;
@@ -1310,8 +1519,8 @@ test("scheduled collection creates an unfocused worker window instead of taking 
   await worker.flush();
 
   assert.equal(worker.windowCreates.length, 1);
-  assert.equal(worker.windowCreates[0].focused, false);
-  assert.equal(worker.windowCreates[0].state, "normal");
+  assert.equal(worker.windowCreates[0].focused, true);
+  assert.equal(worker.windowCreates[0].state, "maximized");
   assert.equal((await worker.chrome.tabs.get(worker.storage.automationTabId)).windowId, 8);
   assert.equal((await worker.chrome.tabs.get(worker.storage.automationTabId)).active, true);
   assert.equal(worker.windowUpdates.some((update) => update.id === 7), false, "the user's window remains untouched");

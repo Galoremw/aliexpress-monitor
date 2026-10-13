@@ -7,15 +7,16 @@ const test = require("node:test");
 const targetDate = "2026-09-29";
 const productId = "1005001234567890";
 
-function loadStoreCollector({ panelProductId = productId, dailyValues = [5, 0, -1, 2, 7, 1, 3], staleDailyValues = null, staleHoverSamples = 0, extraProductIds = [], lazyExtraProductIds = [], moreOutsideMiniChart = false, moreOutsideAncestors = false, moreInsideShadow = false, exactMoreMarkup = false, moreActionDelayMs = 0, trendButtonDelayMs = 0, extraTrendInCard = false, missingMoreAction = false, misalignedChart = false, narrowTooltipTargets = false, firstChartPartial = false, ordersSorted = true, storeReadinessDelayMs = 0, hasNextPage = false, nextPageUrl = null, unrelatedNextControl = false, visibleStoreId = "123456", fastClockStepMs = 0 } = {}) {
+function loadStoreCollector({ panelProductId = productId, dailyValues = [5, 0, -1, 2, 7, 1, 3], staleDailyValues = null, staleHoverSamples = 0, extraProductIds = [], lazyExtraProductIds = [], moreOutsideMiniChart = false, moreOutsideAncestors = false, moreInsideShadow = false, exactMoreMarkup = false, moreActionDelayMs = 0, chartInjectionDelayMs = 0, trendButtonDelayMs = 0, extraTrendInCard = false, missingMoreAction = false, throwOnMoreClick = false, misalignedChart = false, narrowTooltipTargets = false, firstChartPartial = false, ordersSorted = true, challengePage = false, storeReadinessDelayMs = 0, hasNextPage = false, paginationKnown = true, nextPageUrl = null, paginationEntries = null, pageNumber = 1, unrelatedNextControl = false, visibleStoreId = "123456", fastClockStepMs = 0, productCardsReadyAfterScans = 0 } = {}) {
   let miniVisible = false;
   let lazyRevealed = false;
-  let panelVisible = false;
+  let panelVisibleAt = Infinity;
   let chartMode = "cumulative_total";
   let fullYearOpened = false;
   let tooltipText = "";
   let dailyHoverSamples = 0;
   let moreClicks = 0;
+  let productCardQueryCount = 0;
   let moreActionVisibleAt = 0;
   const trendButtonVisibleAt = Date.now() + trendButtonDelayMs;
   const withheldDate = new Date(Date.parse(`${targetDate}T00:00:00Z`) - 4 * 86400000).toISOString().slice(0, 10);
@@ -58,13 +59,14 @@ function loadStoreCollector({ panelProductId = productId, dailyValues = [5, 0, -
     if (miniVisible) moreActionVisibleAt = Date.now() + moreActionDelayMs;
   };
 
-  const totalButton = makeNode("trade-total-button", "总量", () => panelVisible);
+  const panelVisible = () => Date.now() >= panelVisibleAt;
+  const totalButton = makeNode("trade-total-button", "总量", panelVisible);
   totalButton.classList = { contains: (name) => name === "btn-active" && chartMode === "cumulative_total" };
   totalButton.click = () => { chartMode = "cumulative_total"; };
-  const incrementButton = makeNode("trade-inc-button", "增量", () => panelVisible);
+  const incrementButton = makeNode("trade-inc-button", "增量", panelVisible);
   incrementButton.classList = { contains: (name) => name === "btn-active" && chartMode === "daily_increment" };
   incrementButton.click = () => { chartMode = "daily_increment"; };
-  const yearButton = makeNode("", "查看一整年数据", () => panelVisible);
+  const yearButton = makeNode("", "查看一整年数据", panelVisible);
   yearButton.getAttribute = (name) => name === "onclick"
     ? `getYearChart('trade_chart','product','',${panelProductId})`
     : null;
@@ -75,7 +77,7 @@ function loadStoreCollector({ panelProductId = productId, dailyValues = [5, 0, -
   Object.defineProperty(tooltip, "textContent", { get: () => tooltipText });
   tooltip.getAttribute = (name) => name === "role" ? "tooltip" : null;
 
-  const canvas = makeNode("", "", () => panelVisible);
+  const canvas = makeNode("", "", panelVisible);
   canvas.getBoundingClientRect = () => rect(500, 180);
   canvas.dispatchEvent = (event) => {
     if (event.type !== "mousemove" || chartMode !== "daily_increment") return;
@@ -118,7 +120,7 @@ function loadStoreCollector({ panelProductId = productId, dailyValues = [5, 0, -
     querySelectorAll: (selector) => selector === "div, span, [style]" ? [tooltip] : [],
   };
 
-  const panel = makeNode("sales-180", "产品趋势概览 近一年销量趋势图", () => panelVisible);
+  const panel = makeNode("sales-180", "产品趋势概览 近一年销量趋势图", panelVisible);
   panel.querySelector = (selector) => ({
     ".trade-inc-button": incrementButton,
     ".trade-total-button": totalButton,
@@ -137,7 +139,11 @@ function loadStoreCollector({ panelProductId = productId, dailyValues = [5, 0, -
       ? `small-chart-${productId}`
       : name === "onclick" ? "lookMoreChart(this,event)" : null;
   }
-  moreAction.click = () => { moreClicks += 1; panelVisible = true; };
+  moreAction.click = () => {
+    if (throwOnMoreClick) throw new Error("simulated IXSPY interaction failure");
+    moreClicks += 1;
+    panelVisibleAt = Date.now() + chartInjectionDelayMs;
+  };
   moreAction.matches = (selector) => selector === "a, button, [role='button'], [tabindex]";
   const miniChart = makeNode(`test-small-chart ${productId}_h3 store_product_${productId}`, "近一年销量趋势", () => miniVisible);
   miniChart.querySelectorAll = (selector) => selector === "*" && !moreOutsideMiniChart && !moreOutsideAncestors ? [moreAction] : [];
@@ -166,29 +172,50 @@ function loadStoreCollector({ panelProductId = productId, dailyValues = [5, 0, -
   const nextPageLink = makeNode("pagination-next", "Next");
   nextPageLink.parentElement = makeNode("pagination");
   nextPageLink.href = nextPageUrl;
-  nextPageLink.getAttribute = (name) => name === "aria-label" ? "Next" : name === "href" ? nextPageUrl : null;
+  nextPageLink.disabled = !hasNextPage && paginationKnown;
+  nextPageLink.getAttribute = (name) => name === "aria-label" ? "Next"
+    : name === "aria-disabled" ? (nextPageLink.disabled ? "true" : null)
+      : name === "href" ? nextPageUrl : null;
   nextPageLink.matches = (selector) => selector === "a, button, [role='button']";
+  const customPaginationControls = paginationEntries?.map((entry) => {
+    const node = makeNode(entry.className || "pagination-link", entry.label || "");
+    node.href = entry.href || null;
+    node.disabled = Boolean(entry.disabled);
+    node.parentElement = makeNode(entry.parentClass || "pagination");
+    node.getAttribute = (name) => name === "aria-label" ? entry.ariaLabel || null
+      : name === "aria-disabled" ? (node.disabled ? "true" : null)
+        : name === "rel" ? entry.rel || null
+          : name === "href" ? entry.href || null : null;
+    node.matches = (selector) => selector === "a, button, [role='button']";
+    return node;
+  });
   const carouselNext = makeNode("carousel-next", "Next");
   carouselNext.parentElement = makeNode("product-carousel");
   carouselNext.getAttribute = (name) => name === "aria-label" ? "Next" : null;
   const document = {
     title: "IXSPY Store - AliExpress",
     visibilityState: "visible",
-    body: { innerText: `AliExpress public store listing\nShop${visibleStoreId} Store` },
+    body: { innerText: challengePage ? "Security verify required" : `AliExpress public store listing\nShop${visibleStoreId} Store` },
     documentElement: {
       scrollHeight: 1000,
       querySelectorAll: (selector) => selector === "*" ? allNodes : [],
     },
     querySelector: (selector) => ({
-      "#trade_chart": panelVisible ? chart : null,
-      "#trade_chart canvas": panelVisible ? canvas : null,
+      "#trade_chart": panelVisible() ? chart : null,
+      "#trade_chart canvas": panelVisible() ? canvas : null,
       'iframe[src*="captcha"], iframe[src*="punish"], [class*="captcha" i]': null,
     }[selector] || null),
     querySelectorAll(selector) {
-      if (selector === 'a[href*="/item/"], [data-product-id], [data-item-id], [data-product-url], [data-item-url]') return [link, ...extraLinks, ...(lazyRevealed ? lazyExtraLinks : [])];
-      if (selector.includes("pagination") || selector === 'a[rel="next"]') return hasNextPage ? [nextPageLink] : [];
+      if (selector === 'a[href*="/item/"], [data-product-id], [data-item-id], [data-product-url], [data-item-url]') {
+        productCardQueryCount += 1;
+        return productCardQueryCount > productCardsReadyAfterScans
+          ? [link, ...extraLinks, ...(lazyRevealed ? lazyExtraLinks : [])]
+          : [];
+      }
+      if (selector.includes("pagination") || selector === 'a[rel="next"]') return customPaginationControls
+        || (hasNextPage || paginationKnown ? [nextPageLink] : []);
       if (selector === "a, button, [role='button']") return [
-        ...(hasNextPage ? [nextPageLink] : []),
+        ...(customPaginationControls || (hasNextPage || paginationKnown ? [nextPageLink] : [])),
         ...(unrelatedNextControl ? [carouselNext] : []),
       ];
       if (selector === "*") return allNodes;
@@ -197,16 +224,16 @@ function loadStoreCollector({ panelProductId = productId, dailyValues = [5, 0, -
         ? [trendButton, ...(extraTrendInCard ? [neighborTrendButton] : [])]
         : [];
       if (selector === ".test-small-chart") return [miniChart];
-      if (selector === ".sales-180") return panelVisible ? [panel] : [];
+      if (selector === ".sales-180") return panelVisible() ? [panel] : [];
       if (selector === '[role="tooltip"], [class*="tooltip" i]') return [tooltip];
-      if (selector === 'button, [role="button"], a, [tabindex]') return panelVisible ? [totalButton, incrementButton, yearButton] : [];
+      if (selector === 'button, [role="button"], a, [tabindex]') return panelVisible() ? [totalButton, incrementButton, yearButton] : [];
       return [];
     },
   };
   let currentOrdersSorted = ordersSorted;
   const location = {
     get href() {
-      return `https://www.aliexpress.com/store/123456/pages/all-items.html?${currentOrdersSorted ? "shop_sortType=orders_desc" : "shop_sortType=bestmatch_sort"}`;
+      return `https://www.aliexpress.com/store/123456/pages/all-items.html?${currentOrdersSorted ? "shop_sortType=orders_desc" : "shop_sortType=bestmatch_sort"}${pageNumber > 1 ? `&page=${pageNumber}` : ""}`;
     },
     pathname: "/store/123456/pages/all-items.html",
   };
@@ -267,6 +294,32 @@ test("scheduled store page reads only claimed IDs and returns a safe next Orders
   assert.deepEqual(JSON.parse(JSON.stringify(result.page_result.products.map((product) => product.platform_product_id))), [productId]);
   assert.equal(result.page_result.next_page_url, nextPageUrl);
   assert.equal(collector.moreClicks, 1);
+});
+
+test("monitored store waits for product cards and reports page matching and chart outcomes", async () => {
+  const collector = loadStoreCollector({ productCardsReadyAfterScans: 4, fastClockStepMs: 250 });
+  const result = await collector.collect("STORE", targetDate, {
+    monitored_product_ids: [productId, "1005008888888888"],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result.page_result.products.map((product) => product.platform_product_id))),
+    [productId],
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result.page_result.diagnostics.page_scan.matched_product_ids)),
+    [productId],
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result.page_result.diagnostics.page_scan.unmatched_target_ids)),
+    ["1005008888888888"],
+  );
+  assert.equal(result.page_result.diagnostics.page_scan.product_cards_ready, true);
+  assert.equal(result.page_result.diagnostics.page_scan.candidate_node_count, 1);
+  assert.equal(result.page_result.diagnostics.chart_reads[0].product_id, productId);
+  assert.equal(result.page_result.diagnostics.chart_reads[0].outcome, "complete");
+  assert.equal(result.page_result.diagnostics.chart_reads[0].point_count, 7);
 });
 
 test("scheduled store collection checkpoints each product immediately after its chart read", async () => {
@@ -410,6 +463,15 @@ test("waits through a slow first-product IXSPY more-action injection", async () 
   assert.equal(collector.moreClicks, 1);
 });
 
+test("waits for a delayed IXSPY chart panel instead of treating it as unavailable", async () => {
+  const result = await loadStoreCollector({ chartInjectionDelayMs: 2300 })
+    .collect("STORE_TEST", targetDate);
+
+  assert.equal(result.test_result.complete, true);
+  assert.equal(result.test_result.points.length, 7);
+  assert.equal(result.test_result.diagnostics.retry_passes, 0);
+});
+
 test("waits for IXSPY to inject the first product's trend button", async () => {
   const collector = loadStoreCollector({ trendButtonDelayMs: 100 });
   const result = await collector.collect("STORE_TEST", targetDate);
@@ -461,7 +523,7 @@ test("store-page diagnostic reads one card without creating a submission payload
   const result = await collector.collect("STORE_TEST", targetDate);
 
   assert.equal(result.state, "ready");
-  assert.equal(result.test_result.collector_version, "0.6.68");
+  assert.equal(result.test_result.collector_version, "0.6.76");
   assert.equal(result.test_result.platform_product_id, productId);
   assert.equal(result.test_result.complete, true);
   assert.equal(result.test_result.points.length, 7);
@@ -587,6 +649,19 @@ test("scheduled candidate scan reads the current Orders page and diagnoses missi
   assert.equal(result.page_result.diagnostics.chart_reads[1].outcome, "unavailable");
 });
 
+test("candidate scan keeps pagination unknown when the page exposes no pagination controls", async () => {
+  const result = await loadStoreCollector({ paginationKnown: false }).collectStoreCandidatePage({
+    targetDate,
+    expectedStoreId: "123456",
+    expectedPageUrl: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.pagination_known, false);
+  assert.equal(result.page_result.has_next_page, false);
+  assert.equal(result.page_result.scan_complete, true);
+});
+
 test("scheduled candidate scan rejects wrong store, sort, and cursor URL", async () => {
   const expectedPageUrl = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
   const mismatch = await loadStoreCollector({ visibleStoreId: "1103845415" }).collectStoreCandidatePage({
@@ -653,6 +728,28 @@ test("does not mistake a product carousel Next control for store pagination", as
 
   assert.equal(result.state, "ready");
   assert.equal(result.page_result.has_next_page, false);
+});
+
+test("uses the enabled Next link instead of Previous and numbered pagination links", async () => {
+  const firstUrl = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const pageTwo = `${firstUrl}&page=2`;
+  const pageThree = `${firstUrl}&page=3`;
+  const result = await loadStoreCollector({
+    pageNumber: 2,
+    hasNextPage: true,
+    paginationEntries: [
+      { label: "Previous", href: firstUrl },
+      { label: "1", href: firstUrl },
+      { label: "2", href: pageTwo, disabled: true, className: "pagination-current" },
+      { label: "Next", href: pageThree, rel: "next" },
+    ],
+  }).collect("STORE_SELECT_PAGE", targetDate);
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.url, pageTwo);
+  assert.equal(result.page_result.pagination_known, true);
+  assert.equal(result.page_result.has_next_page, true);
+  assert.equal(result.page_result.next_page_url, pageThree);
 });
 
 test("finds the IXSPY more action at store-card level when it is outside the mini-chart node", async () => {

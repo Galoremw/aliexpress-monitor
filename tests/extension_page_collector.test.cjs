@@ -269,7 +269,7 @@ test("does not expand the full-year view and restores the original chart mode", 
   const result = await collector.collect("PRODUCT", TEST_TARGET_DATE);
 
   assert.equal(result.state, "ready");
-  assert.equal(result.payload.raw_data.extractor_version, "extension-content-0.6.74");
+  assert.equal(result.payload.raw_data.extractor_version, "extension-content-0.6.76");
   assert.equal(result.payload.raw_data.history_full_year_control_found, true);
   assert.equal(result.payload.raw_data.history_full_year_view_opened, false);
   assert.equal(result.payload.raw_data.history_daily_mode_selected, true);

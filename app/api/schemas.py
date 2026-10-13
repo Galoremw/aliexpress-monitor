@@ -149,6 +149,7 @@ class BrowserStoreProduct(BaseModel):
 
 class BrowserStoreCandidatePage(BaseModel):
     page_url: str = Field(min_length=1, max_length=2048)
+    pagination_known: bool = False
     has_next_page: bool
     next_page_url: str | None = Field(default=None, max_length=2048)
     scan_complete: bool
@@ -161,7 +162,7 @@ class BrowserStoreDiscoveryRequest(BaseModel):
     claim_token: str | None = Field(default=None, min_length=1, max_length=128, exclude=True)
     platform_store_id: str = Field(min_length=1, max_length=128)
     url: str = Field(min_length=1, max_length=2048)
-    products: list[BrowserStoreProduct] = Field(default_factory=list, max_length=20)
+    products: list[BrowserStoreProduct] = Field(default_factory=list, max_length=50)
     candidate_page: BrowserStoreCandidatePage | None = None
     raw_data: dict[str, Any] = Field(default_factory=dict)
 

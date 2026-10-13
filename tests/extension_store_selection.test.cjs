@@ -399,7 +399,7 @@ test("does not combine complete seven-day histories from different collection da
   assert.equal(pageDecision(pages), "submit");
 });
 
-test("builds a top-twenty store enrollment payload from two Orders pages with auditable selection ranks", () => {
+test("sends all ranked candidates from two Orders pages for backend vacancy filtering", () => {
   const firstPage = {
     platform_store_id: "770701",
     url: "https://www.aliexpress.com/store/770701?shop_sortType=orders_desc&page=1",
@@ -416,13 +416,14 @@ test("builds a top-twenty store enrollment payload from two Orders pages with au
   const payload = buildStoreSelectionPayload([firstPage, secondPage]);
 
   assert.equal(payload.platform_store_id, "770701");
-  assert.equal(payload.raw_data.extractor_version, "extension-store-selection-0.6.74");
-  assert.equal(payload.products.length, 20);
+  assert.equal(payload.raw_data.extractor_version, "extension-store-selection-0.6.76");
+  assert.equal(payload.products.length, 24);
   assert.equal(payload.raw_data.candidate_pages_scanned, 2);
   assert.equal(payload.raw_data.readable_history_candidates, 24);
   assert.equal(payload.raw_data.selection[0].selection_rank, 1);
   assert.equal(payload.raw_data.selection[0].product_id, "60011");
   assert.equal(payload.raw_data.selection[19].product_id, "50004");
+  assert.equal(payload.raw_data.selection[23].product_id, "50000");
 });
 
 test("preserves Orders tie order when the first page has more than thirty products", () => {
@@ -501,4 +502,22 @@ test("submits the readable subset when unreadable charts leave fewer than twenty
   const payload = buildStoreSelectionPayload([firstPage, secondPage]);
   assert.equal(payload.products.length, 19);
   assert.equal(payload.raw_data.readable_history_candidates, 19);
+});
+
+test("keeps all readable page candidates so backend exclusions can still fill pool vacancies", () => {
+  const page = {
+    platform_store_id: "770722",
+    url: "https://www.aliexpress.com/store/770722/pages/all-items.html?shop_sortType=orders_desc",
+    has_next_page: true,
+    next_page_url: "https://www.aliexpress.com/store/770722/pages/all-items.html?page=2&shop_sortType=orders_desc",
+    raw_data: { history_target_date: "2026-09-29" },
+    candidates: Array.from({ length: 21 }, (_, index) =>
+      candidate(`860${String(index).padStart(2, "0")}`, Array(7).fill(21 - index), index + 1)),
+  };
+
+  const payload = buildStoreSelectionPayload([page], 20);
+
+  assert.equal(payload.products.length, 21);
+  assert.equal(payload.raw_data.selection.length, 21);
+  assert.equal(payload.products.at(-1).platform_product_id, "86020");
 });

@@ -56,6 +56,134 @@ def test_complete_page_advances_to_next_url(db_session):
     assert advanced.last_successful_page_url == scanned_url
 
 
+def test_root_store_orders_url_normalizes_to_canonical_cursor(db_session):
+    store = _store(db_session)
+    state = get_or_create_store_page_discovery_state(db_session, store)
+    root_page_one = (
+        f"https://www.aliexpress.com/store/{store.aliexpress_store_id}"
+        "?spm=store-test&sortType=orders_desc"
+    )
+    root_page_two = (
+        f"https://www.aliexpress.com/store/{store.aliexpress_store_id}"
+        "?spm=store-test&page=2&sortType=orders_desc"
+    )
+
+    advanced = advance_store_page_cursor(
+        db_session,
+        store,
+        scanned_url=root_page_one,
+        has_next_page=True,
+        next_page_url=root_page_two,
+        scan_complete=True,
+    )
+
+    parsed = urlsplit(advanced.next_page_url)
+    assert advanced.last_outcome == "advanced"
+    assert parsed.path == f"/store/{store.aliexpress_store_id}/pages/all-items.html"
+    assert parse_qs(parsed.query)["page"] == ["2"]
+    assert parse_qs(parsed.query)["shop_sortType"] == ["orders_desc"]
+    assert advanced.last_successful_page_url == state.first_orders_url
+
+
+def test_cursor_advances_across_page_two_without_collapsing_page_identity(db_session):
+    store = _store(db_session)
+    state = get_or_create_store_page_discovery_state(db_session, store)
+    page_two = (
+        f"https://www.aliexpress.com/store/{store.aliexpress_store_id}/pages/all-items.html"
+        "?page=2&sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
+    page_three = page_two.replace("page=2", "page=3")
+
+    advance_store_page_cursor(
+        db_session,
+        store,
+        scanned_url=state.next_page_url,
+        has_next_page=True,
+        next_page_url=page_two,
+        scan_complete=True,
+    )
+    advanced = advance_store_page_cursor(
+        db_session,
+        store,
+        scanned_url=page_two,
+        has_next_page=True,
+        next_page_url=page_three,
+        scan_complete=True,
+    )
+
+    assert advanced.next_page_url == page_three
+    assert advanced.last_outcome == "advanced"
+
+
+def test_cursor_rejects_backward_next_page_transition(db_session):
+    store = _store(db_session)
+    state = get_or_create_store_page_discovery_state(db_session, store)
+    page_one = state.next_page_url
+    page_two = (
+        f"https://www.aliexpress.com/store/{store.aliexpress_store_id}/pages/all-items.html"
+        "?page=2&sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
+
+    advance_store_page_cursor(
+        db_session,
+        store,
+        scanned_url=page_one,
+        has_next_page=True,
+        next_page_url=page_two,
+        scan_complete=True,
+    )
+    rejected = advance_store_page_cursor(
+        db_session,
+        store,
+        scanned_url=page_two,
+        has_next_page=True,
+        next_page_url=page_one,
+        scan_complete=True,
+    )
+
+    assert rejected.next_page_url == page_two
+    assert rejected.last_outcome == "rejected"
+
+
+def test_stale_previous_page_cannot_advance_a_cursor_beyond_page_two(db_session):
+    store = _store(db_session)
+    state = get_or_create_store_page_discovery_state(db_session, store)
+    page_two = (
+        f"https://www.aliexpress.com/store/{store.aliexpress_store_id}/pages/all-items.html"
+        "?page=2&sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
+    page_three = page_two.replace("page=2", "page=3")
+    page_four = page_two.replace("page=2", "page=4")
+    advance_store_page_cursor(
+        db_session,
+        store,
+        scanned_url=state.next_page_url,
+        has_next_page=True,
+        next_page_url=page_two,
+        scan_complete=True,
+    )
+    advance_store_page_cursor(
+        db_session,
+        store,
+        scanned_url=page_two,
+        has_next_page=True,
+        next_page_url=page_three,
+        scan_complete=True,
+    )
+
+    stale = advance_store_page_cursor(
+        db_session,
+        store,
+        scanned_url=page_two,
+        has_next_page=True,
+        next_page_url=page_four,
+        scan_complete=True,
+    )
+
+    assert stale.next_page_url == page_three
+    assert stale.last_outcome == "duplicate"
+
+
 def test_repeated_last_successful_page_does_not_move_cursor_back(db_session):
     store = _store(db_session)
     state = get_or_create_store_page_discovery_state(db_session, store)
