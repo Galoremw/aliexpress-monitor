@@ -380,7 +380,87 @@ class BrowserCollectionWorker(Base):
     worker_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     label: Mapped[str] = mapped_column(String(128), nullable=False)
     extension_version: Mapped[str | None] = mapped_column(String(64))
+    capabilities: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class StorePoolResetBatch(Base):
+    __tablename__ = "store_pool_reset_batches"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'NEEDS_VERIFICATION', 'COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')",
+            name="ck_store_pool_reset_batches_status",
+        ),
+        Index("ix_store_pool_reset_batches_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    window_start: Mapped[date] = mapped_column(Date, nullable=False)
+    window_end: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", nullable=False)
+    dispatch_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    stores: Mapped[list[StorePoolResetStore]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan"
+    )
+
+
+class StorePoolResetStore(Base):
+    __tablename__ = "store_pool_reset_stores"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "store_id", name="uq_store_pool_reset_batch_store"),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'NEEDS_VERIFICATION', 'SUCCEEDED', 'FAILED', 'SKIPPED', 'CANCELLED')",
+            name="ck_store_pool_reset_stores_status",
+        ),
+        Index("ix_store_pool_reset_stores_batch_status", "batch_id", "status"),
+        Index("ix_store_pool_reset_stores_lease", "status", "lease_expires_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("store_pool_reset_batches.id", ondelete="CASCADE"), nullable=False
+    )
+    store_id: Mapped[int | None] = mapped_column(
+        ForeignKey("stores.id", ondelete="SET NULL")
+    )
+    platform_store_id: Mapped[str | None] = mapped_column(String(128))
+    store_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    orders_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", nullable=False)
+    scanned_candidate_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    scanned_page_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    page_attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_page_url: Mapped[str | None] = mapped_column(String(2048))
+    visited_page_urls: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    staged_candidates: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    diagnostics: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, nullable=False)
+    claimed_worker_id: Mapped[str | None] = mapped_column(String(128))
+    claim_token: Mapped[str | None] = mapped_column(String(128))
+    claimed_page_url: Mapped[str | None] = mapped_column(String(2048))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_accepted_claim_token: Mapped[str | None] = mapped_column(String(128))
+    last_accepted_result_digest: Mapped[str | None] = mapped_column(String(64))
+    error_type: Mapped[str | None] = mapped_column(String(128))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    batch: Mapped[StorePoolResetBatch] = relationship(back_populates="stores")
+    store: Mapped[Store | None] = relationship()
 
 
 class BrowserCollectionRun(Base):

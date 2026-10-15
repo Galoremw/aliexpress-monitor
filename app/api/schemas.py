@@ -279,6 +279,7 @@ class BrowserCollectionHeartbeatRequest(BaseModel):
     worker_id: str | None = Field(default=None, min_length=1, max_length=128)
     worker_label: str | None = Field(default=None, max_length=128)
     extension_version: str | None = Field(default=None, max_length=64)
+    capabilities: list[str] = Field(default_factory=list, max_length=32)
     active_claims: list[BrowserCollectionActiveClaim] = Field(default_factory=list, max_length=2)
 
 
@@ -295,6 +296,7 @@ class BrowserCollectionWorkerRead(BaseModel):
     worker_id: str
     label: str
     extension_version: str | None
+    capabilities: list[str] = Field(default_factory=list)
     last_heartbeat_at: datetime
     online: bool
 
@@ -328,6 +330,73 @@ class BrowserCollectionItemRead(BaseModel):
     error_message: str | None
     monitored_product_ids: list[str] = Field(default_factory=list)
     discovery_page_url: str | None = None
+
+
+class StorePoolResetCreateRequest(BaseModel):
+    confirm_replace: Literal[True]
+
+
+class StorePoolResetStoreRead(BaseModel):
+    id: int
+    store_id: int | None
+    platform_store_id: str | None
+    store_name: str
+    orders_url: str
+    position: int
+    status: str
+    scanned_candidate_count: int
+    scanned_page_count: int
+    error_type: str | None
+    error_message: str | None
+
+
+class StorePoolResetBatchRead(BaseModel):
+    id: int
+    target_date: date
+    window_start: date
+    window_end: date
+    status: str
+    dispatch_enabled: bool
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    stores: list[StorePoolResetStoreRead] = Field(default_factory=list)
+
+
+class StorePoolResetClaimRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+
+
+class StorePoolResetPageRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    claim_token: str = Field(min_length=1, max_length=128)
+    expected_store_id: str = Field(min_length=1, max_length=128)
+    page: BrowserStoreCandidatePage
+
+
+class StorePoolResetFailureRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    claim_token: str = Field(min_length=1, max_length=128)
+    error_type: str = Field(min_length=1, max_length=128)
+    error_message: str = Field(min_length=1, max_length=2000)
+
+
+class StorePoolResetChallengeRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    claim_token: str = Field(min_length=1, max_length=128)
+    error_message: str | None = Field(default=None, max_length=2000)
+    page_url: str | None = Field(default=None, max_length=2048)
+
+
+class StorePoolResetHeartbeatRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    claim_token: str | None = Field(default=None, max_length=128)
+
+
+class StorePoolResetResumeRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    claim_token: str = Field(min_length=1, max_length=128)
+    page_url: str = Field(min_length=1, max_length=2048)
 
 
 class BrowserCollectionRunRead(BaseModel):
