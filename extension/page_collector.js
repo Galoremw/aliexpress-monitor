@@ -1,12 +1,22 @@
 (function () {
   if (globalThis.AliExpressMonitorPageCollector) return;
 
-  const PAGE_COLLECTOR_VERSION = "0.6.76";
+  const PAGE_COLLECTOR_VERSION = "0.6.103";
+  let verifiedStoreIdentity = null;
+  const STORE_MORE_ACTION_WAIT_MS = 5000;
   const clean = (value) => value?.replace(/\s+/g, " ").trim() || null;
   const cleanProductTitle = (value) => {
     const title = clean(value);
     if (!title) return null;
     return title.replace(/\s+(?:\d[\d,.]*(?:\s*[KM])?\+?\s*(?:sold|orders?)\b|(?:HK\$|US\$|CA\$|AU\$|SG\$|NZ\$|USD\s*|HKD\s*|CNY\s*|RMB\s*|EUR\s*|GBP\s*|JPY\s*|KRW\s*|\$|€|£|¥|￥|₩)\s*\d[\d,.]*|new shoppers save\b|free shipping\b|extra\s+\d+(?:\.\d+)?%\s+off\b|(?:已售|销量)\s*[:：]?\s*\d[\d,.]*).*$/i, "").trim() || title;
+  };
+  const storeProductTitleKey = (value) => {
+    const title = cleanProductTitle(value || "")
+      .replace(/^已采集\s*/i, "")
+      .normalize("NFKC")
+      .toLocaleLowerCase()
+      .replace(/[^\p{L}\p{N}]/gu, "");
+    return title.length >= 12 ? title : null;
   };
   const absoluteImageUrl = (value) => {
     if (!value) return null;
@@ -681,23 +691,309 @@
       .match(/(?:\/store\/|storeId=|sellerId=)(\d+)/i)?.[1] || null;
   }
 
-  function storeIdentityError(urlStoreId) {
-    const headingStoreId = (document.body?.innerText || "")
-      .slice(0, 5000)
-      .match(/(?:^|\n)\s*Shop\s*(\d{6,})\s+Store\s*(?=\n|$)/im)?.[1];
-    return headingStoreId && headingStoreId !== urlStoreId
-      ? `网址店铺 ID ${urlStoreId} 与页面显示的店铺 ID ${headingStoreId} 不一致，请打开 /store/${headingStoreId} 的商品展示页后重试`
+  function storeIdentityProof(targetStoreId, evidence, identityMethod) {
+    return {
+      target_store_id: targetStoreId,
+      page_url: location.href,
+      ...evidence,
+      identity_method: identityMethod,
+    };
+  }
+
+  function readStoreIdentityEvidence() {
+    const bodyText = document.body?.innerText || "";
+    const labeledStoreIdsFrom = (text) => [...text.matchAll(/(?:\bStore\s*ID\b|店铺\s*ID)\s*[:：]?\s*(\d{6,})/gi)]
+      .map((match) => match[1]);
+    const headingStoreId = bodyText.slice(0, 5000)
+      .match(/(?:^|\n)\s*Shop\s*(\d{6,})\s+Store\b/im)?.[1]
+      || String(document.title || "").match(/\bShop\s*(\d{6,})\s+Store\b/i)?.[1];
+    const visibleLabeledIds = labeledStoreIdsFrom(bodyText);
+    const labeledStoreIds = visibleLabeledIds.length
+      ? visibleLabeledIds
+      : labeledStoreIdsFrom(document.body?.textContent || "");
+    return {
+      route_store_id: storeIdFromPage(),
+      heading_store_id: headingStoreId || null,
+      labeled_store_ids: [...new Set(labeledStoreIds)],
+    };
+  }
+
+  function storeIdentityEvidence() {
+    const evidence = readStoreIdentityEvidence();
+    const cached = verifiedStoreIdentity;
+    if (cached?.page_url === location.href
+      && cached.route_store_id === evidence.route_store_id
+      && !evidence.labeled_store_ids.length) {
+      return {
+        ...evidence,
+        heading_store_id: evidence.heading_store_id || cached.evidence.heading_store_id,
+        labeled_store_ids: [...cached.evidence.labeled_store_ids],
+      };
+    }
+    return evidence;
+  }
+
+  function storeIdentityError(routeStoreId, expectedStoreId = routeStoreId, evidence = storeIdentityEvidence()) {
+    const displayedIds = [evidence.heading_store_id, ...evidence.labeled_store_ids].filter(Boolean);
+    if (routeStoreId !== expectedStoreId) {
+      const explicitMismatch = evidence.labeled_store_ids.find((id) => id !== expectedStoreId);
+      const headingMismatch = evidence.heading_store_id !== null
+        && evidence.heading_store_id !== expectedStoreId
+        ? evidence.heading_store_id
+        : null;
+      const hasMatchingDisplayedId = evidence.labeled_store_ids.includes(expectedStoreId);
+      if (hasMatchingDisplayedId && !explicitMismatch && !headingMismatch) return null;
+      const mismatch = explicitMismatch || headingMismatch;
+      if (mismatch) {
+        return `任务目标店铺 ID ${expectedStoreId} 与页面明确显示的 Store ID ${mismatch} 冲突（网址路由 ID ${routeStoreId}）`;
+      }
+      return `任务目标店铺 ID ${expectedStoreId} 与网址路由 ID ${routeStoreId} 不同，且页面 Store ID 未识别，无法确认是否为同一店铺`;
+    }
+    const mismatch = displayedIds.find((id) => id !== expectedStoreId);
+    return mismatch
+      ? `任务目标店铺 ID ${expectedStoreId} 与页面显示店铺 ID ${mismatch} 不一致`
       : null;
   }
 
-  function checkStoreIdentity() {
+  function normalizeStoreName(value) {
+    return typeof value === "string"
+      ? value.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase()
+      : "";
+  }
+
+  function storeOrdersUrlIdentity(value) {
+    try {
+      const parsed = new URL(value);
+      const routeStoreId = parsed.pathname.match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
+      if (parsed.protocol !== "https:"
+        || !/(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
+        || (parsed.port && parsed.port !== "443")
+        || !routeStoreId) return null;
+      return {
+        route_store_id: routeStoreId,
+        normalized_page_identity: `${parsed.hostname.toLowerCase()}${parsed.pathname}`,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function approvedStoreUrlIdentity(pageUrl, expectedStoreId, approvedIdentities = []) {
+    const current = storeOrdersUrlIdentity(pageUrl);
+    if (!current || !Array.isArray(approvedIdentities)) return null;
+    return approvedIdentities.find((identity) =>
+      String(identity?.route_store_id || "") === current.route_store_id
+      && identity?.normalized_page_identity === current.normalized_page_identity
+      && Boolean(expectedStoreId)
+    ) || null;
+  }
+
+  function readIxspyStoreOverviewName() {
+    const overviewLabels = new Set(["店铺概览", "store overview"]);
+    const overviewHeading = [...document.querySelectorAll("*")]
+      .filter((node) => {
+        const text = clean(node.innerText || node.textContent);
+        return typeof node?.getBoundingClientRect === "function"
+          && visible(node) && text && overviewLabels.has(text.toLowerCase());
+      });
+    if (overviewHeading.length !== 1) return null;
+
+    let container = overviewHeading[0].parentElement;
+    const selector = "h1, h2, h3, [role='heading'], [class*='title' i], [class*='name' i]";
+    for (let depth = 0; container && depth < 5; depth += 1, container = container.parentElement) {
+      const names = [...new Set([...container.querySelectorAll(selector)]
+        .filter((node) => typeof node?.getBoundingClientRect === "function" && visible(node))
+        .map((node) => clean(node.innerText || node.textContent))
+        .filter((text) => text && text.length <= 255
+          && !overviewLabels.has(text.toLowerCase())
+          && !/^(?:store\s*(?:id|data|overview)|店铺\s*(?:id|数据|概览))\b/i.test(text)))];
+      if (names.length === 1) return names[0];
+    }
+    return null;
+  }
+
+  async function waitForStoreIdentityEvidence(timeoutMs = 1800) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const evidence = readStoreIdentityEvidence();
+      if (evidence.labeled_store_ids.length) return evidence;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return readStoreIdentityEvidence();
+  }
+
+  async function revealStoreIdentity() {
+    const title = clean(document.title).split(/\s+-\s+/)[0].toLowerCase();
+    const triggerSelector = "h1, h2, [role='heading'], [class*='store' i], a[href*='/store/'], button, [role='button'], [aria-label*='store' i], [title*='store' i]";
+    const triggers = [...document.querySelectorAll(triggerSelector)]
+      .map((node) => ({
+        node,
+        text: clean(node.innerText || node.textContent || node.getAttribute?.("aria-label") || node.getAttribute?.("title")),
+      }))
+      .filter(({ text }) => text && text.length <= 100 && /(?:\bstore\b|店铺)/i.test(text))
+      .sort((left, right) => {
+        const score = ({ node, text }) => {
+          const normalized = text.toLowerCase();
+          const tag = String(node.tagName || "").toLowerCase();
+          const role = node.getAttribute?.("role");
+          const className = String(node.className || "").toLowerCase();
+          return (normalized === title ? 100 : title.startsWith(normalized) || normalized.startsWith(title) ? 50 : 0)
+            + (/^h[12]$/.test(tag) || role === "heading" ? 20 : 0)
+            + (["a", "button"].includes(tag) || role === "button" ? 12 : 0)
+            + (className.includes("store-title") ? 10 : 0)
+            - text.length / 1000;
+        };
+        return score(right) - score(left);
+      })
+      .slice(0, 5)
+      .map(({ node }) => node);
+    let attemptedCount = 0;
+    for (const trigger of triggers) {
+      const text = clean(trigger.innerText || trigger.textContent || trigger.getAttribute?.("aria-label") || trigger.getAttribute?.("title"));
+      const rect = trigger.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0 || rect.top > 800 || rect.bottom < 0) continue;
+      attemptedCount += 1;
+      const pointerEvent = typeof PointerEvent === "function" ? PointerEvent : MouseEvent;
+      trigger.dispatchEvent(new pointerEvent("pointerover", { bubbles: true, cancelable: true, view: window }));
+      trigger.dispatchEvent(new pointerEvent("pointerenter", { cancelable: false, view: window }));
+      trigger.dispatchEvent(new pointerEvent("pointermove", { bubbles: true, cancelable: true, view: window }));
+      trigger.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
+      trigger.dispatchEvent(new MouseEvent("mouseenter", { cancelable: false, view: window }));
+      trigger.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window }));
+      const evidence = await waitForStoreIdentityEvidence();
+      if (evidence.labeled_store_ids.length) {
+        trigger.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, cancelable: true, view: window }));
+        trigger.dispatchEvent(new MouseEvent("mouseleave", { cancelable: false, view: window }));
+        return { evidence, trigger_text: text, method: "hover", trigger_count: triggers.length, attempted_count: attemptedCount };
+      }
+      const link = trigger.closest?.("a[href]");
+      const preventNavigation = (event) => event.preventDefault();
+      if (link) link.addEventListener("click", preventNavigation, { capture: true, once: true });
+      trigger.dispatchEvent(new pointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1 }));
+      trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1 }));
+      trigger.dispatchEvent(new pointerEvent("pointerup", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 0 }));
+      trigger.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 0 }));
+      trigger.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+      if (link) link.removeEventListener("click", preventNavigation, true);
+      const clickedEvidence = await waitForStoreIdentityEvidence();
+      if (clickedEvidence.labeled_store_ids.length) {
+        return {
+          evidence: clickedEvidence,
+          trigger_text: text,
+          method: link ? "safe_link_click" : "click",
+          trigger_count: triggers.length,
+          attempted_count: attemptedCount,
+        };
+      }
+      trigger.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, cancelable: true, view: window }));
+      trigger.dispatchEvent(new MouseEvent("mouseleave", { cancelable: false, view: window }));
+    }
+    return { evidence: null, trigger_count: triggers.length, attempted_count: attemptedCount };
+  }
+
+  async function checkStoreIdentity(expectedStoreId = null, options = {}) {
     if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
-    const storeId = storeIdFromPage();
-    if (!storeId) return { state: "failed", message: "尚未识别店铺 ID" };
-    const identityError = storeIdentityError(storeId);
-    return identityError
-      ? { state: "failed", message: identityError }
-      : { state: "ready", platform_store_id: storeId };
+    const routeStoreId = storeIdFromPage();
+    const targetStoreId = String(expectedStoreId || routeStoreId || "");
+    if (!routeStoreId) return { state: "failed", message: "尚未识别店铺 ID" };
+    let evidence = storeIdentityEvidence();
+    const ixspyStoreName = readIxspyStoreOverviewName();
+    const savedAlias = approvedStoreUrlIdentity(
+      location.href, targetStoreId, options.approved_store_url_identities,
+    );
+    let probe = null;
+    if (!evidence.labeled_store_ids.length) {
+      probe = await revealStoreIdentity();
+      evidence = probe?.evidence || readStoreIdentityEvidence();
+    }
+    evidence = { ...evidence, ixspy_store_name: ixspyStoreName };
+    const conflictingDisplayedId = evidence.labeled_store_ids.find((id) => id !== targetStoreId)
+      || (evidence.heading_store_id !== null && evidence.heading_store_id !== targetStoreId
+        ? evidence.heading_store_id : null);
+    const savedIxspyName = savedAlias?.evidence?.ixspy_store_name;
+    const namesConflict = Boolean(savedIxspyName && ixspyStoreName
+      && normalizeStoreName(savedIxspyName) !== normalizeStoreName(ixspyStoreName));
+    let identityError = null;
+    let errorType = "store_identity_unverified";
+    let identityMethod = "unverified";
+    if (conflictingDisplayedId) {
+      errorType = "store_identity_mismatch";
+      identityMethod = "explicit_store_id_conflict";
+      identityError = `任务目标店铺 ID ${targetStoreId} 与页面明确显示的 Store ID ${conflictingDisplayedId} 冲突（网址路由 ID ${routeStoreId}）`;
+    } else if (namesConflict) {
+      errorType = "store_identity_mismatch";
+      identityMethod = "ixspy_store_name_conflict";
+      identityError = `已确认的 IXSPY 店铺名称“${savedIxspyName}”与当前页面“${ixspyStoreName}”不一致`;
+    } else if (routeStoreId !== targetStoreId && !evidence.labeled_store_ids.includes(targetStoreId)) {
+      if (savedAlias) {
+        identityMethod = "backend_approved_url_alias";
+      } else {
+        identityError = `任务目标店铺 ID ${targetStoreId} 与网址路由 ID ${routeStoreId} 不同，且页面 Store ID 未识别，无法确认是否为同一店铺`;
+      }
+    } else if (!evidence.labeled_store_ids.includes(targetStoreId)) {
+      identityError = `任务目标店铺 ID ${targetStoreId} 未能从店铺信息卡的 Store ID 字段中核实（网址路由 ID ${routeStoreId}）`;
+    } else {
+      identityMethod = "explicit_store_id";
+    }
+    if (identityError) {
+      const label = evidence.labeled_store_ids.join(", ") || "未识别";
+      const probeSummary = probe?.method
+        ? `通过${probe.method}读取到“${probe.trigger_text}”`
+        : probe
+          ? `已检查${probe.trigger_count}个店铺标题控件并尝试${probe.attempted_count}个，均未读到 Store ID 字段`
+          : evidence.labeled_store_ids.length ? "已读取页面中显示的字段" : "未找到可交互的店铺标题控件";
+      return {
+        state: "identity_review",
+        error_type: errorType,
+        message: `${identityError}；页面标题：${String(document.title || "未识别").slice(0, 100)}；Store ID 字段：${label}；身份卡探测：${probeSummary}`,
+        page_url: location.href,
+        evidence: {
+          ...evidence,
+          page_title: String(document.title || "").slice(0, 512) || null,
+          identity_method: identityMethod,
+        },
+      };
+    }
+    verifiedStoreIdentity = {
+      route_store_id: routeStoreId,
+      target_store_id: targetStoreId,
+      page_url: location.href,
+      evidence: {
+        ...evidence,
+        identity_method: identityMethod,
+      },
+    };
+    return {
+      state: "ready",
+      platform_store_id: targetStoreId,
+      store_identity: storeIdentityProof(targetStoreId, evidence, identityMethod),
+    };
+  }
+
+  function rememberVerifiedStoreIdentity(identity, expectedStoreId) {
+    const routeStoreId = storeIdFromPage();
+    const targetStoreId = String(expectedStoreId || "");
+    const labeledStoreIds = Array.isArray(identity?.labeled_store_ids)
+      ? identity.labeled_store_ids.map(String)
+      : [];
+    const matchingDisplayedId = labeledStoreIds.includes(targetStoreId);
+    if (!routeStoreId || !targetStoreId || identity?.target_store_id !== targetStoreId
+      || String(identity.route_store_id) !== routeStoreId
+      || identity.page_url !== location.href
+      || !matchingDisplayedId
+      || (identity.heading_store_id != null && String(identity.heading_store_id) !== targetStoreId)
+      || labeledStoreIds.some((id) => id !== targetStoreId)) return false;
+    verifiedStoreIdentity = {
+      route_store_id: routeStoreId,
+      target_store_id: targetStoreId,
+      page_url: location.href,
+      evidence: {
+        route_store_id: routeStoreId,
+        heading_store_id: identity.heading_store_id || null,
+        labeled_store_ids: labeledStoreIds,
+      },
+    };
+    return true;
   }
 
   function storeOrdersSortSelected() {
@@ -742,7 +1038,42 @@
         ? { known: true, has_next_page: false, next_page_url: null }
         : { known: true, has_next_page: true, next_page_url: null };
     }
+    if (storeId) {
+      const currentUrl = new URL(location.href);
+      const currentPage = Math.max(1, Number.parseInt(currentUrl.searchParams.get("page") || "1", 10) || 1);
+      const numberedPages = storeOrdersPageLinks(storeId);
+      if (numberedPages.length) {
+        const hasLaterPage = numberedPages.some((entry) => entry.page > currentPage);
+        return {
+          known: true,
+          has_next_page: hasLaterPage,
+          next_page_url: numberedPages.find((entry) => entry.page === currentPage + 1)?.url || null,
+        };
+      }
+    }
     return { known: false, has_next_page: false, next_page_url: null };
+  }
+
+  function storeOrdersPageLinks(storeId) {
+    const current = new URL(location.href);
+    const links = [];
+    for (const node of document.querySelectorAll("a[href]")) {
+      if (!visible(node)) continue;
+      const label = clean(node.innerText || node.textContent || "");
+      if (!/^\d+$/.test(label || "")) continue;
+      const href = node.href || node.getAttribute?.("href");
+      if (!href) continue;
+      try {
+        const url = new URL(href, current);
+        const page = Number.parseInt(url.searchParams.get("page") || "1", 10);
+        if (url.origin !== current.origin
+            || url.pathname !== `/store/${storeId}/pages/all-items.html`
+            || url.searchParams.get("shop_sortType") !== "orders_desc"
+            || !Number.isInteger(page) || page < 1 || Number(label) !== page) continue;
+        links.push({ page, url: url.href });
+      } catch {}
+    }
+    return links.sort((left, right) => left.page - right.page);
   }
 
   function storeNextPageUrl(storeId) {
@@ -768,7 +1099,8 @@
         return next.href;
       } catch {}
     }
-    return null;
+    const currentPage = Math.max(1, Number.parseInt(current.searchParams.get("page") || "1", 10) || 1);
+    return storeOrdersPageLinks(storeId).find((entry) => entry.page === currentPage + 1)?.url || null;
   }
 
   function scanStoreProducts() {
@@ -944,7 +1276,7 @@
     return storeMoreAction(miniChart, trigger, productId);
   }
 
-  function unavailableStoreHistory(targetDate, source) {
+  function unavailableStoreHistory(targetDate, source, diagnostics = {}) {
     const expectedDates = expectedDailyDates(targetDate);
     return {
       points: [],
@@ -954,6 +1286,7 @@
       missing_dates: expectedDates,
       daily_capture_complete: false,
       sampling_strategy: "latest_7_daily_increments_only",
+      ...diagnostics,
     };
   }
 
@@ -983,6 +1316,8 @@
     if (!trigger) return unavailableStoreHistory(targetDate, "ixspy_store_card_trend_button_missing");
     trigger.scrollIntoView?.({ block: "center", behavior: "instant" });
     let miniChart = storeMiniChart(product.platform_product_id);
+    let preserveMiniChartForRetry = false;
+    let moreActionWaitMs = 0;
     try {
       if (!miniChart || !visible(miniChart)) {
         trigger.click();
@@ -997,23 +1332,33 @@
       if (!miniChart || !visible(miniChart)) {
         return unavailableStoreHistory(targetDate, "ixspy_store_card_mini_chart_unavailable");
       }
+      const moreActionWaitStartedAt = Date.now();
       const more = await waitForStoreMoreAction(
         miniChart, trigger, product.platform_product_id,
-        Math.min(5000, Math.max(1400, setupWaitMs)),
+        STORE_MORE_ACTION_WAIT_MS,
       );
-      if (!more) return unavailableStoreHistory(targetDate, "ixspy_store_card_more_action_missing");
+      moreActionWaitMs = Date.now() - moreActionWaitStartedAt;
+      if (!more) {
+        preserveMiniChartForRetry = true;
+        return unavailableStoreHistory(targetDate, "ixspy_store_card_more_action_missing", {
+          more_action_wait_ms: moreActionWaitMs,
+        });
+      }
       more.click();
       await new Promise((resolve) => setTimeout(resolve, 140));
       const chart = await waitForStoreChart(product.platform_product_id);
       if (chart?.challenge) return { challenge: true };
       if (chart?.loginRequired) return { login_required: true };
-      if (!chart) return unavailableStoreHistory(targetDate, "ixspy_store_product_chart_unavailable");
-      return await collectIxspyDailyHistory(targetDate, {
+      if (!chart) return unavailableStoreHistory(targetDate, "ixspy_store_product_chart_unavailable", {
+        more_action_wait_ms: moreActionWaitMs,
+      });
+      const history = await collectIxspyDailyHistory(targetDate, {
         expectedProductId: product.platform_product_id,
         retryVisibleRange: true,
       });
+      return { ...history, more_action_wait_ms: moreActionWaitMs };
     } finally {
-      if (miniChart && visible(miniChart) && !isChallengePage()) trigger.click();
+      if (!preserveMiniChartForRetry && miniChart && visible(miniChart) && !isChallengePage()) trigger.click();
     }
   }
 
@@ -1025,6 +1370,9 @@
     await new Promise((resolve) => setTimeout(resolve, 180));
     const retry = await collectStoreProductHistory(product, targetDate, 700);
     if (retry.challenge || retry.login_required) return { history: retry, retryPasses: 1 };
+    const remainingMiniChart = storeMiniChart(product.platform_product_id);
+    const trigger = storeTrendButton(product.platform_product_id);
+    if (remainingMiniChart && visible(remainingMiniChart) && trigger && !isChallengePage()) trigger.click();
 
     const expectedDates = retry.expected_dates || history.expected_dates || expectedDailyDates(targetDate);
     const pointsByDate = new Map();
@@ -1050,6 +1398,7 @@
       attempts: (history.attempts || 0) + (retry.attempts || 0),
       observed_points: [...observedByDate.values()].sort((left, right) => left.date.localeCompare(right.date)),
       tooltip_samples: [...new Set([...(history.tooltip_samples || []), ...(retry.tooltip_samples || [])])].slice(0, 4),
+      more_action_wait_ms: (history.more_action_wait_ms || 0) + (retry.more_action_wait_ms || 0),
     };
     return { history, retryPasses: 1 };
   }
@@ -1059,7 +1408,7 @@
     const storeId = storeIdFromPage();
     if (!storeId) return { state: "failed", message: "尚未识别店铺 ID" };
     const identityError = storeIdentityError(storeId);
-    if (identityError) return { state: "failed", message: identityError };
+    if (identityError) return { state: "failed", error_type: "store_identity_mismatch", message: identityError };
     let stableRounds = 0;
     let latest = scanStoreProducts();
     for (let round = 0; round < 12 && latest.products.length < 20 && stableRounds < 2; round += 1) {
@@ -1110,23 +1459,33 @@
     };
   }
 
-  async function waitForMonitoredStorePageReady(timeoutMs = 20000) {
+  async function waitForMonitoredStorePageReady(timeoutMs = 20000, expectedStoreId = null, options = {}) {
     const deadline = Date.now() + timeoutMs;
     const startedAt = Date.now();
     let lastMessage = "店铺 ID 或 Orders 排序未就绪";
     let verifiedStoreId = null;
+    let verifiedStoreIdentityProof = null;
+    let checkedPageUrl = null;
+    let checkedIdentity = null;
     while (Date.now() < deadline) {
       if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
       const storeId = storeIdFromPage();
-      const identityError = storeId ? storeIdentityError(storeId) : null;
-      if (identityError) return { state: "failed", message: identityError };
-      if (storeId && !identityError && storeOrdersSortSelected()) {
+      const targetStoreId = String(expectedStoreId || storeId || "");
+      if (storeId && checkedPageUrl !== location.href) {
+        checkedPageUrl = location.href;
+        checkedIdentity = await checkStoreIdentity(targetStoreId, options);
+        if (checkedIdentity.state !== "ready") return checkedIdentity;
+      }
+      if (storeId && storeOrdersSortSelected()) {
         verifiedStoreId = storeId;
+        verifiedStoreIdentityProof = checkedIdentity.store_identity;
         const scan = scanStoreProducts();
         if (scan.products.length) {
           return {
             state: "ready",
             storeId,
+            platformStoreId: targetStoreId,
+            storeIdentity: verifiedStoreIdentityProof,
             productCardsReady: true,
             productCardWaitMs: Date.now() - startedAt,
           };
@@ -1142,6 +1501,9 @@
       return {
         state: "ready",
         storeId: verifiedStoreId,
+        platformStoreId: String(expectedStoreId || verifiedStoreId),
+        storeIdentity: verifiedStoreIdentityProof || storeIdentityProof(
+          String(expectedStoreId || verifiedStoreId), storeIdentityEvidence(), "route_id"),
         productCardsReady: false,
         productCardWaitMs: Date.now() - startedAt,
       };
@@ -1150,9 +1512,13 @@
   }
 
   async function collectMonitoredStorePage(targetDate, options) {
-    const readiness = await waitForMonitoredStorePageReady();
+    rememberVerifiedStoreIdentity(options.verified_store_identity, options.expected_store_id);
+    const readiness = await waitForMonitoredStorePageReady(20000, options.expected_store_id, {
+      approved_store_url_identities: options.approved_store_url_identities || [],
+    });
     if (readiness.state !== "ready") return readiness;
     const storeId = readiness.storeId;
+    const targetStoreId = readiness.platformStoreId;
     const targetIds = new Set((options.monitored_product_ids || []).map(String));
     if (!targetIds.size) return { state: "failed", message: "任务缺少监控商品 ID" };
     let latest = scanStoreProducts();
@@ -1165,8 +1531,54 @@
       stableRounds = grew || latest.products.length > previousCount ? 0 : stableRounds + 1;
       if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
     }
-    const products = latest.products.filter((product) => targetIds.has(product.platform_product_id));
+    const monitoredTargets = new Map((options.monitored_products || [])
+      .filter((target) => target && targetIds.has(String(target.platform_product_id)))
+      .map((target) => [String(target.platform_product_id), target]));
+    const matchedByObservedId = new Map();
+    const matchedTargetIds = new Set();
+    for (const product of latest.products) {
+      if (!targetIds.has(product.platform_product_id)) continue;
+      const target = monitoredTargets.get(product.platform_product_id) || {
+        platform_product_id: product.platform_product_id,
+        url: product.url,
+        title: product.title,
+      };
+      matchedByObservedId.set(product.platform_product_id, { product, target, method: "platform_id" });
+      matchedTargetIds.add(product.platform_product_id);
+    }
+    const targetsByTitle = new Map();
+    for (const [targetId, target] of monitoredTargets) {
+      if (matchedTargetIds.has(targetId)) continue;
+      const titleKey = storeProductTitleKey(target.title);
+      if (!titleKey) continue;
+      targetsByTitle.set(titleKey, [...(targetsByTitle.get(titleKey) || []), target]);
+    }
+    const visibleByTitle = new Map();
+    for (const product of latest.products) {
+      const titleKey = storeProductTitleKey(product.title);
+      if (titleKey) visibleByTitle.set(titleKey, [...(visibleByTitle.get(titleKey) || []), product]);
+    }
+    for (const product of latest.products) {
+      if (matchedByObservedId.has(product.platform_product_id)) continue;
+      const titleKey = storeProductTitleKey(product.title);
+      const titleTargets = titleKey ? targetsByTitle.get(titleKey) || [] : [];
+      const titleProducts = titleKey ? visibleByTitle.get(titleKey) || [] : [];
+      if (titleTargets.length !== 1 || titleProducts.length !== 1) continue;
+      const target = titleTargets[0];
+      if (matchedTargetIds.has(String(target.platform_product_id))) continue;
+      matchedByObservedId.set(product.platform_product_id, { product, target, method: "exact_title" });
+      matchedTargetIds.add(String(target.platform_product_id));
+    }
+    const products = latest.products
+      .map((product) => matchedByObservedId.get(product.platform_product_id))
+      .filter(Boolean);
     const pagination = storePaginationStatus(storeId);
+    const identityMatches = products.map(({ product, target, method }) => ({
+      monitored_product_id: String(target.platform_product_id),
+      observed_product_id: product.platform_product_id,
+      match_method: method,
+      page_url: location.href,
+    }));
     const pageScan = {
       url: location.href,
       product_cards_ready: readiness.productCardsReady,
@@ -1174,22 +1586,29 @@
       candidate_node_count: latest.candidateNodeCount,
       visible_product_count: latest.products.length,
       visible_product_ids: latest.products.map((product) => product.platform_product_id),
-      matched_product_ids: products.map((product) => product.platform_product_id),
-      unmatched_target_ids: [...targetIds].filter((id) => !latest.products.some((product) => product.platform_product_id === id)),
+      matched_product_ids: products.map(({ target }) => String(target.platform_product_id)),
+      unmatched_target_ids: [...targetIds].filter((id) => !matchedTargetIds.has(id)),
+      identity_matches: identityMatches,
+      store_identity: readiness.storeIdentity,
       pagination_known: pagination.known,
       has_next_page: pagination.has_next_page,
       next_page_url: pagination.next_page_url,
     };
     const chartReads = [];
-    for (const [index, product] of products.entries()) {
+    const collectedProducts = [];
+    for (const [index, match] of products.entries()) {
+      const { product, target, method } = match;
       const { history, retryPasses } = await collectStoreProductHistoryWithRetry(product, targetDate, index === 0 ? 6000 : 800);
       const chartRead = {
-        product_id: product.platform_product_id,
+        product_id: String(target.platform_product_id),
+        observed_product_id: product.platform_product_id,
+        identity_match_method: method,
         outcome: history.daily_capture_complete ? "complete" : history.points?.length ? "partial" : "unavailable",
         source: history.source || (history.points?.length ? "ixspy_visible_daily_increment" : "ixspy_data_unavailable"),
         point_count: history.points?.length || 0,
         missing_dates: history.missing_dates || expectedDailyDates(targetDate),
         retry_passes: retryPasses,
+        ...(history.more_action_wait_ms ? { more_action_wait_ms: history.more_action_wait_ms } : {}),
       };
       chartReads.push(chartRead);
       product.history_read_diagnostic = chartRead;
@@ -1200,31 +1619,96 @@
       product.history_daily_capture_complete = Boolean(history.daily_capture_complete);
       product.history_expected_dates = history.expected_dates || expectedDailyDates(targetDate);
       product.history_missing_dates = history.missing_dates || product.history_expected_dates;
-      await options.on_product_collected?.(product);
+      const monitoredProduct = {
+        ...product,
+        platform_product_id: String(target.platform_product_id),
+        url: target.url || product.url,
+        observed_product_id: product.platform_product_id,
+        observed_url: product.url,
+        observed_page_url: location.href,
+        identity_match_method: method,
+        store_identity: readiness.storeIdentity,
+        history_read_diagnostic: chartRead,
+      };
+      collectedProducts.push(monitoredProduct);
+      await options.on_product_collected?.(monitoredProduct);
     }
     return {
       state: "ready",
       page_result: {
-        platform_store_id: storeId,
+        platform_store_id: targetStoreId,
         url: location.href,
-        products,
+        products: collectedProducts,
         has_next_page: storeHasNextPage(),
         next_page_url: storeNextPageUrl(storeId),
+        store_identity: readiness.storeIdentity,
         diagnostics: { page_scan: pageScan, chart_reads: chartReads },
       },
     };
   }
 
-  async function collectStoreCandidatePage(message = {}) {
+  function reusableCandidateHistory(
+    candidate, targetDate, expectedStoreId, routeStoreId, approvedIdentities = [],
+  ) {
+    const expectedDates = expectedDailyDates(targetDate);
+    const dates = candidate?.history_expected_dates;
+    const history = candidate?.historical_sales;
+    const diagnostic = candidate?.history_read_diagnostic;
+    const identity = candidate?.store_identity;
+    const labeledStoreIds = Array.isArray(identity?.labeled_store_ids)
+      ? identity.labeled_store_ids.map(String)
+      : [];
+    const approvedAlias = approvedStoreUrlIdentity(
+      identity?.page_url, expectedStoreId, approvedIdentities,
+    );
+    const savedStoreName = approvedAlias?.evidence?.ixspy_store_name;
+    const currentStoreName = identity?.ixspy_store_name;
+    const namesConflict = Boolean(savedStoreName && currentStoreName
+      && normalizeStoreName(savedStoreName) !== normalizeStoreName(currentStoreName));
+    const backendAliasMatches = Boolean(approvedAlias
+      && identity?.identity_method === "backend_approved_url_alias"
+      && !namesConflict);
+    const identityMatches = identity?.target_store_id === expectedStoreId
+      && String(identity.route_store_id) === routeStoreId
+      && (routeStoreId === expectedStoreId
+        || String(identity.heading_store_id || "") === expectedStoreId
+        || labeledStoreIds.includes(expectedStoreId)
+        || backendAliasMatches)
+      && (identity.heading_store_id == null || String(identity.heading_store_id) === expectedStoreId)
+      && labeledStoreIds.every((id) => id === expectedStoreId)
+      && !namesConflict;
+    const candidateUrlId = String(candidate?.url || "").match(/\/item\/(\d+)/i)?.[1];
+    if (!identityMatches || candidateUrlId !== String(candidate?.platform_product_id)
+      || !Array.isArray(dates) || dates.length !== 7
+      || !expectedDates.every((date, index) => dates[index] === date)) return false;
+    if (candidate.history_daily_capture_complete === true && Array.isArray(history)
+      && history.length === 7 && expectedDates.every((date) => history.some((point) => point?.date === date))) {
+      return true;
+    }
+    return diagnostic?.outcome === "unavailable"
+      && typeof diagnostic.source === "string"
+      && (/^ixspy_store_(?:card_|product_chart_unavailable)/.test(diagnostic.source)
+        || diagnostic.source === "ixspy_data_unavailable")
+      && !diagnostic.error
+      && Array.isArray(candidate.history_missing_dates)
+      && expectedDates.every((date) => candidate.history_missing_dates.includes(date))
+      && Array.isArray(history) && history.length === 0;
+  }
+
+  async function collectStoreCandidatePage(message = {}, options = {}) {
     if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
     const expectedStoreId = String(message.expectedStoreId || "");
     const expectedPageUrl = String(message.expectedPageUrl || "");
+    rememberVerifiedStoreIdentity(message.verifiedStoreIdentity, expectedStoreId);
     const storeId = storeIdFromPage();
-    if (!expectedStoreId || !storeId || storeId !== expectedStoreId) {
-      return { state: "failed", message: "当前页面店铺 ID 与候选扫描任务不一致" };
+    if (!expectedStoreId || !storeId) {
+      return { state: "failed", error_type: "store_identity_mismatch", message: "当前页面店铺 ID 与候选扫描任务不一致" };
     }
-    const identityError = storeIdentityError(storeId);
-    if (identityError) return { state: "failed", message: identityError };
+    const identity = await checkStoreIdentity(expectedStoreId, {
+      approved_store_url_identities: message.approvedStoreUrlIdentities || [],
+    });
+    if (identity.state !== "ready") return identity;
+    const verifiedPageIdentity = identity.store_identity;
     if (!storeOrdersSortSelected()) {
       return { state: "failed", message: "候选扫描要求店铺商品页使用 Orders 排序" };
     }
@@ -1233,7 +1717,7 @@
       expectedUrl = new URL(expectedPageUrl);
       if (expectedUrl.protocol !== "https:"
         || !/(?:^|\.)aliexpress\.com$/i.test(expectedUrl.hostname)
-        || expectedUrl.pathname !== `/store/${storeId}/pages/all-items.html`
+        || !new RegExp(`^/store/(?:${expectedStoreId}|${storeId})/pages/all-items\\.html$`).test(expectedUrl.pathname)
         || expectedUrl.searchParams.get("shop_sortType") !== "orders_desc") {
         throw new Error("invalid Orders URL");
       }
@@ -1246,7 +1730,10 @@
     } catch {
       return { state: "failed", message: "无法确认当前候选页地址" };
     }
-    if (currentUrl.href !== expectedUrl.href) {
+    const pageNumber = (url) => [...url.searchParams.entries()]
+      .find(([key]) => ["page", "pagenum", "pageno"].includes(key.toLowerCase()))?.[1] || "1";
+    if (currentUrl.searchParams.get("shop_sortType") !== expectedUrl.searchParams.get("shop_sortType")
+      || pageNumber(currentUrl) !== pageNumber(expectedUrl)) {
       return { state: "failed", message: "当前页面不是后端指定的候选页地址" };
     }
     let latest = scanStoreProducts();
@@ -1264,6 +1751,7 @@
     const pagination = storePaginationStatus(storeId);
     const pageScan = {
       url: currentUrl.href,
+      store_identity: verifiedPageIdentity,
       candidate_node_count: latest.candidateNodeCount,
       visible_product_count: latest.products.length,
       candidate_count: candidates.length,
@@ -1278,8 +1766,9 @@
       return {
         state: "ready",
         page_result: {
-          platform_store_id: storeId,
+          platform_store_id: expectedStoreId,
           url: currentUrl.href,
+          store_identity: verifiedPageIdentity,
           candidates,
           pagination_known: pageScan.pagination_known,
           has_next_page: pageScan.has_next_page,
@@ -1293,8 +1782,9 @@
       return {
         state: "ready",
         page_result: {
-          platform_store_id: storeId,
+          platform_store_id: expectedStoreId,
           url: currentUrl.href,
+          store_identity: verifiedPageIdentity,
           candidates: [],
           pagination_known: pageScan.pagination_known,
           has_next_page: pageScan.has_next_page,
@@ -1304,10 +1794,31 @@
         },
       };
     }
-
+    const priorCandidates = new Map((message.priorCandidates || [])
+      .filter((candidate) => candidate?.platform_product_id)
+      .map((candidate) => [String(candidate.platform_product_id), candidate]));
     for (const [index, product] of candidates.entries()) {
       if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证", diagnostics };
       product.orders_rank = index + 1;
+      const pageStoreIdentity = verifiedPageIdentity;
+      const prior = priorCandidates.get(String(product.platform_product_id));
+      if (prior && reusableCandidateHistory(
+        prior,
+        message.targetDate,
+        expectedStoreId,
+        storeId,
+        message.approvedStoreUrlIdentities || [],
+      )) {
+        product.historical_sales = prior.historical_sales;
+        product.history_source = prior.history_source;
+        product.history_daily_capture_complete = prior.history_daily_capture_complete;
+        product.history_expected_dates = prior.history_expected_dates;
+        product.history_missing_dates = prior.history_missing_dates;
+        product.history_read_diagnostic = { ...prior.history_read_diagnostic, resumed: true };
+        product.store_identity = pageStoreIdentity;
+        diagnostics.chart_reads.push(product.history_read_diagnostic);
+        continue;
+      }
       let history;
       let retryPasses = 0;
       let readError = null;
@@ -1339,12 +1850,16 @@
       product.history_daily_capture_complete = Boolean(history.daily_capture_complete);
       product.history_expected_dates = history.expected_dates || expectedDailyDates(message.targetDate);
       product.history_missing_dates = history.missing_dates || product.history_expected_dates;
+      product.store_identity = pageStoreIdentity;
+      product.history_read_diagnostic = chartRead;
+      await options.on_candidate_collected?.(product);
     }
     return {
       state: "ready",
       page_result: {
-        platform_store_id: storeId,
+        platform_store_id: expectedStoreId,
         url: currentUrl.href,
+        store_identity: identity.store_identity,
         candidates,
         pagination_known: pageScan.pagination_known,
         has_next_page: pageScan.has_next_page,
@@ -1466,6 +1981,7 @@
           tooltip_hit_count: history.tooltip_hit_count || 0,
           attempts: history.attempts || 0,
           retry_passes: retryPasses,
+          more_action_wait_ms: history.more_action_wait_ms || 0,
           observed_points: history.observed_points || [],
           tooltip_samples: history.tooltip_samples || [],
         },
@@ -1597,16 +2113,25 @@
     });
   }
 
+  async function collectStoreTask(targetType, targetDate, options = {}) {
+    const identity = await checkStoreIdentity(options.expected_store_id, options);
+    if (identity.state !== "ready") return identity;
+    const verifiedOptions = { ...options, verified_store_identity: identity.store_identity };
+    if (targetType === "STORE_TEST") return testStorePage(targetDate || localDateString());
+    if (targetType === "STORE_SELECT_PAGE") {
+      return collectStoreSelectionPage(targetDate || localDateString(), verifiedOptions);
+    }
+    return verifiedOptions.monitored_product_ids
+      ? collectMonitoredStorePage(targetDate || localDateString(), verifiedOptions)
+      : collectStore(targetDate || localDateString());
+  }
+
   globalThis.AliExpressMonitorPageCollector = {
-    collect: (targetType, targetDate, options) => targetType === "STORE_IDENTITY"
-      ? checkStoreIdentity()
-      : targetType === "STORE_TEST"
-      ? testStorePage(targetDate || localDateString())
-      : targetType === "STORE_SELECT_PAGE" ? collectStoreSelectionPage(targetDate || localDateString(), options)
-      : targetType === "STORE" ? (options?.monitored_product_ids
-        ? collectMonitoredStorePage(targetDate || localDateString(), options)
-        : collectStore(targetDate || localDateString()))
-      : collectProduct(45000, targetDate || localDateString()),
+    collect: (targetType, targetDate, options = {}) => targetType === "STORE_IDENTITY"
+      ? checkStoreIdentity(options.expected_store_id, options)
+      : ["STORE_TEST", "STORE_SELECT_PAGE", "STORE"].includes(targetType)
+        ? collectStoreTask(targetType, targetDate, options)
+        : collectProduct(45000, targetDate || localDateString()),
     collectReviews,
     collectStoreCandidatePage,
     readProduct,

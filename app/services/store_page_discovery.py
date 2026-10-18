@@ -54,7 +54,9 @@ def _canonical_first_orders_url(store: Store) -> str:
     )
 
 
-def _validate_orders_url(store: Store, value: str) -> str:
+def _validate_orders_url(
+    store: Store, value: str, *, route_alias_id: str | None = None
+) -> str:
     if not isinstance(value, str) or len(value) > 2048:
         raise ValueError("店铺 Orders 页面 URL 无效")
     try:
@@ -80,7 +82,11 @@ def _validate_orders_url(store: Store, value: str) -> str:
     route_match = match or root_match
     if route_match is None:
         raise ValueError("店铺 Orders 页面路径无效")
-    if route_match.group(1) != store_id:
+    allowed_route_ids = {store_id}
+    if route_alias_id and route_alias_id.isdigit():
+        allowed_route_ids.add(route_alias_id)
+    route_store_id = route_match.group(1)
+    if route_store_id not in allowed_route_ids:
         raise ValueError("店铺 Orders 页面 ID 与监控店铺不一致")
     query = parse_qsl(parsed.query, keep_blank_values=True)
     if root_match:
@@ -113,7 +119,9 @@ def _validate_orders_url(store: Store, value: str) -> str:
     return urlunsplit(("https", parsed.netloc.lower(), path, urlencode(query), ""))
 
 
-def _orders_page_identity(value: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+def _orders_page_identity(
+    value: str, canonical_store_id: str | None = None
+) -> tuple[str, tuple[tuple[str, str], ...]]:
     parsed = urlsplit(value)
     query = parse_qsl(parsed.query, keep_blank_values=True)
     page = next(
@@ -132,11 +140,16 @@ def _orders_page_identity(value: str) -> tuple[str, tuple[tuple[str, str], ...]]
     remaining.append(("page", normalized_page))
     if not any(key == "sorttype" for key, _ in remaining):
         remaining.append(("sorttype", "bestmatch_sort"))
-    return parsed.path, tuple(sorted(remaining))
+    path = parsed.path
+    if canonical_store_id and _STORE_PATH.fullmatch(path):
+        path = f"/store/{canonical_store_id}/pages/all-items.html"
+    return path, tuple(sorted(remaining))
 
 
-def _same_orders_page(left: str, right: str) -> bool:
-    return _orders_page_identity(left) == _orders_page_identity(right)
+def _same_orders_page(left: str, right: str, canonical_store_id: str | None = None) -> bool:
+    return _orders_page_identity(left, canonical_store_id) == _orders_page_identity(
+        right, canonical_store_id
+    )
 
 
 def _orders_page_number(value: str) -> int:
@@ -183,19 +196,21 @@ def advance_store_page_cursor(
     scan_complete: bool,
     pagination_known: bool = True,
     error: str | None = None,
+    route_alias_id: str | None = None,
 ) -> StorePageDiscoveryState:
     state = get_or_create_store_page_discovery_state(db, store)
     try:
-        scanned = _validate_orders_url(store, scanned_url)
+        scanned = _validate_orders_url(store, scanned_url, route_alias_id=route_alias_id)
     except ValueError as exc:
         state.last_outcome = "rejected"
         state.last_error = str(exc)
         db.flush()
         return state
 
-    if not _same_orders_page(scanned, state.next_page_url):
+    store_id = _platform_store_id(store)
+    if not _same_orders_page(scanned, state.next_page_url, store_id):
         if state.last_successful_page_url and _same_orders_page(
-            scanned, state.last_successful_page_url
+            scanned, state.last_successful_page_url, store_id
         ):
             state.last_outcome = "duplicate"
             state.last_error = None
@@ -226,13 +241,13 @@ def advance_store_page_cursor(
             db.flush()
             return state
         try:
-            next_url = _validate_orders_url(store, next_page_url)
+            next_url = _validate_orders_url(store, next_page_url, route_alias_id=route_alias_id)
         except ValueError as exc:
             state.last_outcome = "rejected"
             state.last_error = str(exc)
             db.flush()
             return state
-        if _same_orders_page(next_url, scanned):
+        if _same_orders_page(next_url, scanned, store_id):
             state.last_outcome = "rejected"
             state.last_error = "下一页 URL 与当前页相同"
             db.flush()

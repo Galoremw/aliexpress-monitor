@@ -1,4 +1,4 @@
-from app.db.models import Product
+from app.db.models import Product, ProductSnapshot
 
 
 def create_store(client, **overrides):
@@ -16,7 +16,7 @@ def test_health(client):
     assert response.json()["status"] == "ok"
 
 
-def test_store_crud_and_deactivate(client):
+def test_store_crud_and_deactivate(client, db_session):
     created = create_store(client)
     assert created.status_code == 201
     assert created.json()["aliexpress_store_id"] == "110001"
@@ -27,9 +27,70 @@ def test_store_crud_and_deactivate(client):
     assert updated.status_code == 200
     assert updated.json()["name"] == "Updated Peer Store"
 
+    product = client.post(
+        "/api/products",
+        json={
+            "store_id": created.json()["id"],
+            "aliexpress_product_id": "100500110001",
+        },
+    )
+    assert product.status_code == 201
+    snapshot = ProductSnapshot(
+        product_id=product.json()["id"],
+        collector_name="fixture",
+        collector_version="1",
+        parse_status="success",
+        cumulative_sold=12,
+        raw_payload={},
+    )
+    db_session.add(snapshot)
+    db_session.commit()
+    snapshot_id = snapshot.id
+
     deactivated = client.post(f"/api/stores/{created.json()['id']}/deactivate")
     assert deactivated.json()["status"] == "inactive"
     assert client.get("/api/stores?status=inactive").json()[0]["id"] == created.json()["id"]
+    assert client.get("/api/stores?status=active").json() == []
+    assert db_session.get(Product, product.json()["id"]).status == "active"
+    assert db_session.get(ProductSnapshot, snapshot_id).cumulative_sold == 12
+
+
+def test_clear_active_store_products_preserves_history_and_does_not_queue_collection(client, db_session):
+    store = create_store(client).json()
+    active_product = client.post(
+        "/api/products",
+        json={"store_id": store["id"], "aliexpress_product_id": "100500110099"},
+    ).json()
+    already_inactive = client.post(
+        "/api/products",
+        json={"store_id": store["id"], "aliexpress_product_id": "100500110098"},
+    ).json()
+    db_session.get(Product, already_inactive["id"]).status = "inactive"
+    snapshot = ProductSnapshot(
+        product_id=active_product["id"],
+        collector_name="fixture",
+        collector_version="1",
+        parse_status="success",
+        cumulative_sold=12,
+        raw_payload={"kept": True},
+    )
+    db_session.add(snapshot)
+    db_session.commit()
+
+    rejected = client.post("/api/products/clear-active", json={"confirm_clear": False})
+    assert rejected.status_code == 422
+    response = client.post("/api/products/clear-active", json={"confirm_clear": True})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"deactivated_count": 1}
+    cleared = db_session.get(Product, active_product["id"])
+    untouched = db_session.get(Product, already_inactive["id"])
+    assert cleared.status == "inactive"
+    assert cleared.pool_reset_reactivation_eligible is True
+    assert untouched.status == "inactive"
+    assert untouched.pool_reset_reactivation_eligible is False
+    assert db_session.get(ProductSnapshot, snapshot.id).cumulative_sold == 12
+    assert client.get("/api/browser-collection/runs/today").json() is None
 
 
 def test_rejects_non_aliexpress_store_url(client):

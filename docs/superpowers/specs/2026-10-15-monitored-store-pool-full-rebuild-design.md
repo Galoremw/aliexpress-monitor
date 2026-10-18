@@ -1,6 +1,6 @@
 # Monitored Store Pool Full Rebuild Design
 
-**Status:** Draft for user review
+**Status:** Approved for implementation
 **Date:** 2026-10-15
 
 ## Goal

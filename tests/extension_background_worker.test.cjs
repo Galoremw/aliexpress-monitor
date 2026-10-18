@@ -25,8 +25,11 @@ function makeWorkerHarness({
   activeTabActivationStealsFocus = false,
   claimsHeld = false,
   heartbeatConflict = false,
+  poolResetBatch = null,
+  poolResetClaim = null,
   clockNow = () => Date.now(),
   cloneStorage = false,
+  realTimers = false,
 } = {}) {
   const listeners = {
     message: eventSlot(),
@@ -67,10 +70,14 @@ function makeWorkerHarness({
   let nextItem = 0;
   let groupId = 1;
   let challengePaused = false;
+  let identityReviewPaused = false;
+  let currentRunStatus = "RUNNING";
   let focusedWindowId = 7;
   const windowStates = new Map([[7, "normal"]]);
   let currentCollectionResult = collectionResult;
   let currentHeartbeatConflict = heartbeatConflict;
+  let currentPoolResetBatch = poolResetBatch;
+  let currentPoolResetClaim = poolResetClaim;
   const queue = (queueItems ?? [
     { id: 101, target_type: "PRODUCT", target_url: "https://www.aliexpress.com/item/100000000101.html", title: "Product 1", target_date: "2026-09-29" },
     { id: 102, target_type: "PRODUCT", target_url: "https://www.aliexpress.com/item/100000000102.html", title: "Product 2" },
@@ -83,10 +90,10 @@ function makeWorkerHarness({
     const current = items.find((item) => item.status === "RUNNING") || null;
     return {
       id: 9,
-      status: challengePaused ? "NEEDS_VERIFICATION" : "RUNNING",
+      status: challengePaused || identityReviewPaused ? "NEEDS_VERIFICATION" : currentRunStatus,
       phase: "PRODUCT_COLLECTION",
-      paused_reason: null,
-      current_item: current,
+      paused_reason: challengePaused ? "platform_challenge" : identityReviewPaused ? "store_identity_review" : null,
+      current_item: current || items.find((item) => item.status === "NEEDS_VERIFICATION") || null,
       pending_count: items.filter((item) => item.status === "PENDING").length,
       items,
     };
@@ -136,11 +143,22 @@ function makeWorkerHarness({
         if (changes.active === true && activeTabActivationStealsFocus) focusedWindowId = tab.windowId;
         return tab;
       },
+      async move(ids, options) {
+        const moved = (Array.isArray(ids) ? ids : [ids]).map((id) => {
+          const tab = tabs.get(id);
+          Object.assign(tab, { windowId: options.windowId });
+          return tab;
+        });
+        return Array.isArray(ids) ? moved : moved[0];
+      },
       async remove(id) { removedTabs.push(id); tabs.delete(id); },
       async group() { return groupId; },
       async sendMessage(_tabId, message) {
-        if (message.type === "collect-visible-page") collectionMessages.push({ ...message });
-        if (message.type === "STORE_CANDIDATE_SCAN") candidateScanMessages.push({ ...message });
+        if (message.type === "collect-visible-page") collectionMessages.push({ ...message, tab_id: _tabId });
+        if (message.type === "STORE_CANDIDATE_SCAN") {
+          candidateScanMessages.push({ ...message });
+          if (currentCollectionResult) return currentCollectionResult;
+        }
         if (message.type === "dianxiaomi-check-ready") return { state: "ready" };
         if (message.type === "dianxiaomi-submit-links") return collectionResult || { state: "succeeded" };
         return collectionResults?.length ? collectionResults.shift()
@@ -192,9 +210,13 @@ function makeWorkerHarness({
     Map,
     Date: WorkerDate,
     Promise,
-    setTimeout(callback, delay) { pendingTimers.push({ callback, delay }); return pendingTimers.length; },
+    setTimeout(callback, delay) {
+      if (realTimers) return globalThis.setTimeout(callback, delay);
+      pendingTimers.push({ callback, delay });
+      return pendingTimers.length;
+    },
     setInterval() { return 0; },
-    clearTimeout() {},
+    clearTimeout(timerId) { if (realTimers) globalThis.clearTimeout(timerId); },
     importScripts() {},
     async fetch(url, options) {
       const parsedUrl = new URL(url);
@@ -207,6 +229,17 @@ function makeWorkerHarness({
       let body = {};
       if (pathname === "/api/integrations/dianxiaomi/queue/heartbeat" && legacyDianxiaomiHeartbeat) {
         return { ok: false, status: 404, json: async () => ({ detail: "Not Found" }) };
+      } else if (pathname === "/api/browser-collection/pool-resets/latest") {
+        body = currentPoolResetBatch;
+      } else if (pathname === "/api/browser-collection/pool-resets/heartbeat") {
+        body = { worker_id: JSON.parse(options.body).worker_id };
+      } else if (pathname === "/api/browser-collection/pool-resets/claim") {
+        body = currentPoolResetClaim || { batch: currentPoolResetBatch, store: null, claim_token: null };
+        currentPoolResetClaim = null;
+      } else if (/\/pool-resets\/tasks\/\d+\/page$/.test(pathname)) {
+        body = currentPoolResetBatch || {};
+      } else if (/\/pool-resets\/tasks\/\d+\/(?:challenge|resume|failure)$/.test(pathname)) {
+        body = currentPoolResetBatch || {};
       } else if (pathname === "/api/integrations/dianxiaomi/queue/heartbeat") {
         body = { paused: false };
       } else if (pathname === "/api/integrations/dianxiaomi/handoffs" && options.method !== "POST") {
@@ -236,6 +269,14 @@ function makeWorkerHarness({
           item: item ? { ...item } : null,
           claim_token: item ? `claim-token-${item.id}-${item.attempt_count}` : null,
         };
+      } else if (pathname.includes("/items/") && pathname.endsWith("/identity-review")) {
+        const id = Number(pathname.match(/items\/(\d+)\/identity-review/)?.[1]);
+        const item = queue.find((candidate) => candidate.id === id);
+        if (item) item.status = "NEEDS_VERIFICATION";
+        challengePaused = false;
+        identityReviewPaused = true;
+        currentRunStatus = "NEEDS_VERIFICATION";
+        body = runPayload();
       } else if (pathname.includes("/items/") && pathname.endsWith("/challenge")) {
         const id = Number(pathname.match(/items\/(\d+)\/challenge/)?.[1]);
         const item = queue.find((candidate) => candidate.id === id);
@@ -268,6 +309,26 @@ function makeWorkerHarness({
     get focusedWindowId() { return focusedWindowId; },
     setCollectionResult(value) { currentCollectionResult = value; },
     setHeartbeatConflict(value) { currentHeartbeatConflict = value; },
+    resumeChallenge() {
+      challengePaused = false;
+      currentRunStatus = "RUNNING";
+      for (const item of queue) {
+        if (item.status === "NEEDS_VERIFICATION") item.status = "RUNNING";
+      }
+    },
+    confirmIdentityReview(itemId, aliases) {
+      identityReviewPaused = false;
+      currentRunStatus = "RUNNING";
+      const item = queue.find((candidate) => Number(candidate.id) === Number(itemId));
+      if (item) {
+        item.status = "RUNNING";
+        item.approved_store_url_identities = aliases;
+      }
+    },
+    setCollectionResults(values) {
+      collectionResults = values;
+    },
+    setPoolResetBatch(value) { currentPoolResetBatch = value; },
   };
 }
 
@@ -304,9 +365,10 @@ test("legacy local worker setting does not activate collection in the everyday p
   assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/claim")), false);
 });
 
-test("isolated local worker marker survives an MV3 service-worker restart", async () => {
-  const worker = makeWorkerHarness({ dedicatedProfile: false });
-  worker.storage.browserCollectionIsolatedProfileAuthorized = true;
+test("isolated local dashboard URL restores worker mode after an MV3 service-worker restart", async () => {
+  const worker = makeWorkerHarness({
+    dashboardUrl: "http://127.0.0.1:3000/?browser_collection=1&browser_collection_profile=isolated",
+  });
   worker.chrome.runtime.onStartup.callback();
   await worker.flush();
   worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
@@ -314,6 +376,18 @@ test("isolated local worker marker survives an MV3 service-worker restart", asyn
 
   assert.equal(worker.storage.browserCollectionWorkerMode, true);
   assert.ok(worker.requests.some((request) => request.pathname.endsWith("/items/claim")));
+});
+
+test("stale isolated authorization cannot activate the everyday Chrome profile", async () => {
+  const worker = makeWorkerHarness({ dedicatedProfile: false });
+  worker.storage.browserCollectionIsolatedProfileAuthorized = true;
+  worker.chrome.runtime.onStartup.callback();
+  await worker.flush();
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.equal(worker.storage.browserCollectionWorkerMode, false);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/claim")), false);
 });
 
 test("isolated local collector profile can claim queued work", async () => {
@@ -335,7 +409,77 @@ test("isolated local collector profile can claim queued work", async () => {
   assert.ok(worker.requests.some((request) => request.pathname.endsWith("/items/claim")));
 });
 
-test("stale heartbeat discards local claims and closes only the task tab", async () => {
+test("pool reset scans the claimed Orders page without touching the daily queue", async () => {
+  const pageUrl = "https://www.aliexpress.com/store/1100000092/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc";
+  const batch = { id: 41, status: "RUNNING", dispatch_enabled: true, target_date: "2026-10-16" };
+  const worker = makeWorkerHarness({
+    poolResetBatch: batch,
+    poolResetClaim: {
+      batch,
+      store: {
+        id: 701,
+        store_id: 92,
+        platform_store_id: "1100000092",
+        store_name: "Reset Test Store",
+        next_page_url: pageUrl,
+      },
+      claim_token: "pool-reset-token-701",
+      candidate_limit: 50,
+      target_url: pageUrl,
+      target_date: "2026-10-16",
+    },
+    collectionResult: {
+      state: "ready",
+      page_result: {
+        platform_store_id: "1100000092",
+        url: pageUrl,
+        candidates: [],
+        pagination_known: true,
+        has_next_page: false,
+        next_page_url: null,
+        scan_complete: true,
+        diagnostics: { page_scan: { visible_product_count: 0 } },
+      },
+    },
+  });
+  worker.listeners.message.callback({
+    type: "dashboard-context",
+    browser_collection_mode: true,
+    browser_collection_mode_explicit: true,
+    browser_collection_local_mode: true,
+  }, {
+    tab: {
+      id: 1,
+      windowId: 7,
+      url: "http://127.0.0.1:3000/?browser_collection=1&browser_collection_profile=isolated",
+    },
+  }, () => {});
+  await worker.flush();
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.equal(worker.storage.automationTaskKind, "POOL_RESET");
+  const taskTab = await worker.chrome.tabs.get(worker.storage.automationTabId);
+  assert.equal(taskTab.url, pageUrl);
+  worker.listeners.updated.callback(taskTab.id, { status: "complete" }, taskTab);
+  await worker.flush();
+
+  const scan = worker.candidateScanMessages[0];
+  assert.equal(scan.expectedStoreId, "1100000092");
+  assert.equal(scan.expectedPageUrl, pageUrl);
+  const submitted = worker.requests.find((request) => /\/pool-resets\/tasks\/701\/page$/.test(request.pathname));
+  assert.equal(submitted.body.expected_store_id, "1100000092");
+  assert.equal(submitted.body.claim_token, "pool-reset-token-701");
+  assert.equal(submitted.body.page.page_url, pageUrl);
+  const pageRequestIndex = worker.requests.indexOf(submitted);
+  assert.equal(worker.requests.slice(0, pageRequestIndex).some((request) =>
+    request.pathname === "/api/browser-collection/heartbeat"
+      || request.pathname === "/api/browser-collection/items/claim"), false);
+  assert.equal(worker.createdTabs.some((tab) => /\/item\//.test(tab.url)), false);
+  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/pool-resets/heartbeat"));
+});
+
+test("stale heartbeat discards local claims but keeps the task page instead of blanking it", async () => {
   const worker = makeWorkerHarness({ heartbeatConflict: true });
   worker.chrome.runtime.onStartup.callback();
   await worker.flush();
@@ -358,7 +502,8 @@ test("stale heartbeat discards local claims and closes only the task tab", async
 
   assert.equal(worker.storage.automationItem, undefined);
   assert.equal(worker.storage.automationClaimToken, undefined);
-  assert.equal((await worker.chrome.tabs.get(taskTab.id)).url, "about:blank");
+  assert.equal((await worker.chrome.tabs.get(taskTab.id)).url,
+    "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc");
   assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/claim")), false);
 });
 
@@ -408,6 +553,10 @@ test("store worker merges two Orders pages without opening product detail URLs",
   const result = await worker.context.collectStorePages(tab.id, {
     target_url: firstUrl, target_date: "2026-09-29",
     monitored_product_ids: ["1005000000000001", "1005000000000002"],
+    monitored_products: [{
+      platform_product_id: "1005000000000001", title: "Tracked item",
+      url: "https://www.aliexpress.com/item/1005000000000001.html",
+    }],
   });
 
   assert.equal(result.state, "ready");
@@ -421,6 +570,85 @@ test("store worker merges two Orders pages without opening product detail URLs",
     ["partial", "complete"]);
   assert.equal(worker.updatedTabs.some((update) => /\/item\//.test(update.url || "")), false);
   assert.equal(worker.collectionMessages.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(worker.collectionMessages[0].monitored_products)), [{
+    platform_product_id: "1005000000000001", title: "Tracked item",
+    url: "https://www.aliexpress.com/item/1005000000000001.html",
+  }]);
+});
+
+test("store worker follows a signaled next page without a URL and records fallback scan diagnostics", async () => {
+  const firstUrl = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const secondUrl = `${firstUrl}&page=2`;
+  const firstId = "1005000000000001";
+  const secondId = "1005000000000002";
+  const worker = makeWorkerHarness({ collectionResults: [
+    { state: "ready", page_result: { platform_store_id: "123456", url: firstUrl,
+      products: [{ platform_product_id: firstId, historical_sales: [] }],
+      has_next_page: true, next_page_url: null } },
+    { state: "ready", page_result: { platform_store_id: "123456", url: secondUrl,
+      products: [{ platform_product_id: secondId, historical_sales: [] }],
+      has_next_page: false, next_page_url: null } },
+  ] });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: firstUrl, active: true });
+
+  const result = await worker.context.collectStorePages(tab.id, {
+    target_url: firstUrl,
+    target_date: "2026-09-29",
+    monitored_product_ids: [firstId, secondId],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.products.map((product) => product.platform_product_id))),
+    [firstId, secondId]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [firstUrl, secondUrl]);
+  assert.equal(result.payload.raw_data.page_scans.length, 2);
+  assert.equal(result.payload.raw_data.page_scans[0].next_page_url, secondUrl);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.page_scans[0].unmatched_target_ids)), [secondId]);
+  assert.equal(result.payload.raw_data.page_scans[0].scan_source, "worker_fallback");
+  assert.equal(worker.updatedTabs[0].url, secondUrl);
+});
+
+test("store worker restores the target Orders page when verification leaves its tab blank", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const monitoredIds = Array.from({ length: 20 }, (_, index) => `1005000000000${String(index + 1).padStart(3, "0")}`);
+  let now = 0;
+  const worker = makeWorkerHarness({ clockNow: () => now, collectionResult: {
+    state: "ready",
+    page_result: {
+      platform_store_id: "123456",
+      url,
+      products: monitoredIds.map((platform_product_id) => ({ platform_product_id, historical_sales: [] })),
+      has_next_page: false,
+      next_page_url: null,
+    },
+  } });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: "about:blank", active: true });
+
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 413, run_id: 9, target_url: url, target_date: "2026-09-29",
+    monitored_product_ids: monitoredIds,
+  });
+
+  assert.equal(result.state, "ready");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [url]);
+  assert.equal(worker.updatedTabs[0].url, url, "recovers the same worker tab to the claimed Orders page");
+  assert.equal(worker.collectionMessages.length, 1);
+});
+
+test("store worker fails explicitly when its collector tab disappeared instead of submitting an empty visit record", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness();
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  await worker.chrome.tabs.remove(tab.id);
+
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 414, run_id: 9, target_url: url, target_date: "2026-09-29",
+    monitored_product_ids: Array.from({ length: 20 }, (_, index) => `1005000000000${String(index + 1).padStart(3, "0")}`),
+  });
+
+  assert.equal(result.state, "failed");
+  assert.match(result.message, /采集标签页已关闭/);
+  assert.equal(result.payload, undefined, "never submits a success-shaped result with no visited Orders page");
 });
 
 test("empty monitored pool scans exactly the backend cursor page without opening product details", async () => {
@@ -460,6 +688,142 @@ test("empty monitored pool scans exactly the backend cursor page without opening
   assert.equal(worker.updatedTabs.some((update) => /\/item\//.test(update.url || "")), false);
 });
 
+test("empty initial pool scans the task Orders page when the backend has no continuation cursor", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({ collectionResults: [{
+    state: "ready",
+    page_result: {
+      platform_store_id: "123456",
+      url,
+      candidates: [{ platform_product_id: "1005000000000009", historical_sales: [] }],
+      has_next_page: true,
+      next_page_url: `${url}&page=2`,
+      scan_complete: true,
+      pagination_known: true,
+    },
+  }] });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 404,
+    run_id: 9,
+    target_url: url,
+    discovery_page_url: null,
+    target_date: "2026-09-29",
+    monitored_product_ids: [],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.payload.candidate_page.page_url, url);
+  assert.equal(result.payload.candidate_page.scan_complete, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [url]);
+  assert.equal(worker.candidateScanMessages.length, 1);
+  assert.equal(worker.candidateScanMessages[0].expectedPageUrl, url);
+  assert.equal(worker.collectionMessages.length, 0, "does not run per-product monitored collection for an empty pool");
+  assert.equal(worker.updatedTabs.length, 0, "scans the already-open task page without navigation");
+});
+
+test("candidate scan waits for a matching pending Orders navigation instead of navigating twice", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({ realTimers: true, collectionResult: {
+    state: "ready",
+    page_result: {
+      platform_store_id: "123456",
+      url,
+      candidates: [],
+      has_next_page: false,
+      next_page_url: null,
+      scan_complete: true,
+      pagination_known: true,
+    },
+  } });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: "about:blank", active: true });
+  tab.status = "loading";
+  tab.pendingUrl = url;
+  worker.context.waitForStorePage = async () => {
+    tab.url = url;
+    delete tab.pendingUrl;
+    tab.status = "complete";
+    return { storeId: "123456" };
+  };
+
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 403,
+    run_id: 9,
+    target_url: url,
+    discovery_page_url: url,
+    target_date: "2026-09-29",
+    monitored_product_ids: [],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(worker.updatedTabs.length, 0, "does not restart a navigation already targeting the required Orders page");
+  assert.equal(worker.candidateScanMessages.length, 1);
+});
+
+test("empty pool preserves the page-load diagnosis when no Orders page is reached", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness();
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: "about:blank", active: true });
+  worker.context.waitForStorePage = async () => {
+    throw new Error("店铺下一页未在限定时间内加载完成");
+  };
+
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 402,
+    run_id: 9,
+    target_url: url,
+    discovery_page_url: url,
+    target_date: "2026-09-29",
+    monitored_product_ids: [],
+  });
+
+  assert.equal(result.state, "failed");
+  assert.equal(result.error_type, "page_not_ready");
+  assert.match(result.message, /阶段：page_load_timeout/);
+  assert.match(result.message, /当前 URL：https:\/\/www\.aliexpress\.com\/store\/123456/);
+});
+
+test("empty-pool identity failures include the Store ID probe evidence", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const aliasUrl = "https://www.aliexpress.com/store/789012/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness();
+  const tab = await worker.chrome.tabs.create({
+    windowId: 8,
+    url: aliasUrl,
+    active: true,
+  });
+  worker.context.waitForStorePage = async () => {
+    const error = new Error("任务目标店铺 ID 123456 与页面显示店铺 ID 未识别；Store ID 字段：未识别");
+    error.code = "STORE_IDENTITY_REVIEW";
+    error.error_type = "store_identity_mismatch";
+    error.page_url = "https://www.aliexpress.com/store/789012/pages/all-items.html?shop_sortType=orders_desc";
+    error.evidence = {
+      route_store_id: "789012",
+      heading_store_id: "123456",
+      labeled_store_ids: [],
+      page_title: "AliExpress Store",
+      ixspy_store_name: null,
+      identity_method: "unverified",
+    };
+    throw error;
+  };
+
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 410,
+    run_id: 9,
+    target_url: url,
+    discovery_page_url: aliasUrl,
+    target_date: "2026-09-29",
+    monitored_product_ids: [],
+  });
+
+  assert.equal(result.state, "identity_review");
+  assert.equal(result.error_type, "store_identity_mismatch");
+  assert.match(result.message, /任务目标店铺 ID 123456/);
+  assert.match(result.message, /Store ID 字段：未识别/);
+  assert.equal(result.evidence.route_store_id, "789012");
+});
+
 test("store worker reuses a visited cursor URL and submits candidate diagnostics once", async () => {
   const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
   const worker = makeWorkerHarness({ collectionResults: [
@@ -496,7 +860,8 @@ test("candidate page timeout submits an incomplete candidate scan without advanc
   });
   await worker.flush();
   assert.equal(worker.candidateScanMessages.length, 1);
-  const timeout = worker.pendingTimers.find((timer) => timer.delay === 4 * 60 * 1000);
+  const timeout = worker.pendingTimers.find((timer) => timer.delay > 14 * 60 * 1000
+    && timer.delay <= 15 * 60 * 1000);
   assert.ok(timeout, "candidate scan uses the bounded page response timeout");
   timeout.callback();
   const result = await collecting;
@@ -508,14 +873,35 @@ test("candidate page timeout submits an incomplete candidate scan without advanc
   assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [url]);
 });
 
+test("candidate page scan has a 15-minute response window for serial chart reads", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({ collectionResult: new Promise(() => {}) });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const collecting = worker.context.collectStorePages(tab.id, {
+    id: 411, run_id: 9, target_url: url, discovery_page_url: url,
+    target_date: "2026-09-29", monitored_product_ids: [],
+  });
+  await worker.flush();
+
+  const timeout = worker.pendingTimers.find((timer) => timer.delay >= 14 * 60 * 1000);
+  assert.ok(timeout, "the scan timeout must allow 15 minutes for sequential IXSPY chart reads");
+  timeout.callback();
+  const result = await collecting;
+
+  assert.equal(result.payload.candidate_page.scan_complete, false);
+  assert.equal(result.payload.candidate_page.diagnostics.outcome, "page_response_timeout");
+});
+
 test("incomplete candidate page never forwards its partial candidates to the backend", async () => {
   const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc&page=2";
-  const worker = makeWorkerHarness({ collectionResult: {
+  const worker = makeWorkerHarness({ realTimers: true, collectionResult: {
     state: "ready",
     page_result: {
       platform_store_id: "123456", url,
       candidates: [{ platform_product_id: "1005000000000009", historical_sales: [] }],
-      has_next_page: true, next_page_url: `${url}&page=3`, scan_complete: false,
+      has_next_page: true,
+      next_page_url: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc&page=3",
+      scan_complete: false,
       diagnostics: { outcome: "page_structure_incomplete" },
     },
   } });
@@ -529,7 +915,9 @@ test("incomplete candidate page never forwards its partial candidates to the bac
   assert.equal(result.state, "ready");
   assert.equal(result.payload.candidate_page.scan_complete, false);
   assert.deepEqual(JSON.parse(JSON.stringify(result.payload.candidate_page.candidates)), []);
-  assert.equal(result.payload.candidate_page.next_page_url, `${url}&page=3`);
+  assert.equal(result.payload.candidate_page.next_page_url,
+    "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc&page=3",
+    JSON.stringify(result.payload.candidate_page));
 });
 
 test("store worker stops at a cross-store next link and leaves missing IDs pending", async () => {
@@ -646,7 +1034,70 @@ test("candidate discovery resumes after challenge without an empty monitored-pag
   assert.equal(worker.candidateScanMessages.length, 2, "the candidate page is retried after verification");
 });
 
-test("selected remote worker foregrounds the maximized store collector then backgrounds it after the task", async () => {
+test("store retry preserves prior product identity evidence when a rescan omits the completed target", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const targetId = "1005000000000043";
+  const observedId = "1005000000000044";
+  const pendingId = "1005000000000045";
+  const identityMatch = {
+    monitored_product_id: targetId,
+    observed_product_id: observedId,
+    match_method: "exact_title",
+    page_url: url,
+  };
+  const worker = makeWorkerHarness({ collectionResult: {
+    state: "challenge",
+    message: "verification",
+    diagnostics: { page_scan: {
+      url,
+      visible_product_ids: [pendingId],
+      matched_product_ids: [],
+      unmatched_target_ids: [targetId, pendingId],
+      identity_matches: [],
+    } },
+  } });
+  const item = {
+    id: 414, run_id: 9, target_url: url, target_date: "2026-09-29",
+    monitored_product_ids: [targetId, pendingId],
+  };
+  worker.storage["browserCollectionStoreProgress:414"] = {
+    run_id: 9,
+    item_id: 414,
+    store_id: "123456",
+    target_date: "2026-09-29",
+    target_ids: [targetId, pendingId],
+    products: {
+      [targetId]: {
+        platform_product_id: targetId,
+        observed_product_id: observedId,
+        observed_url: `https://www.aliexpress.com/item/${observedId}.html`,
+        observed_page_url: url,
+        identity_match_method: "exact_title",
+        historical_sales: [],
+      },
+    },
+    visited_page_urls: [url],
+    page_scans: [{
+      url,
+      visible_product_ids: [observedId],
+      matched_product_ids: [targetId],
+      unmatched_target_ids: [pendingId],
+      identity_matches: [identityMatch],
+    }],
+    chart_reads: [],
+  };
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+
+  const result = await worker.context.collectStorePages(tab.id, item);
+
+  assert.equal(result.state, "challenge");
+  const scan = worker.storage["browserCollectionStoreProgress:414"].page_scans[0];
+  assert.ok(scan.visible_product_ids.includes(observedId));
+  assert.ok(scan.visible_product_ids.includes(pendingId));
+  assert.deepEqual(JSON.parse(JSON.stringify(scan.identity_matches)), [identityMatch]);
+});
+
+test("selected remote worker remains maximized and foreground after the store task", async () => {
   const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
   const worker = makeWorkerHarness({ collectionResult: {
     state: "ready",
@@ -680,8 +1131,8 @@ test("selected remote worker foregrounds the maximized store collector then back
   assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true
     && update.state === "maximized"), "the store chart is read in a maximized foreground window");
   const finalWindowUpdate = worker.windowUpdates.filter((update) => update.id === 8).at(-1);
-  assert.equal(finalWindowUpdate.focused, false);
-  assert.equal(finalWindowUpdate.state, "minimized", "the finished worker window moves behind the dashboard");
+  assert.equal(finalWindowUpdate.focused, true);
+  assert.equal(finalWindowUpdate.state, "maximized");
 });
 
 test("store worker returns a partial payload when the first page exceeds its response budget", async () => {
@@ -728,7 +1179,7 @@ test("candidate page response timeout is bounded by the remaining store work bud
   let clockReads = 0;
   const worker = makeWorkerHarness({
     collectionResult: new Promise(() => {}),
-    clockNow: () => (clockReads++ === 0 ? 0 : 7 * 60 * 1000),
+    clockNow: () => (clockReads++ === 0 ? 0 : 14 * 60 * 1000),
   });
   const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc&page=2";
   const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
@@ -745,7 +1196,7 @@ test("candidate page response timeout is bounded by the remaining store work bud
   timeout.callback();
   const result = await collecting;
 
-  assert.ok(boundedTimeout, "a scan starting at minute seven only receives the remaining one-minute budget");
+  assert.ok(boundedTimeout, "a scan starting at minute fourteen only receives the remaining one-minute budget");
   assert.equal(result.payload.candidate_page.scan_complete, false);
 });
 
@@ -826,6 +1277,49 @@ test("store worker retains completed pages when a later page stalls", async () =
     ["1005000000000001"]);
 });
 
+test("store worker follows a persisted route-alias candidate cursor after verifying page identity", async () => {
+  const canonicalUrl = "https://www.aliexpress.com/store/1105161198/pages/all-items.html?shop_sortType=orders_desc";
+  const aliasUrl = "https://www.aliexpress.com/store/1105170187/pages/all-items.html?page=2&shop_sortType=orders_desc";
+  const aliasPageThree = "https://www.aliexpress.com/store/1105170187/pages/all-items.html?page=3&shop_sortType=orders_desc";
+  const productId = "1005000000000001";
+  const routeAliasIdentity = {
+    target_store_id: "1105161198",
+    route_store_id: "1105170187",
+    heading_store_id: "1105161198",
+    page_url: aliasUrl,
+  };
+  const worker = makeWorkerHarness({
+    realTimers: true,
+    collectionResults: [
+      { state: "ready", page_result: { platform_store_id: "1105161198", url: canonicalUrl,
+        products: [{ platform_product_id: productId, historical_sales: [] }],
+        has_next_page: false, next_page_url: null } },
+      { state: "ready", platform_store_id: "1105161198", store_identity: routeAliasIdentity },
+      { state: "ready", page_result: { platform_store_id: "1105161198", url: aliasUrl,
+        store_identity: routeAliasIdentity, candidates: [], pagination_known: true,
+        has_next_page: true, next_page_url: aliasPageThree, scan_complete: true } },
+    ],
+  });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: canonicalUrl, active: true });
+
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 402,
+    target_type: "STORE",
+    target_url: canonicalUrl,
+    discovery_page_url: aliasUrl,
+    target_date: "2026-09-29",
+    monitored_product_ids: [productId],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(worker.collectionMessages[0].expected_store_id, "1105161198");
+  assert.equal(worker.candidateScanMessages[0].expectedStoreId, "1105161198");
+  assert.equal(worker.candidateScanMessages[0].expectedPageUrl, aliasUrl);
+  assert.equal(result.payload.candidate_page.page_url, aliasUrl);
+  assert.equal(result.payload.candidate_page.next_page_url, aliasPageThree);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.store_identity)), routeAliasIdentity);
+});
+
 test("expired extension authorization is refreshed from the signed-in dashboard and retried once", async () => {
   const worker = makeWorkerHarness({ expiredToken: "expired-token", refreshedToken: "fresh-token" });
 
@@ -850,7 +1344,7 @@ test("expired authorization asks for dashboard login when renewal is unavailable
   assert.match(worker.notifications[0].message, /登录本地监控台/);
 });
 
-test("scheduled items reuse the blank page in a maximized foreground worker window and close completed tabs", async () => {
+test("scheduled items reuse one foreground worker tab without blanking the final page", async () => {
   const worker = makeWorkerHarness();
   await worker.listeners.message.callback({
     type: "dashboard-context",
@@ -893,19 +1387,19 @@ test("scheduled items reuse the blank page in a maximized foreground worker wind
   assert.equal(worker.createdTabs.length, 2, "only the one-page prefetches need new tabs");
   assert.ok(worker.updatedTabs.some((tab) => tab.id === 10 && tab.url === "https://www.aliexpress.com/item/100000000101.html"),
     "the first product reuses the initial blank tab");
-  assert.deepEqual(worker.removedTabs, [11, 12], "prefetched product tabs are closed after use");
-  assert.equal(worker.storage.idleAutomationTabId, 10, "the original worker tab is restored to a blank idle page");
+  assert.deepEqual(worker.removedTabs, [10, 11], "replaces completed pages without leaving blank tabs behind");
+  assert.equal(worker.storage.idleAutomationTabId, 12, "keeps the final completed page for the next task");
   assert.deepEqual(
     (await worker.chrome.tabs.query({ windowId: 8 })).map((tab) => tab.url),
-    ["about:blank"],
+    ["https://www.aliexpress.com/item/100000000103.html"],
   );
   assert.deepEqual(worker.windowRemoves, [], "collection does not close the worker window");
   assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true));
   assert.ok(worker.windowUpdates.some((update) => update.id === 8 && update.focused === true && update.state === "maximized"),
     "the worker stays maximized and focused while the item is processed");
   const finalWorkerWindowUpdate = worker.windowUpdates.filter((update) => update.id === 8).at(-1);
-  assert.equal(finalWorkerWindowUpdate.focused, false);
-  assert.equal(finalWorkerWindowUpdate.state, "minimized", "the completed worker window moves behind the dashboard");
+  assert.equal(finalWorkerWindowUpdate.focused, true);
+  assert.equal(finalWorkerWindowUpdate.state, "maximized", "the completed worker window stays in front");
 });
 
 test("closes tracked collection tabs even if worker-window ownership flags were lost", async () => {
@@ -939,6 +1433,622 @@ test("closes tracked collection tabs even if worker-window ownership flags were 
 
   assert.ok(worker.removedTabs.includes(productTabId), "removes the explicitly tracked product tab");
   assert.ok(await worker.chrome.tabs.get(1), "does not close the dashboard tab");
+});
+
+test("loaded store route alias is accepted only when the page identity matches the task store", async () => {
+  const worker = makeWorkerHarness({
+    realTimers: true,
+    collectionResult: {
+      state: "ready",
+      platform_store_id: "1105161198",
+      store_identity: {
+        target_store_id: "1105161198",
+        route_store_id: "1105170187",
+        heading_store_id: "1105161198",
+        page_url: "https://www.aliexpress.com/store/1105170187/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc",
+      },
+    },
+  });
+  const tab = await worker.chrome.tabs.create({
+    windowId: 8,
+    url: "https://www.aliexpress.com/store/1105170187/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc",
+    active: true,
+  });
+
+  const resolved = await worker.context.waitForStorePage(
+    tab.id,
+    "https://www.aliexpress.com/store/1105161198/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc",
+    1000,
+    "1105161198",
+  );
+
+  assert.equal(resolved.storeId, "1105170187");
+  assert.deepEqual(JSON.parse(JSON.stringify(resolved.store_identity)), {
+    target_store_id: "1105161198",
+    route_store_id: "1105170187",
+    heading_store_id: "1105161198",
+    page_url: "https://www.aliexpress.com/store/1105170187/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc",
+  });
+  assert.equal(worker.collectionMessages[0].expected_store_id, "1105161198");
+});
+
+test("store progress accepts a route alias verified by the explicit Store ID label", async () => {
+  const storeId = "1105179516";
+  const routeStoreId = "1105182474";
+  const productId = "1005001234567890";
+  const targetUrl = `https://www.aliexpress.com/store/${storeId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const pageUrl = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const worker = makeWorkerHarness();
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: pageUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 501,
+      run_id: 9,
+      target_type: "STORE",
+      target_url: targetUrl,
+      target_date: "2026-10-17",
+      monitored_product_ids: [productId],
+    },
+    automationTabId: tab.id,
+    automationClaimToken: "claim-501",
+  });
+  let response;
+
+  worker.listeners.message.callback({
+    type: "store-collection-product-progress",
+    item_id: 501,
+    claim_token: "claim-501",
+    product: {
+      platform_product_id: productId,
+      url: `https://www.aliexpress.com/item/${productId}.html`,
+      historical_sales: [],
+      store_identity: {
+        target_store_id: storeId,
+        route_store_id: routeStoreId,
+        heading_store_id: null,
+        labeled_store_ids: [storeId],
+      },
+    },
+  }, { tab }, (value) => { response = value; });
+  await worker.flush();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: true });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(worker.storage["browserCollectionStoreProgress:501"].visited_page_urls)),
+    [pageUrl],
+  );
+});
+
+test("store product progress accepts a page identity approved for this store", async () => {
+  const storeId = "1105179516";
+  const routeStoreId = "1105182474";
+  const productId = "1005001234567890";
+  const targetUrl = `https://www.aliexpress.com/store/${storeId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const pageUrl = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const worker = makeWorkerHarness();
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: pageUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 503,
+      run_id: 9,
+      target_type: "STORE",
+      target_url: targetUrl,
+      target_date: "2026-10-17",
+      monitored_product_ids: [productId],
+      approved_store_url_identities: [{
+        route_store_id: routeStoreId,
+        normalized_page_identity: `www.aliexpress.com/store/${routeStoreId}/pages/all-items.html`,
+        evidence: { ixspy_store_name: "Reviewed Store" },
+      }],
+    },
+    automationTabId: tab.id,
+    automationClaimToken: "claim-503",
+  });
+  let response;
+
+  worker.listeners.message.callback({
+    type: "store-collection-product-progress",
+    item_id: 503,
+    claim_token: "claim-503",
+    product: {
+      platform_product_id: productId,
+      url: `https://www.aliexpress.com/item/${productId}.html`,
+      historical_sales: [],
+      store_identity: {
+        target_store_id: storeId,
+        route_store_id: routeStoreId,
+        page_url: pageUrl,
+        heading_store_id: null,
+        labeled_store_ids: [],
+        ixspy_store_name: " Reviewed Store ",
+        identity_method: "backend_approved_url_alias",
+      },
+    },
+  }, { tab }, (value) => { response = value; });
+  await worker.flush();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: true });
+  assert.ok(worker.storage["browserCollectionStoreProgress:503"].products[productId]);
+});
+
+test("candidate progress accepts a page identity approved for this store", async () => {
+  const storeId = "1105179516";
+  const routeStoreId = "1105182474";
+  const productId = "1005001234567890";
+  const targetUrl = `https://www.aliexpress.com/store/${storeId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const pageUrl = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const worker = makeWorkerHarness();
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: pageUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 504,
+      run_id: 9,
+      target_type: "STORE",
+      target_url: targetUrl,
+      discovery_page_url: targetUrl,
+      target_date: "2026-10-17",
+      monitored_product_ids: [],
+      approved_store_url_identities: [{
+        route_store_id: routeStoreId,
+        normalized_page_identity: `www.aliexpress.com/store/${routeStoreId}/pages/all-items.html`,
+        evidence: { ixspy_store_name: "Reviewed Store" },
+      }],
+    },
+    automationTabId: tab.id,
+    automationClaimToken: "claim-504",
+  });
+  let response;
+
+  worker.listeners.message.callback({
+    type: "store-candidate-progress",
+    item_id: 504,
+    claim_token: "claim-504",
+    expected_store_id: storeId,
+    expected_page_url: pageUrl,
+    product: {
+      platform_product_id: productId,
+      url: `https://www.aliexpress.com/item/${productId}.html`,
+      historical_sales: [
+        "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13",
+        "2026-10-14", "2026-10-15", "2026-10-16",
+      ].map((date, index) => ({ date, value: index + 1, value_type: "daily_increment" })),
+      history_source: "ixspy_visible_daily_increment",
+      history_daily_capture_complete: true,
+      history_expected_dates: [
+        "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13",
+        "2026-10-14", "2026-10-15", "2026-10-16",
+      ],
+      history_missing_dates: [],
+      history_read_diagnostic: { outcome: "complete", source: "ixspy_visible_daily_increment" },
+      store_identity: {
+        target_store_id: storeId,
+        route_store_id: routeStoreId,
+        page_url: pageUrl,
+        heading_store_id: null,
+        labeled_store_ids: [],
+        ixspy_store_name: "Reviewed Store",
+        identity_method: "backend_approved_url_alias",
+      },
+    },
+  }, { tab }, (value) => { response = value; });
+  await worker.flush();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: true });
+  assert.ok(worker.storage["browserCollectionStoreProgress:504"].candidate_page_progress.products[productId]);
+});
+
+test("candidate chart checkpoints persist under the claimed store page for retry", async () => {
+  const storeId = "1105179516";
+  const routeStoreId = "1105182474";
+  const productId = "1005001234567890";
+  const targetUrl = `https://www.aliexpress.com/store/${storeId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const pageUrl = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const worker = makeWorkerHarness();
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: pageUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 502,
+      run_id: 9,
+      target_type: "STORE",
+      target_url: targetUrl,
+      discovery_page_url: targetUrl,
+      target_date: "2026-10-17",
+      monitored_product_ids: [],
+    },
+    automationTabId: tab.id,
+    automationClaimToken: "claim-502",
+  });
+  let response;
+
+  worker.listeners.message.callback({
+    type: "store-candidate-progress",
+    item_id: 502,
+    claim_token: "claim-502",
+    expected_store_id: storeId,
+    expected_page_url: pageUrl,
+    page_url: pageUrl,
+    product: {
+      platform_product_id: productId,
+      url: `https://www.aliexpress.com/item/${productId}.html`,
+      historical_sales: [
+        "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13",
+        "2026-10-14", "2026-10-15", "2026-10-16",
+      ].map((date, index) => ({ date, value: index + 1, value_type: "daily_increment" })),
+      history_source: "ixspy_visible_daily_increment",
+      history_daily_capture_complete: true,
+      history_expected_dates: [
+        "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13",
+        "2026-10-14", "2026-10-15", "2026-10-16",
+      ],
+      history_missing_dates: [],
+      history_read_diagnostic: {
+        product_id: productId,
+        outcome: "complete",
+        source: "ixspy_visible_daily_increment",
+        point_count: 7,
+        missing_dates: [],
+      },
+      store_identity: {
+        target_store_id: storeId,
+        route_store_id: routeStoreId,
+        heading_store_id: null,
+        labeled_store_ids: [storeId],
+        page_url: pageUrl,
+      },
+    },
+  }, { tab }, (value) => { response = value; });
+  await worker.flush();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: true });
+  const checkpoint = worker.storage["browserCollectionStoreProgress:502"].candidate_page_progress;
+  assert.equal(checkpoint.target_date, "2026-10-17");
+  assert.equal(checkpoint.page_url, pageUrl);
+  assert.equal(checkpoint.products[productId].history_daily_capture_complete, true);
+});
+
+test("route alias matching the requested URL still requires target-store identity", async () => {
+  const worker = makeWorkerHarness({
+    realTimers: true,
+    collectionResult: {
+      state: "ready",
+      platform_store_id: "1105161198",
+      store_identity: {
+        target_store_id: "1105161198",
+        route_store_id: "1105170187",
+        heading_store_id: "1105161198",
+        page_url: "https://www.aliexpress.com/store/1105170187/pages/all-items.html?shop_sortType=orders_desc",
+      },
+    },
+  });
+  const aliasUrl = "https://www.aliexpress.com/store/1105170187/pages/all-items.html?shop_sortType=orders_desc";
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: aliasUrl, active: true });
+
+  const resolved = await worker.context.waitForStorePage(tab.id, aliasUrl, 1000, "1105161198");
+
+  assert.equal(resolved.storeId, "1105170187");
+  assert.equal(worker.collectionMessages[0].expected_store_id, "1105161198");
+});
+
+test("loaded route alias is rejected when the page identity belongs to another store", async () => {
+  const worker = makeWorkerHarness({
+    realTimers: true,
+    collectionResult: {
+      state: "failed",
+      error_type: "store_identity_mismatch",
+      message: "任务目标店铺 ID 与页面标题不一致",
+    },
+  });
+  const tab = await worker.chrome.tabs.create({
+    windowId: 8,
+    url: "https://www.aliexpress.com/store/1105182474/pages/all-items.html?shop_sortType=orders_desc",
+    active: true,
+  });
+
+  await assert.rejects(
+    worker.context.waitForStorePage(
+      tab.id,
+      "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc",
+      1000,
+      "1105179516",
+    ),
+    (error) => error.code === "STORE_IDENTITY_REVIEW" && error.error_type === "store_identity_mismatch",
+  );
+});
+
+test("waits for manual review when a route alias has no explicit Store ID evidence", async () => {
+  const worker = makeWorkerHarness({
+    realTimers: true,
+    collectionResult: {
+      state: "failed",
+      error_type: "store_identity_unverified",
+      message: "网址路由 ID 1105182474 不同，页面 Store ID 未识别，无法确认是否为同一店铺",
+    },
+  });
+  const aliasUrl = "https://www.aliexpress.com/store/1105182474/pages/all-items.html?shop_sortType=orders_desc";
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: aliasUrl, active: true });
+
+  await assert.rejects(
+    worker.context.waitForStorePage(
+      tab.id,
+      "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc",
+      1000,
+      "1105179516",
+    ),
+    (error) => error.code === "STORE_IDENTITY_REVIEW" && error.error_type === "store_identity_unverified",
+  );
+});
+
+test("store identity review reports structured evidence without using the platform challenge endpoint", async () => {
+  const targetUrl = "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc";
+  const evidence = {
+    route_store_id: "1105179516",
+    heading_store_id: null,
+    labeled_store_ids: [],
+    page_title: "AMZSTEM Pop Toys Store - AliExpress",
+    ixspy_store_name: "AMZSTEM Pop Toys Store",
+    identity_method: "unverified",
+  };
+  const message = "页面未显示可确认店铺的 Store ID，请人工核实店铺身份后继续";
+  let now = 0;
+  const worker = makeWorkerHarness({ clockNow: () => now, collectionResult: {
+    state: "identity_review",
+    error_type: "store_identity_unverified",
+    message,
+    page_url: targetUrl,
+    evidence,
+  } });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: targetUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 817, run_id: 9, target_type: "STORE", target_url: targetUrl,
+      target_date: "2026-10-18", monitored_product_ids: ["1005001234567890"],
+      title: "Test store",
+    },
+    automationTabId: tab.id,
+    automationTaskKind: "STORE",
+    automationClaimToken: "claim-817",
+    browserCollectionWorkerMode: true,
+  });
+
+  await worker.context.processAutomationTabInternal(tab.id);
+
+  assert.equal(worker.storage.identityReviewPaused, true);
+  assert.equal(worker.storage.challengePaused, false);
+  const reviewRequest = worker.requests.find((request) => request.pathname.endsWith("/items/817/identity-review"));
+  assert.ok(reviewRequest);
+  assert.equal(reviewRequest.body.page_url, targetUrl);
+  assert.deepEqual(JSON.parse(JSON.stringify(reviewRequest.body.evidence)), evidence);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/817/challenge")), false);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/817/failure")), false);
+  assert.equal(worker.notifications.at(-1).title, "店铺身份待核验");
+});
+
+test("waitForStorePage accepts an alias only when the backend approved that exact page identity", async () => {
+  const targetStoreId = "1105179516";
+  const routeStoreId = "1105182474";
+  const url = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const approved = [{
+    route_store_id: routeStoreId,
+    normalized_page_identity: `www.aliexpress.com/store/${routeStoreId}/pages/all-items.html`,
+    evidence: { ixspy_store_name: "AMZSTEM Pop Toys Store" },
+  }];
+  let now = 0;
+  const worker = makeWorkerHarness({ clockNow: () => now, collectionResult: {
+    state: "ready",
+    platform_store_id: targetStoreId,
+    store_identity: {
+      target_store_id: targetStoreId,
+      route_store_id: routeStoreId,
+      page_url: url,
+      heading_store_id: null,
+      labeled_store_ids: [],
+      ixspy_store_name: "AMZSTEM Pop Toys Store",
+      identity_method: "backend_approved_url_alias",
+    },
+  } });
+  worker.context.setTimeout = (callback, delay) => { now += delay; callback(); return 0; };
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+
+  const page = await worker.context.waitForStorePage(tab.id, url, 1000, targetStoreId, approved);
+
+  assert.equal(page.storeId, routeStoreId);
+  assert.equal(page.store_identity.identity_method, "backend_approved_url_alias");
+  assert.deepEqual(worker.collectionMessages[0].approved_store_url_identities, approved);
+});
+
+test("waitForStorePage refuses an alias omitted from this store's backend identity list", async () => {
+  const targetStoreId = "1105179516";
+  const routeStoreId = "1105182474";
+  const url = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
+  let now = 0;
+  const worker = makeWorkerHarness({ clockNow: () => now, collectionResult: {
+    state: "identity_review",
+    error_type: "store_identity_unverified",
+    message: "店铺页面身份未核实",
+    page_url: url,
+    evidence: {
+      route_store_id: routeStoreId,
+      heading_store_id: null,
+      labeled_store_ids: [],
+      page_title: "AliExpress Store",
+      ixspy_store_name: null,
+      identity_method: "unverified",
+    },
+  } });
+  worker.context.setTimeout = (callback, delay) => { now += delay; callback(); return 0; };
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+
+  await assert.rejects(
+    worker.context.waitForStorePage(tab.id, url, 1000, targetStoreId, []),
+    (error) => error.code === "STORE_IDENTITY_REVIEW"
+      && error.error_type === "store_identity_unverified"
+      && error.evidence?.route_store_id === routeStoreId,
+  );
+});
+
+test("confirmed identity refreshes the alias and resumes the same collection tab", async () => {
+  const targetStoreId = "1105179516";
+  const routeStoreId = "1105182474";
+  const targetUrl = `https://www.aliexpress.com/store/${targetStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const aliasUrl = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const aliases = [{
+    route_store_id: routeStoreId,
+    normalized_page_identity: `www.aliexpress.com/store/${routeStoreId}/pages/all-items.html`,
+    evidence: { ixspy_store_name: "AMZSTEM Pop Toys Store" },
+  }];
+  const worker = makeWorkerHarness({
+    dashboardUrl: "http://127.0.0.1:3000/?browser_collection=1&browser_collection_profile=isolated",
+    queueItems: [{
+      id: 818,
+      target_type: "STORE",
+      target_url: targetUrl,
+      target_date: "2026-10-18",
+      title: "AMZSTEM Pop Toys Store",
+      monitored_product_ids: ["1005001234567890"],
+    }],
+    collectionResults: [
+      {
+        state: "identity_review",
+        error_type: "store_identity_unverified",
+        message: "待人工核实",
+        page_url: aliasUrl,
+        evidence: {
+          route_store_id: routeStoreId,
+          heading_store_id: null,
+          labeled_store_ids: [],
+          page_title: "AMZSTEM Pop Toys Store - AliExpress",
+          ixspy_store_name: "AMZSTEM Pop Toys Store",
+          identity_method: "unverified",
+        },
+      },
+      {
+        state: "ready",
+        page_result: {
+          platform_store_id: targetStoreId,
+          url: aliasUrl,
+          store_identity: {
+            target_store_id: targetStoreId,
+            route_store_id: routeStoreId,
+            page_url: aliasUrl,
+            heading_store_id: null,
+            labeled_store_ids: [],
+            ixspy_store_name: "AMZSTEM Pop Toys Store",
+            identity_method: "backend_approved_url_alias",
+          },
+          products: [{ platform_product_id: "1005001234567890", historical_sales: [] }],
+          has_next_page: false,
+          next_page_url: null,
+        },
+      },
+    ],
+  });
+  worker.storage.browserCollectionIsolatedProfileAuthorized = true;
+  await worker.context.syncDedicatedWorkerMode();
+  worker.queue[0].status = "RUNNING";
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: aliasUrl, active: true });
+  Object.assign(worker.storage, {
+    automationWindowId: 8,
+    automationWindowOwned: true,
+    automationWindowBackground: true,
+    automationItem: {
+      id: 818, run_id: 9, target_type: "STORE", target_url: targetUrl,
+      target_date: "2026-10-18", title: "AMZSTEM Pop Toys Store",
+      monitored_product_ids: ["1005001234567890"], monitored_products: [],
+    },
+    automationTabId: tab.id,
+    automationTaskKind: "STORE",
+    automationClaimToken: "claim-818",
+    browserCollectionWorkerMode: true,
+  });
+
+  await worker.context.processAutomationTabInternal(tab.id);
+  assert.equal(worker.storage.identityReviewPaused, true);
+  worker.confirmIdentityReview(818, aliases);
+  await worker.context.pollAutomation();
+  await worker.flush();
+
+  assert.notEqual(worker.storage.identityReviewPaused, true);
+  assert.equal(worker.collectionMessages.some((message) => message.target_type === "STORE"
+    && message.approved_store_url_identities?.[0]?.route_store_id === routeStoreId), true);
+  assert.equal(worker.collectionMessages.some((message) => message.tab_id === tab.id
+    && message.target_type === "STORE"
+    && message.approved_store_url_identities?.[0]?.route_store_id === routeStoreId), true);
+  assert.equal(worker.createdTabs.filter((created) => created.url === aliasUrl).length, 1);
+  assert.equal(worker.removedTabs.includes(tab.id), false);
+  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/818/store-discovery"));
+});
+
+test("store navigation waits for the pending target instead of rejecting the previously committed store", async () => {
+  const worker = makeWorkerHarness({ realTimers: true });
+  const previousUrl = "https://www.aliexpress.com/store/1105182474/pages/all-items.html?shop_sortType=orders_desc";
+  const targetUrl = "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc";
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: previousUrl, active: true });
+  tab.pendingUrl = targetUrl;
+  const navigation = worker.context.waitForStorePage(tab.id, targetUrl, 1000);
+  setTimeout(() => {
+    tab.url = targetUrl;
+    delete tab.pendingUrl;
+    tab.status = "complete";
+  }, 50);
+
+  await assert.doesNotReject(navigation);
+});
+
+test("store navigation recognizes an AliExpress challenge instead of timing out", async () => {
+  const worker = makeWorkerHarness({ realTimers: true });
+  const tab = await worker.chrome.tabs.create({
+    windowId: 8,
+    url: "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc",
+    active: true,
+  });
+  tab.status = "loading";
+  tab.pendingUrl = "https://www.aliexpress.com/punish?return=%2Fstore%2F1105179516%2Fpages%2Fall-items.html";
+
+  await assert.rejects(
+    worker.context.waitForStorePage(
+      tab.id,
+      "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc",
+      750,
+    ),
+    (error) => error.code === "PLATFORM_CHALLENGE",
+  );
+});
+
+test("store navigation allows slow Orders pages ninety seconds before failing", async () => {
+  let now = 0;
+  const worker = makeWorkerHarness({ clockNow: () => now });
+  const url = "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc";
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: "about:blank", active: true });
+  worker.context.setTimeout = (callback, delay) => {
+    now += delay;
+    callback();
+    return 0;
+  };
+
+  await assert.rejects(
+    worker.context.waitForStorePage(tab.id, url),
+    /店铺下一页未在限定时间内加载完成/,
+  );
+
+  assert.equal(now, 90 * 1000);
+});
+
+test("store discovery does not prefetch another store task", async () => {
+  const worker = makeWorkerHarness({
+    queueItems: [
+      { id: 101, target_type: "STORE", target_key: "store:1", target_url: "https://www.aliexpress.com/store/100001/pages/all-items.html?shop_sortType=orders_desc" },
+      { id: 102, target_type: "STORE", target_key: "store:2", target_url: "https://www.aliexpress.com/store/100002/pages/all-items.html?shop_sortType=orders_desc" },
+    ],
+  });
+  worker.storage.automationItem = { id: 101, target_type: "STORE", target_key: "store:1" };
+  worker.storage.automationTaskKind = "PRODUCT";
+  worker.storage.automationWindowId = 7;
+
+  await worker.context.prefetchNextBrowserItem({ status: "RUNNING", phase: "STORE_DISCOVERY" });
+
+  assert.equal(worker.requests.filter((request) => request.pathname === "/api/browser-collection/items/claim").length, 0);
+  assert.equal(worker.queue[1].status, "PENDING");
+  assert.equal(worker.storage.prefetchedItem, undefined);
 });
 
 test("prefetch is capped at one inactive product page and never samples its hidden IXSPY chart", async () => {
@@ -1174,7 +2284,7 @@ test("a content-script hang is bounded and the item is returned for retry", asyn
   assert.match(failure.body.error_message, /90 秒/);
 });
 
-test("store-page batch gets a longer bounded response window", async () => {
+test("store-page batch response window exceeds the candidate scan budget", async () => {
   const worker = makeWorkerHarness({
     collectionResult: new Promise(() => {}),
     queueItems: [{
@@ -1192,7 +2302,7 @@ test("store-page batch gets a longer bounded response window", async () => {
   worker.listeners.updated.callback(tab.id, { status: "complete" }, tab);
   await worker.flush();
 
-  assert.ok(worker.pendingTimers.some((timer) => timer.delay === 10 * 60 * 1000));
+  assert.ok(worker.pendingTimers.some((timer) => timer.delay === 18 * 60 * 1000));
   assert.equal(worker.pendingTimers.some((timer) => timer.delay === 90 * 1000), false);
   assert.equal(worker.collectionMessages[0].target_type, "STORE");
   assert.deepEqual(JSON.parse(JSON.stringify(worker.collectionMessages[0].monitored_product_ids)), ["1005000000000001"]);
@@ -1258,8 +2368,116 @@ test("manual start leaves the dashboard window alone and maximizes the focused w
   assert.equal(worker.windowUpdates.some((update) => update.id === 7 && update.focused === true), false);
 });
 
+test("a stale worker-window id that points at the dashboard is replaced with a separate task window", async () => {
+  const worker = makeWorkerHarness({
+    queueItems: [{ id: 101, target_type: "STORE", target_url: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc", target_date: "2026-09-29" }],
+  });
+  Object.assign(worker.storage, {
+    browserCollectionIsolatedProfileAuthorized: true,
+    automationDashboardTabId: 1,
+    automationWindowId: 7,
+    automationWindowOwned: true,
+    automationWindowBackground: true,
+    automationTabGroupId: 77,
+    automationTabGroupWindowId: 7,
+  });
+
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.equal(worker.windowCreates.length, 1, "does not reuse the dashboard's Chrome window");
+  assert.equal(worker.storage.automationWindowId, 8);
+  assert.equal((await worker.chrome.tabs.get(worker.storage.automationTabId)).windowId, 8);
+  assert.equal(worker.storage.automationTabGroupWindowId, 8, "creates the task group in the dedicated worker window");
+  assert.ok(await worker.chrome.tabs.get(1), "keeps the dashboard open");
+});
+
+test("an in-flight task tab left in the dashboard window is migrated before collection resumes", async () => {
+  let finishCollection;
+  const collectionGate = new Promise((resolve) => { finishCollection = resolve; });
+  const worker = makeWorkerHarness({ collectionResult: collectionGate });
+  const task = worker.queue[0];
+  task.target_type = "PRODUCT";
+  task.target_url = "https://www.aliexpress.com/item/100000000101.html";
+  task.status = "RUNNING";
+  const taskTab = await worker.chrome.tabs.create({
+    windowId: 7,
+    url: task.target_url,
+    active: true,
+  });
+  const prefetchedItem = worker.queue[1];
+  prefetchedItem.status = "RUNNING";
+  const prefetchedTab = await worker.chrome.tabs.create({
+    windowId: 7,
+    url: prefetchedItem.target_url,
+    active: false,
+  });
+  Object.assign(worker.storage, {
+    automationDashboardTabId: 1,
+    automationWindowId: 7,
+    automationWindowOwned: true,
+    automationWindowBackground: true,
+    automationTabId: taskTab.id,
+    automationItem: task,
+    automationClaimToken: "in-flight-claim",
+    automationTaskKind: "PRODUCT",
+    prefetchedTabId: prefetchedTab.id,
+    prefetchedItem,
+    prefetchedClaimToken: "prefetched-claim",
+    prefetchedTaskKind: "PRODUCT",
+  });
+
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  const migratedTaskTab = await worker.chrome.tabs.get(taskTab.id);
+  assert.ok(migratedTaskTab, "keeps the in-flight product tab open");
+  assert.equal(migratedTaskTab.windowId, 8,
+    "moves the already-open product page out of the dashboard window");
+  assert.equal((await worker.chrome.tabs.get(prefetchedTab.id)).windowId, 8,
+    "moves the prefetched page into the same collector window");
+  assert.equal((await worker.chrome.tabs.get(1)).windowId, 7, "leaves the dashboard in its original window");
+  assert.equal(worker.storage.automationTabId, taskTab.id, "preserves the current claim and task tab");
+  assert.equal(worker.storage.prefetchedTabId, prefetchedTab.id, "preserves the prefetched claim and tab");
+  assert.equal(worker.storage.automationTabGroupWindowId, 8, "recreates task grouping in the collector window");
+  assert.ok(worker.collectionMessages.length > 0, "resumes collection in the migrated page");
+  finishCollection({ state: "partial", payload: {} });
+  await worker.flush();
+});
+
+test("does not collect an in-flight task from the dashboard window if migration fails", async () => {
+  const worker = makeWorkerHarness();
+  const task = worker.queue[0];
+  task.status = "RUNNING";
+  const taskTab = await worker.chrome.tabs.create({
+    windowId: 7,
+    url: task.target_url,
+    active: true,
+  });
+  Object.assign(worker.storage, {
+    automationDashboardTabId: 1,
+    automationWindowId: 7,
+    automationWindowOwned: true,
+    automationWindowBackground: true,
+    automationTabId: taskTab.id,
+    automationItem: task,
+    automationClaimToken: "in-flight-claim",
+    automationTaskKind: "PRODUCT",
+  });
+  worker.chrome.tabs.move = async () => { throw new Error("simulated Chrome tab move failure"); };
+
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.equal((await worker.chrome.tabs.get(taskTab.id)).windowId, 7);
+  assert.deepEqual(worker.collectionMessages, [], "never reads IXSPY in the dashboard window as a fallback");
+  assert.equal(worker.storage.automationItem.id, task.id, "keeps the claimed task for a later migration retry");
+});
+
 test("selected collector uses a maximized foreground window without replacing the dashboard", async () => {
-  const worker = makeWorkerHarness({ dedicatedProfile: false });
+  const worker = makeWorkerHarness({
+    dashboardUrl: "http://127.0.0.1:3000/?browser_collection=1&browser_collection_profile=isolated",
+  });
   worker.listeners.message.callback({
     type: "dashboard-context",
     browser_collection_mode: true,
@@ -1310,8 +2528,8 @@ test("keeps the selected collector window in front while collection is running",
   finishCollection({ state: "ready", payload: { sold_count: 20, captured_at: "2026-09-30T10:00:00+08:00" } });
   await worker.flush();
   const finalWorkerUpdate = worker.windowUpdates.filter((update) => update.id === 8).at(-1);
-  assert.equal(finalWorkerUpdate.state, "minimized", "the worker backgrounds only after collection finishes");
-  assert.equal(finalWorkerUpdate.focused, false);
+  assert.equal(finalWorkerUpdate.state, "maximized", "the worker remains visible after collection finishes");
+  assert.equal(finalWorkerUpdate.focused, true);
 });
 
 test("verification restores the maximized worker window and shows the challenge tab", async () => {
@@ -1337,8 +2555,8 @@ test("verification restores the maximized worker window and shows the challenge 
   assert.ok(worker.updatedTabs.some((update) => update.id === challengeTab.id && update.active === true));
   assert.equal(worker.removedTabs.includes(challengeTab.id), false,
     "keeps the challenge page open for human verification");
-  assert.equal(worker.removedTabs.length, 0, "recycles the unused prefetched page as the idle blank tab");
-  assert.equal((await worker.chrome.tabs.get(worker.storage.idleAutomationTabId)).url, "about:blank");
+  assert.deepEqual(worker.removedTabs, [11], "removes the prefetched page while keeping the verification page open");
+  assert.equal(worker.storage.idleAutomationTabId, undefined);
   assert.equal(worker.queue.find((item) => item.id === 102).status, "PENDING",
     "returns the prefetched task to pending when verification interrupts the pipeline");
   const restore = worker.windowUpdates.find((update) => update.id === 8 && update.focused === true);
@@ -1368,6 +2586,20 @@ test("store verification resumes with identity probe instead of legacy first-20 
   worker.listeners.updated.callback(tab.id, { status: "complete" }, tab);
   await worker.flush();
 
+  const identityProbeCountBeforeBlank = worker.collectionMessages
+    .filter((message) => message.target_type === "STORE_IDENTITY").length;
+  tab.url = "about:blank";
+  tab.status = "complete";
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+  assert.equal(worker.updatedTabs.some((update) => update.id === tab.id && update.url === url), true,
+    "restores a blank tab before sending the store identity probe");
+  assert.equal(worker.collectionMessages.filter((message) => message.target_type === "STORE_IDENTITY").length,
+    identityProbeCountBeforeBlank,
+    "does not probe a blank page after verification");
+
+  worker.listeners.updated.callback(tab.id, { status: "complete", url }, tab);
+  await worker.flush();
   worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
   await worker.flush();
 
@@ -1375,10 +2607,130 @@ test("store verification resumes with identity probe instead of legacy first-20 
     ["STORE", "STORE_IDENTITY", "STORE"]);
   assert.equal(worker.collectionMessages.filter((message) => message.target_type === "STORE"
     && !message.monitored_product_ids).length, 0);
-  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/store-discovery"));
+  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/store-discovery"),
+    JSON.stringify({ requests: worker.requests.map(({ pathname, method, body }) => ({ pathname, method, body })),
+      collectionMessages: worker.collectionMessages, storage: worker.storage }));
   assert.ok(worker.windowUpdates.some((update) => update.id === 8
     && update.focused === true && update.state === "maximized"),
   "store collection and its verification page use the maximized worker window");
+});
+
+test("stored Store ID proof resumes collection on the route alias without canonical navigation", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const aliasUrl = "https://www.aliexpress.com/store/123457/pages/all-items.html?shop_sortType=orders_desc";
+  const targetIds = Array.from({ length: 20 }, (_, index) => `10050000000000${index + 1}`).sort();
+  const identity = {
+    target_store_id: "123456",
+    route_store_id: "123457",
+    heading_store_id: "123456",
+    page_url: aliasUrl,
+  };
+  const worker = makeWorkerHarness({ collectionResult: {
+    state: "ready",
+    page_result: {
+      platform_store_id: "123456",
+      url: aliasUrl,
+      store_identity: identity,
+      products: targetIds.map((platform_product_id) => ({ platform_product_id, historical_sales: [] })),
+      has_next_page: false,
+      next_page_url: null,
+    },
+  } });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: aliasUrl, active: true });
+  const item = {
+    id: 101, run_id: 9, target_type: "STORE", target_url: url,
+    target_date: "2026-09-29", monitored_product_ids: targetIds, monitored_products: [],
+  };
+  worker.storage["browserCollectionStoreProgress:101"] = {
+    run_id: 9, item_id: 101, store_id: "123456", target_date: "2026-09-29",
+    target_ids: targetIds, products: {}, visited_page_urls: [], page_scans: [], chart_reads: [],
+    route_store_id: "123457", store_identity: identity,
+  };
+
+  const collecting = worker.context.collectStorePages(tab.id, item);
+  await worker.flush();
+
+  assert.ok(worker.collectionMessages.some((message) => message.target_type === "STORE"
+    && message.verified_store_identity?.heading_store_id === "123456"));
+  const result = await collecting;
+  assert.equal(result.state, "ready");
+  assert.equal(result.payload.platform_store_id, "123456");
+  assert.equal(worker.updatedTabs.some((update) => update.id === tab.id && update.url === url), false);
+});
+
+test("store verification resumes in the same tab without minimizing or blanking it", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({
+    queueItems: [{ id: 101, target_type: "STORE", target_url: url, target_date: "2026-09-29",
+      monitored_product_ids: ["1005000000000001"] }],
+    collectionResults: [
+      { state: "challenge", message: "verification" },
+      { state: "ready", platform_store_id: "123456" },
+      { state: "ready", page_result: { platform_store_id: "123456", url,
+        products: [{ platform_product_id: "1005000000000001", historical_sales: [] }],
+        has_next_page: false, next_page_url: null } },
+    ],
+  });
+  worker.storage.browserCollectionIsolatedProfileAuthorized = true;
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+  const tab = await worker.chrome.tabs.get(worker.storage.automationTabId);
+  worker.listeners.updated.callback(tab.id, { status: "complete" }, tab);
+  await worker.flush();
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/challenge"));
+  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/store-discovery"));
+  assert.equal((await worker.chrome.tabs.get(tab.id)).url, url, "keeps the verified store page instead of replacing it with about:blank");
+  assert.equal(worker.storage.idleAutomationTabId, tab.id);
+  const finalWindowUpdate = worker.windowUpdates.filter((update) => update.id === 8).at(-1);
+  assert.equal(finalWindowUpdate.focused, true);
+  assert.equal(finalWindowUpdate.state, "maximized");
+});
+
+test("resuming a verified queue preserves its current store tab instead of reopening the store", async () => {
+  const url = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({
+    queueItems: [{ id: 101, target_type: "STORE", target_url: url, target_date: "2026-09-29",
+      monitored_product_ids: ["1005000000000001"] }],
+    collectionResults: [
+      { state: "challenge", message: "verification" },
+      { state: "challenge", message: "verification still active" },
+    ],
+  });
+  worker.storage.browserCollectionIsolatedProfileAuthorized = true;
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+  const tabId = worker.storage.automationTabId;
+  const tab = await worker.chrome.tabs.get(tabId);
+  worker.listeners.updated.callback(tab.id, { status: "complete" }, tab);
+  await worker.flush();
+  assert.equal(worker.storage.challengePaused, true);
+  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/challenge"));
+
+  worker.setCollectionResult({ state: "ready", platform_store_id: "123456", page_result: {
+    platform_store_id: "123456",
+    url,
+    products: [{ platform_product_id: "1005000000000001", historical_sales: [] }],
+    has_next_page: false,
+    next_page_url: null,
+  } });
+  const storeNavigationsBeforeResume = worker.updatedTabs
+    .filter((update) => update.id === tabId && update.url === url).length;
+  const createdTabsBeforeResume = worker.createdTabs.length;
+  worker.resumeChallenge();
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.equal(worker.storage.automationTabId || worker.storage.idleAutomationTabId, tabId);
+  assert.equal(worker.removedTabs.includes(tabId), false);
+  assert.equal(worker.updatedTabs.filter((update) => update.id === tabId && update.url === url).length,
+    storeNavigationsBeforeResume,
+    "does not navigate back to the store URL after the same tab passed verification");
+  assert.equal(worker.createdTabs.length, createdTabsBeforeResume,
+    "does not open a second tab for the same store task");
+  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/store-discovery"));
 });
 
 test("IXSPY login expiry foregrounds the visible login page, pauses safely, and resumes the same item", async () => {
@@ -1398,7 +2750,7 @@ test("IXSPY login expiry foregrounds the visible login page, pauses safely, and 
   const loginTab = await worker.chrome.tabs.get(worker.storage.automationTabId);
   worker.listeners.updated.callback(loginTab.id, { status: "complete" }, loginTab);
   await worker.flush();
-  const prefetchedTabId = worker.storage.idleAutomationTabId;
+  const prefetchedTabId = worker.createdTabs.find((candidate) => candidate.id !== loginTab.id)?.id;
 
   assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/challenge"
     && /IXSPY 登录已过期/.test(request.body.error_message)));
@@ -1407,9 +2759,8 @@ test("IXSPY login expiry foregrounds the visible login page, pauses safely, and 
   assert.equal(worker.windowCreates.length, 1, "keeps the task page in the worker window");
   assert.equal(worker.queue.find((item) => item.id === 102).status, "PENDING",
     "returns the prefetched task to the queue while login is pending");
-  assert.ok(worker.removedTabs.includes(prefetchedTabId) === false,
-    "recycles the unused prefetched page as the idle blank tab");
-  assert.equal((await worker.chrome.tabs.get(prefetchedTabId)).url, "about:blank");
+  assert.ok(worker.removedTabs.includes(prefetchedTabId), "closes the unused prefetched page without touching the login page");
+  assert.equal(worker.storage.idleAutomationTabId, undefined);
   assert.equal(worker.removedTabs.includes(loginTab.id), false, "keeps the page open while login is pending");
   assert.equal(worker.notifications.some((notice) => notice.title === "IXSPY 需要登录" && notice.requireInteraction), true);
   assert.ok(worker.updatedTabs.some((update) => update.id === loginTab.id && update.active === true));
@@ -1423,7 +2774,7 @@ test("IXSPY login expiry foregrounds the visible login page, pauses safely, and 
   await worker.flush();
 
   assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/101/snapshot"));
-  assert.ok(worker.removedTabs.includes(loginTab.id), "closes the product tab after the resumed item succeeds");
+  assert.equal(worker.removedTabs.includes(loginTab.id), false, "retains the successful page instead of replacing it with a blank tab");
   assert.equal(Boolean(worker.storage.challengeProvider), false);
 });
 
@@ -1474,17 +2825,16 @@ test("polling recovers a challenge page that was already open during extension r
 });
 
 test("alarm wake restores persisted worker mode after the MV3 service worker restarts", async () => {
-  const worker = makeWorkerHarness({ dedicatedProfile: false });
-  const dashboard = await worker.chrome.tabs.get(1);
-  dashboard.url = "http://127.0.0.1:3000/";
-  worker.storage.browserCollectionIsolatedProfileAuthorized = true;
+  const worker = makeWorkerHarness({
+    dashboardUrl: "http://127.0.0.1:3000/?browser_collection=1&browser_collection_profile=isolated",
+  });
 
   worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
   await worker.flush();
 
   assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/heartbeat"));
   assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/claim"));
-  assert.equal(worker.windowCreates.length, 1, "the alarm wake resumes in a background worker window");
+  assert.equal(worker.windowCreates.length, 1, "the alarm wake resumes in the dedicated worker window");
 });
 
 test("alarm wake discovers a LAN dashboard and polls its same-origin API", async () => {
@@ -1505,13 +2855,13 @@ test("alarm wake discovers a LAN dashboard and polls its same-origin API", async
 });
 
 test("authorized worker collection uses a maximized foreground window without resizing the dashboard", async () => {
-  const worker = makeWorkerHarness({ dedicatedProfile: false });
+  const worker = makeWorkerHarness({
+    dashboardUrl: "http://127.0.0.1:3000/?browser_collection=1&browser_collection_profile=isolated",
+  });
   await worker.flush();
-  worker.storage.browserCollectionIsolatedProfileAuthorized = true;
   worker.storage.automationWindowId = 88;
   worker.storage.automationWindowOwned = true;
-  const dashboard = await worker.chrome.tabs.get(1);
-  dashboard.url = "http://127.0.0.1:3000/";
+  worker.storage.automationDashboardTabId = 1;
 
   worker.chrome.runtime.onStartup.callback();
   await worker.flush();

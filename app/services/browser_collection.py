@@ -7,6 +7,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, object_session
 
 from app.core.config import get_settings
@@ -20,15 +21,17 @@ from app.db.models import (
     ProductSnapshot,
     Store,
     StorePageDiscoveryState,
+    StoreUrlIdentity,
 )
 from app.services.store_page_discovery import get_or_create_store_page_discovery_state
+from app.services.store_identity import normalize_store_orders_identity
 
 
 ITEM_TERMINAL_STATUSES = {"SUCCEEDED", "PARTIAL", "FAILED", "SKIPPED"}
 RUN_ACTIVE_STATUSES = {"PENDING", "RUNNING", "NEEDS_VERIFICATION"}
 LEASE_DURATION = timedelta(minutes=5)
 MAX_ITEM_RUNTIME = timedelta(minutes=5)
-MAX_STORE_ITEM_RUNTIME = timedelta(minutes=12)
+MAX_STORE_ITEM_RUNTIME = timedelta(minutes=20)
 HEARTBEAT_FRESHNESS = timedelta(minutes=2)
 MANUAL_CANCEL_REASON = "manual_cancel"
 
@@ -62,6 +65,12 @@ def _browser_control_row(db: Session, *, lock: bool = False) -> BrowserCollectio
 def _worker_is_online(worker: BrowserCollectionWorker | None, now: datetime) -> bool:
     heartbeat = _aware(worker.last_heartbeat_at) if worker else None
     return bool(heartbeat and now - heartbeat <= HEARTBEAT_FRESHNESS)
+
+
+def _pool_reset_owns_browser(db: Session) -> bool:
+    from app.services.store_pool_reset import pool_reset_dispatch_active
+
+    return pool_reset_dispatch_active(db)
 
 
 def _store_collection_id(store: Store) -> str | None:
@@ -197,6 +206,7 @@ def browser_collection_control_status(db: Session) -> dict:
             "worker_id": worker.worker_id,
             "label": worker.label,
             "extension_version": worker.extension_version,
+            "capabilities": worker.capabilities or [],
             "last_heartbeat_at": worker.last_heartbeat_at,
             "online": _worker_is_online(worker, now),
         }
@@ -542,9 +552,11 @@ def _release_unresponsive_items(
 def start_browser_collection_run(
     db: Session, run: BrowserCollectionRun | None = None
 ) -> BrowserCollectionRun:
+    control = _browser_control_row(db, lock=True)
+    if _pool_reset_owns_browser(db):
+        raise ValueError("监控池重建任务正在占用采集电脑")
     if run is None:
         run = ensure_browser_collection_run(db, trigger="MANUAL")
-    control = _browser_control_row(db, lock=True)
     run = db.scalar(
         select(BrowserCollectionRun).where(BrowserCollectionRun.id == run.id).with_for_update()
     )
@@ -566,12 +578,20 @@ def start_browser_collection_run(
 
     for item in run.items:
         if item.status == "NEEDS_VERIFICATION":
-            item.status = "PENDING"
-            item.claimed_at = None
-            item.lease_expires_at = None
-            item.claimed_worker_id = None
-            item.claim_token = None
-            item.completed_at = None
+            same_worker_claim = (
+                item.claimed_worker_id == control.selected_worker_id
+                and bool(item.claim_token)
+            )
+            if same_worker_claim:
+                item.status = "RUNNING"
+                item.lease_expires_at = now + LEASE_DURATION
+            else:
+                item.status = "PENDING"
+                item.claimed_at = None
+                item.lease_expires_at = None
+                item.claimed_worker_id = None
+                item.claim_token = None
+                item.completed_at = None
             item.error_type = None
             item.error_message = None
 
@@ -602,9 +622,13 @@ def start_browser_collection_run(
 
 def claim_next_item(
     db: Session, worker_id: str | None = None
-) -> tuple[BrowserCollectionRun, BrowserCollectionItem | None]:
-    run = ensure_browser_collection_run(db, trigger="CATCH_UP")
+) -> tuple[BrowserCollectionRun | None, BrowserCollectionItem | None]:
     control = _browser_control_row(db, lock=True)
+    if _pool_reset_owns_browser(db):
+        run = get_today_run(db)
+        db.commit()
+        return run, None
+    run = ensure_browser_collection_run(db, trigger="CATCH_UP")
     run = db.scalar(
         select(BrowserCollectionRun).where(BrowserCollectionRun.id == run.id).with_for_update()
     )
@@ -715,7 +739,31 @@ def fail_item(
             error_type=error_type,
             error_message=error_message,
         )
-    if item.attempt_count < 2:
+    if error_type == "store_identity_mismatch":
+        run = item.run
+        has_remaining_work = any(
+            candidate.id != item.id
+            and candidate.status in {"PENDING", "RUNNING", "NEEDS_VERIFICATION"}
+            for candidate in run.items
+        )
+        result = finish_item(
+            db,
+            item,
+            "FAILED",
+            error_type=error_type,
+            error_message=error_message,
+            commit=not has_remaining_work,
+        )
+        if has_remaining_work and result.status == "RUNNING":
+            result.status = "PAUSED"
+            result.paused_reason = "store_identity_mismatch"
+            result.dispatch_enabled = False
+            result.completed_at = None
+            db.commit()
+            db.refresh(result)
+        return result
+    retryable = item.target_type != "STORE" or error_type == "page_not_ready"
+    if retryable and item.attempt_count < 2:
         item.status = "PENDING"
         item.claimed_at = None
         item.lease_expires_at = None
@@ -761,6 +809,260 @@ def pause_for_challenge(
     run.status = "NEEDS_VERIFICATION"
     run.paused_reason = "platform_challenge"
     run.dispatch_enabled = False
+    _refresh_counts(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def record_store_identity_review(
+    db: Session,
+    item: BrowserCollectionItem,
+    page_url: str,
+    error_type: str,
+    error_message: str,
+    evidence: dict,
+    *,
+    worker_id: str,
+    claim_token: str,
+) -> BrowserCollectionRun:
+    if error_type not in {"store_identity_mismatch", "store_identity_unverified"}:
+        raise ValueError("Invalid store identity review reason")
+    route_store_id, normalized_identity = normalize_store_orders_identity(page_url)
+    if evidence.get("route_store_id") != route_store_id:
+        raise ValueError("Store route ID does not match the observed page URL")
+
+    _browser_control_row(db, lock=True)
+    run = db.scalar(
+        select(BrowserCollectionRun)
+        .where(BrowserCollectionRun.id == item.run_id)
+        .with_for_update()
+    )
+    if run is None:
+        raise ValueError("Browser collection run not found")
+    claimed_item = db.scalar(
+        select(BrowserCollectionItem)
+        .where(BrowserCollectionItem.id == item.id)
+        .with_for_update()
+    )
+    if claimed_item is None or claimed_item.run_id != run.id:
+        raise ValueError("Browser collection item not found")
+    try:
+        validate_browser_collection_claim(
+            db, claimed_item.id, worker_id, claim_token, lock=False
+        )
+    except ValueError:
+        db.rollback()
+        raise
+    if (
+        claimed_item.target_type != "STORE"
+        or claimed_item.store_id is None
+        or claimed_item.status != "RUNNING"
+        or run.status != "RUNNING"
+        or not run.dispatch_enabled
+        or run.paused_reason is not None
+    ):
+        raise ValueError("This store task is no longer eligible for identity review")
+    another_running_item = db.scalar(
+        select(BrowserCollectionItem.id)
+        .where(
+            BrowserCollectionItem.run_id == run.id,
+            BrowserCollectionItem.id != claimed_item.id,
+            BrowserCollectionItem.status == "RUNNING",
+        )
+        .limit(1)
+    )
+    if another_running_item is not None:
+        raise ValueError("Another collection item is still active")
+
+    review_evidence = dict(evidence)
+    review_evidence["identity_error_type"] = error_type
+    claimed_item.identity_review_url = page_url
+    claimed_item.identity_review_evidence = review_evidence
+    claimed_item.status = "NEEDS_VERIFICATION"
+    claimed_item.error_type = "store_identity_review"
+    claimed_item.error_message = error_message
+    claimed_item.lease_expires_at = utcnow() + LEASE_DURATION
+    run.status = "NEEDS_VERIFICATION"
+    run.paused_reason = "store_identity_review"
+    run.dispatch_enabled = False
+    _refresh_counts(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def _locked_identity_review_context(
+    db: Session, item_id: int
+) -> tuple[BrowserCollectionControl, BrowserCollectionRun, BrowserCollectionItem]:
+    control = _browser_control_row(db, lock=True)
+    item_ref = db.get(BrowserCollectionItem, item_id)
+    if item_ref is None:
+        raise ValueError("Browser collection item not found")
+    run = db.scalar(
+        select(BrowserCollectionRun)
+        .where(BrowserCollectionRun.id == item_ref.run_id)
+        .with_for_update()
+    )
+    item = db.scalar(
+        select(BrowserCollectionItem)
+        .where(BrowserCollectionItem.id == item_id)
+        .with_for_update()
+    )
+    if run is None or item is None or item.run_id != run.id:
+        raise ValueError("Browser collection item not found")
+    return control, run, item
+
+
+def _require_current_identity_review(
+    db: Session, run: BrowserCollectionRun, item: BrowserCollectionItem
+) -> None:
+    if (
+        item.target_type != "STORE"
+        or item.store_id is None
+        or item.status != "NEEDS_VERIFICATION"
+        or item.error_type != "store_identity_review"
+        or not item.identity_review_url
+        or not isinstance(item.identity_review_evidence, dict)
+        or run.status != "NEEDS_VERIFICATION"
+        or run.paused_reason != "store_identity_review"
+        or run.dispatch_enabled
+    ):
+        raise ValueError("This item is not the current store identity review")
+
+    current_item_id = db.scalar(
+        select(BrowserCollectionItem.id)
+        .where(
+            BrowserCollectionItem.run_id == run.id,
+            BrowserCollectionItem.status.in_(["RUNNING", "NEEDS_VERIFICATION"]),
+        )
+        .order_by(BrowserCollectionItem.position, BrowserCollectionItem.id)
+        .limit(1)
+    )
+    if current_item_id != item.id:
+        raise ValueError("This item is no longer the current collection task")
+
+
+def _identity_review_route(item: BrowserCollectionItem) -> tuple[str, str]:
+    if not item.identity_review_url or not isinstance(item.identity_review_evidence, dict):
+        raise ValueError("Store identity review evidence is missing")
+    route_store_id, normalized_identity = normalize_store_orders_identity(
+        item.identity_review_url
+    )
+    if item.identity_review_evidence.get("route_store_id") != route_store_id:
+        raise ValueError("Store route ID does not match the reviewed evidence")
+    return route_store_id, normalized_identity
+
+
+def confirm_store_identity_review(db: Session, item_id: int) -> BrowserCollectionRun:
+    control, run, item = _locked_identity_review_context(db, item_id)
+    route_store_id, normalized_identity = _identity_review_route(item)
+
+    previously_approved = db.scalar(
+        select(StoreUrlIdentity).where(StoreUrlIdentity.source_item_id == item.id)
+    )
+    if previously_approved is not None:
+        if (
+            previously_approved.store_id != item.store_id
+            or previously_approved.route_store_id != route_store_id
+            or previously_approved.normalized_page_identity != normalized_identity
+        ):
+            raise ValueError("This task was already confirmed for a different identity")
+        db.commit()
+        db.refresh(run)
+        return run
+
+    _require_current_identity_review(db, run, item)
+    selected_worker_id = control.selected_worker_id
+    selected_worker = db.get(BrowserCollectionWorker, selected_worker_id) if selected_worker_id else None
+    now = utcnow()
+    if not _worker_is_online(selected_worker, now):
+        raise ValueError("所选采集电脑当前离线，请连接后再确认店铺身份")
+
+    by_route = db.scalar(
+        select(StoreUrlIdentity).where(StoreUrlIdentity.route_store_id == route_store_id)
+    )
+    by_identity = db.scalar(
+        select(StoreUrlIdentity).where(
+            StoreUrlIdentity.normalized_page_identity == normalized_identity
+        )
+    )
+    if by_route is not None and by_identity is not None and by_route.id != by_identity.id:
+        raise ValueError("该店铺页面身份已与另一条监控记录冲突")
+    existing = by_route or by_identity
+    if existing is not None:
+        if (
+            existing.store_id != item.store_id
+            or existing.route_store_id != route_store_id
+            or existing.normalized_page_identity != normalized_identity
+        ):
+            raise ValueError("该店铺页面身份已绑定到其他监控店铺")
+    else:
+        db.add(
+            StoreUrlIdentity(
+                store_id=item.store_id,
+                route_store_id=route_store_id,
+                normalized_page_identity=normalized_identity,
+                first_observed_url=item.identity_review_url,
+                evidence=dict(item.identity_review_evidence),
+                source_item_id=item.id,
+                approved_at=now,
+            )
+        )
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            raise ValueError("该店铺页面身份已被其他监控店铺确认") from exc
+
+    same_live_worker_claim = (
+        item.claimed_worker_id == selected_worker_id
+        and bool(item.claim_token)
+        and (_aware(item.lease_expires_at) or now) > now
+    )
+    if same_live_worker_claim:
+        item.status = "RUNNING"
+        item.lease_expires_at = now + LEASE_DURATION
+    else:
+        item.status = "PENDING"
+        item.claimed_at = None
+        item.lease_expires_at = None
+        item.claimed_worker_id = None
+        item.claim_token = None
+    item.completed_at = None
+    item.error_type = None
+    item.error_message = None
+    run.status = "RUNNING"
+    run.paused_reason = None
+    run.dispatch_enabled = True
+    run.completed_at = None
+    run.started_at = run.started_at or now
+    _advance_run(db, run)
+    run.dispatch_enabled = True
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def reject_store_identity_review(db: Session, item_id: int) -> BrowserCollectionRun:
+    _, run, item = _locked_identity_review_context(db, item_id)
+    if item.status == "FAILED" and item.error_type == "store_identity_rejected":
+        db.commit()
+        db.refresh(run)
+        return run
+    _require_current_identity_review(db, run, item)
+    now = utcnow()
+    item.status = "FAILED"
+    item.error_type = "store_identity_rejected"
+    item.error_message = "人工审核判定该页面不属于此监控店铺"
+    item.completed_at = now
+    item.lease_expires_at = None
+    item.claimed_worker_id = None
+    item.claim_token = None
+    run.status = "PAUSED"
+    run.paused_reason = "store_identity_rejected"
+    run.dispatch_enabled = False
+    run.completed_at = None
     _refresh_counts(run)
     db.commit()
     db.refresh(run)
@@ -845,11 +1147,14 @@ def retry_item(db: Session, item: BrowserCollectionItem) -> BrowserCollectionRun
     item.snapshot_id = None
     run = item.run
     run.phase = "STORE_DISCOVERY" if item.target_type == "STORE" else "PRODUCT_COLLECTION"
-    if run.status != "PAUSED":
+    verification_blocked = run.status == "NEEDS_VERIFICATION"
+    if run.status not in {"PAUSED", "NEEDS_VERIFICATION"}:
         run.status = "RUNNING" if run.started_at else "PENDING"
     run.completed_at = None
-    if run.status != "PAUSED":
+    if run.status not in {"PAUSED", "NEEDS_VERIFICATION"}:
         run.paused_reason = None
+    if verification_blocked:
+        run.dispatch_enabled = False
     _refresh_counts(run)
     db.commit()
     db.refresh(run)
@@ -892,6 +1197,7 @@ def record_heartbeat(
     worker_id: str | None = None,
     worker_label: str | None = None,
     extension_version: str | None = None,
+    capabilities: list[str] | None = None,
 ) -> BrowserCollectionRun:
     claimed_items = [
         (validate_browser_collection_claim(db, item_id, worker_id, claim_token), claim_token)
@@ -907,6 +1213,7 @@ def record_heartbeat(
                 worker_id=worker_id,
                 label=(worker_label or "Chrome采集器").strip() or "Chrome采集器",
                 extension_version=extension_version,
+                capabilities=capabilities or [],
                 last_heartbeat_at=now,
             )
             db.add(worker)
@@ -914,6 +1221,7 @@ def record_heartbeat(
             if worker_label and worker_label.strip():
                 worker.label = worker_label.strip()
             worker.extension_version = extension_version or worker.extension_version
+            worker.capabilities = list(capabilities or [])
             worker.last_heartbeat_at = now
     _release_unresponsive_items(run, now, check_lease=False)
     for item, claim_token in claimed_items:
@@ -933,13 +1241,36 @@ def record_heartbeat(
 def serialize_item(item: BrowserCollectionItem, *, include_targets: bool = False) -> dict:
     title = item.product.title if item.product else item.store.name if item.store else None
     targets: list[str] = []
+    target_products: list[dict[str, str | None]] = []
     discovery_page_url = None
+    approved_store_url_identities: list[dict] = []
+    if item.target_type == "STORE" and item.store_id is not None:
+        session = object_session(item)
+        if session is not None:
+            approved_store_url_identities = [
+                {
+                    "route_store_id": identity.route_store_id,
+                    "normalized_page_identity": identity.normalized_page_identity,
+                    "evidence": identity.evidence or {},
+                }
+                for identity in session.scalars(
+                    select(StoreUrlIdentity)
+                    .where(StoreUrlIdentity.store_id == item.store_id)
+                    .order_by(StoreUrlIdentity.id)
+                )
+            ]
     if include_targets and item.target_type == "STORE" and item.store_id is not None:
         session = object_session(item)
         if session is not None:
-            targets = sorted(session.scalars(select(Product.aliexpress_product_id).where(
+            products = list(session.scalars(select(Product).where(
                 Product.store_id == item.store_id, Product.status == "active"
-            )).all())
+            ).order_by(Product.aliexpress_product_id)))
+            targets = [product.aliexpress_product_id for product in products]
+            target_products = [{
+                "platform_product_id": product.aliexpress_product_id,
+                "title": product.title,
+                "url": product.url,
+            } for product in products]
             state = session.get(StorePageDiscoveryState, item.store_id)
             discovery_page_url = state.next_page_url if state is not None else None
     return {
@@ -959,8 +1290,15 @@ def serialize_item(item: BrowserCollectionItem, *, include_targets: bool = False
         "completed_at": item.completed_at,
         "error_type": item.error_type,
         "error_message": item.error_message,
+        "identity_review_url": item.identity_review_url,
+        "identity_review_evidence": item.identity_review_evidence,
+        "identity_review_pending": bool(
+            item.status == "NEEDS_VERIFICATION" and item.error_type == "store_identity_review"
+        ),
         "monitored_product_ids": targets,
+        "monitored_products": target_products,
         "discovery_page_url": discovery_page_url,
+        "approved_store_url_identities": approved_store_url_identities,
     }
 
 

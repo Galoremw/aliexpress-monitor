@@ -125,6 +125,9 @@ class Product(Base):
     url: Mapped[str] = mapped_column(String(2048), unique=True)
     title: Mapped[str | None] = mapped_column(String(1024))
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    pool_reset_reactivation_eligible: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
     business_role: Mapped[str] = mapped_column(String(16), default="UNCLASSIFIED", index=True)
     discovery_source: Mapped[str] = mapped_column(String(32), default="manual")
     discovery_rank: Mapped[int | None] = mapped_column(Integer)
@@ -543,6 +546,8 @@ class BrowserCollectionItem(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_type: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(Text)
+    identity_review_url: Mapped[str | None] = mapped_column(String(2048))
+    identity_review_evidence: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     snapshot_id: Mapped[int | None] = mapped_column(
         ForeignKey("product_snapshots.id", ondelete="SET NULL")
     )
@@ -551,6 +556,33 @@ class BrowserCollectionItem(Base):
     store: Mapped[Store | None] = relationship()
     product: Mapped[Product | None] = relationship()
     snapshot: Mapped[ProductSnapshot | None] = relationship()
+
+
+class StoreUrlIdentity(Base):
+    __tablename__ = "store_url_identities"
+    __table_args__ = (
+        UniqueConstraint("route_store_id", name="uq_store_url_identities_route_store_id"),
+        UniqueConstraint(
+            "normalized_page_identity",
+            name="uq_store_url_identities_normalized_page_identity",
+        ),
+        Index("ix_store_url_identities_store_id", "store_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(
+        ForeignKey("stores.id", ondelete="CASCADE"), nullable=False
+    )
+    route_store_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    normalized_page_identity: Mapped[str] = mapped_column(String(2048), nullable=False)
+    first_observed_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    source_item_id: Mapped[int | None] = mapped_column(
+        ForeignKey("browser_collection_items.id", ondelete="SET NULL")
+    )
+    approved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
 
 
 class DianxiaomiQueueControl(Base):

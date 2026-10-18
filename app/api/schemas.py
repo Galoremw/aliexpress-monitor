@@ -61,6 +61,14 @@ class ProductUpdate(BaseModel):
         return clean_product_title(value)
 
 
+class ProductMonitorClearRequest(BaseModel):
+    confirm_clear: Literal[True]
+
+
+class ProductMonitorClearResponse(BaseModel):
+    deactivated_count: int
+
+
 class ProductRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -138,6 +146,10 @@ class BrowserStoreProduct(BaseModel):
     platform_product_id: str = Field(min_length=1, max_length=128)
     url: str = Field(min_length=1, max_length=2048)
     title: str | None = Field(default=None, max_length=1024)
+    observed_product_id: str | None = Field(default=None, max_length=128)
+    observed_url: str | None = Field(default=None, max_length=2048)
+    observed_page_url: str | None = Field(default=None, max_length=2048)
+    identity_match_method: str | None = Field(default=None, max_length=32)
     public_cumulative_sold: int | None = Field(default=None, ge=0)
     image_url: str | None = Field(default=None, max_length=2048)
     historical_sales: list[HistoricalSalesPoint] = Field(default_factory=list, max_length=7)
@@ -270,6 +282,24 @@ class BrowserCollectionChallengeRequest(BaseModel):
     page_url: str | None = Field(default=None, max_length=2048)
 
 
+class BrowserCollectionIdentityEvidence(BaseModel):
+    route_store_id: str = Field(min_length=1, max_length=128, pattern=r"^\d+$")
+    heading_store_id: str | None = Field(default=None, max_length=128)
+    labeled_store_ids: list[str] = Field(default_factory=list, max_length=32)
+    page_title: str | None = Field(default=None, max_length=512)
+    ixspy_store_name: str | None = Field(default=None, max_length=255)
+    identity_method: str = Field(min_length=1, max_length=64)
+
+
+class BrowserCollectionIdentityReviewRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    claim_token: str = Field(min_length=1, max_length=128)
+    page_url: str = Field(min_length=1, max_length=2048)
+    identity_error_type: Literal["store_identity_mismatch", "store_identity_unverified"]
+    error_message: str = Field(min_length=1, max_length=2000)
+    evidence: BrowserCollectionIdentityEvidence
+
+
 class BrowserCollectionActiveClaim(BaseModel):
     item_id: int
     claim_token: str = Field(min_length=1, max_length=128)
@@ -311,6 +341,12 @@ class BrowserCollectionControlRead(BaseModel):
     can_start: bool
 
 
+class BrowserCollectionMonitoredProductRead(BaseModel):
+    platform_product_id: str
+    title: str | None
+    url: str
+
+
 class BrowserCollectionItemRead(BaseModel):
     id: int
     run_id: int
@@ -328,8 +364,13 @@ class BrowserCollectionItemRead(BaseModel):
     completed_at: datetime | None
     error_type: str | None
     error_message: str | None
+    identity_review_url: str | None = None
+    identity_review_evidence: dict[str, Any] | None = None
+    identity_review_pending: bool = False
     monitored_product_ids: list[str] = Field(default_factory=list)
+    monitored_products: list[BrowserCollectionMonitoredProductRead] = Field(default_factory=list)
     discovery_page_url: str | None = None
+    approved_store_url_identities: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class StorePoolResetCreateRequest(BaseModel):
@@ -346,6 +387,8 @@ class StorePoolResetStoreRead(BaseModel):
     status: str
     scanned_candidate_count: int
     scanned_page_count: int
+    next_page_url: str | None
+    diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     error_type: str | None
     error_message: str | None
 
@@ -391,12 +434,24 @@ class StorePoolResetChallengeRequest(BaseModel):
 class StorePoolResetHeartbeatRequest(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
     claim_token: str | None = Field(default=None, max_length=128)
+    worker_label: str | None = Field(default=None, max_length=128)
+    extension_version: str | None = Field(default=None, max_length=64)
+    capabilities: list[str] = Field(default_factory=list, max_length=32)
 
 
 class StorePoolResetResumeRequest(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
     claim_token: str = Field(min_length=1, max_length=128)
     page_url: str = Field(min_length=1, max_length=2048)
+
+
+class StorePoolResetClaimRead(BaseModel):
+    batch: StorePoolResetBatchRead | None
+    store: StorePoolResetStoreRead | None
+    claim_token: str | None
+    candidate_limit: int = 0
+    target_url: str | None
+    target_date: date | None
 
 
 class BrowserCollectionRunRead(BaseModel):
@@ -422,7 +477,7 @@ class BrowserCollectionRunRead(BaseModel):
 
 
 class BrowserCollectionClaimRead(BaseModel):
-    run: BrowserCollectionRunRead
+    run: BrowserCollectionRunRead | None
     item: BrowserCollectionItemRead | None
     claim_token: str | None = None
 

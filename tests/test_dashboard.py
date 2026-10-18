@@ -27,7 +27,7 @@ def test_dashboard_renders_empty_state(client):
     assert '<details id="dianxiaomi-status"' in response.text
     assert '<summary class="section-heading dianxiaomi-summary">' in response.text
     assert '<details id="dianxiaomi-status" class="data-section dianxiaomi-band" data-status-endpoint="/api/integrations/dianxiaomi/status" open' not in response.text
-    assert 'dashboard.js?v=galore-collector-01' in response.text
+    assert 'dashboard.js?v=galore-collector-02' in response.text
     assert 'id="browser-run-cancel"' in response.text
     script = client.get("/static/dashboard.js").text
     collect_all_handler = script.split('document.querySelector("#collect-all")', 1)[1].split(
@@ -726,6 +726,28 @@ def test_dashboard_exposes_store_rename_control(client, db_session):
     assert "采集到店小秘" in dashboard.text
 
 
+def test_store_summary_places_confirmed_deactivation_after_dianxiaomi(client, db_session):
+    store = Store(name="Removal Candidate", url="https://www.aliexpress.com/store/770004")
+    db_session.add(store)
+    db_session.commit()
+
+    dashboard = client.get("/").text
+    action_group = dashboard.split('class="store-summary-actions"', 1)[1].split("</span>", 1)[0]
+    css = client.get("/static/dashboard.css").text
+    script = client.get("/static/dashboard.js").text
+
+    assert action_group.index('class="link-button dianxiaomi-store"') < action_group.index('class="link-button danger deactivate-store"')
+    assert f'data-store-id="{store.id}"' in action_group
+    assert "删除监控店铺" in action_group
+    assert ".store-summary-actions { display: inline-flex; align-items: center; justify-self: start;" in css
+    handler = script.split('document.querySelectorAll(".deactivate-store")', 1)[1].split(
+        'document.querySelectorAll(".deactivate-product")', 1
+    )[0]
+    assert "window.confirm" in handler
+    assert f"/api/stores/${{button.dataset.storeId}}/deactivate" in handler
+    assert "商品及历史数据会保留" in handler
+
+
 def test_monitor_pool_has_manual_review_collection_action(client, db_session):
     store = Store(name="Review Store", url="https://www.aliexpress.com/store/770003")
     product = Product(
@@ -746,3 +768,44 @@ def test_monitor_pool_has_manual_review_collection_action(client, db_session):
     assert f'class="link-button collect-reviews" type="button" data-product-id="{product.id}">采集评论</button>' in detail.text
     assert 'class="store-rename-form inline-rename"' in dashboard.text
     assert '.inline-rename[hidden] { display: none; }' in css.text
+
+
+def test_identity_review_item_exposes_review_evidence_to_dashboard(client):
+    script = client.get("/static/dashboard.js").text
+    renderer = script.split("function renderBrowserCollectionItem(item)", 1)[1].split(
+        "function formatBrowserTime", 1
+    )[0]
+    handler = script.split('document.querySelector("#browser-collection-status")?.addEventListener("click"', 1)[1].split(
+        'document.querySelector("#browser-run-pause")', 1
+    )[0]
+
+    assert 'item.status === "NEEDS_VERIFICATION"' in renderer
+    assert "item.identity_review_pending === true" in renderer
+    assert "item.identity_review_url" in renderer
+    assert "item.identity_review_evidence" in renderer
+    assert "ixspy_store_name" in renderer
+    assert 'data-browser-item-action="identity-confirm"' in renderer
+    assert 'data-browser-item-action="identity-reject"' in renderer
+    assert "确定无误" in renderer
+    assert "错误" in renderer
+    assert "/identity-review/${endpoint}" in handler
+    assert "队列保持暂停" in handler
+    assert "当前店铺身份，采集任务继续运行" in handler
+
+
+def test_identity_buttons_render_only_for_identity_review_items(client):
+    script = client.get("/static/dashboard.js").text
+    renderer = script.split("function renderBrowserCollectionItem(item)", 1)[1].split(
+        "function formatBrowserTime", 1
+    )[0]
+    css = client.get("/static/dashboard.css").text
+
+    assert 'item.status === "NEEDS_VERIFICATION"' in renderer
+    assert "item.identity_review_pending === true" in renderer
+    assert '.browser-identity-actions .identity-confirm { background:' in css
+    assert '.browser-identity-actions .identity-reject { background:' in css
+    assert 'color: #111' in css
+    assert "等待人工确认店铺身份；队列已暂停" in script
+    assert "const platformVerification = needsVerification && !identityReview" in script
+    template = Path("app/templates/dashboard.html").read_text(encoding="utf-8")
+    assert 'browser_collection_run.paused_reason == "store_identity_review"' in template

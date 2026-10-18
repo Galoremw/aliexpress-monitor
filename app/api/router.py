@@ -2,7 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -13,6 +13,16 @@ from app.api.schemas import (
     BrowserCollectionControlRead,
     BrowserCollectionFailureRequest,
     BrowserCollectionHeartbeatRequest,
+    BrowserCollectionIdentityReviewRequest,
+    StorePoolResetBatchRead,
+    StorePoolResetChallengeRequest,
+    StorePoolResetClaimRead,
+    StorePoolResetClaimRequest,
+    StorePoolResetCreateRequest,
+    StorePoolResetFailureRequest,
+    StorePoolResetHeartbeatRequest,
+    StorePoolResetPageRequest,
+    StorePoolResetResumeRequest,
     BrowserCollectionRunEnsureRequest,
     BrowserCollectionRunRead,
     BrowserCollectionWorkerSelectRequest,
@@ -31,6 +41,8 @@ from app.api.schemas import (
     CollectionStatusRead,
     ManualCollectionRequest,
     ProductCreate,
+    ProductMonitorClearRequest,
+    ProductMonitorClearResponse,
     ProductRead,
     ProductDailyMetricRead,
     ProductSnapshotRead,
@@ -88,6 +100,7 @@ from app.services.browser_collection import (
     browser_collection_control_status,
     cancel_run,
     claim_next_item,
+    confirm_store_identity_review,
     ensure_browser_collection_run,
     fail_item,
     finish_item,
@@ -98,6 +111,8 @@ from app.services.browser_collection import (
     queue_single_product_collection,
     queue_store_collection,
     record_heartbeat,
+    record_store_identity_review,
+    reject_store_identity_review,
     resume_run,
     retry_item,
     select_browser_collection_worker,
@@ -105,6 +120,20 @@ from app.services.browser_collection import (
     serialize_run,
     start_browser_collection_run,
     validate_browser_collection_claim,
+)
+from app.services.store_pool_reset import (
+    cancel_pool_reset_batch,
+    claim_pool_reset_store,
+    create_pool_reset_batch,
+    get_latest_pool_reset_batch,
+    record_pool_reset_challenge,
+    record_pool_reset_failure,
+    record_pool_reset_heartbeat,
+    record_pool_reset_page,
+    resume_pool_reset_after_challenge,
+    retry_pool_reset_store,
+    serialize_pool_reset_batch,
+    start_pool_reset_batch,
 )
 from app.services.dianxiaomi import (
     ACTIVE_HANDOFF_STATUSES,
@@ -1080,7 +1109,8 @@ def _claimed_browser_collection_item(
     db: Session,
     item_id: int,
     payload: BrowserExtensionCollectionRequest | BrowserStoreDiscoveryRequest
-    | BrowserCollectionFailureRequest | BrowserCollectionChallengeRequest,
+    | BrowserCollectionFailureRequest | BrowserCollectionChallengeRequest
+    | BrowserCollectionIdentityReviewRequest,
     target_type: str | None = None,
 ) -> BrowserCollectionItem:
     item = _browser_collection_item(db, item_id, target_type)
@@ -1098,6 +1128,217 @@ def _claimed_browser_collection_item(
 )
 def browser_collection_control(db: Session = Depends(get_db)) -> dict:
     return browser_collection_control_status(db)
+
+
+@router.post(
+    "/browser-collection/pool-resets",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_create_pool_reset(
+    payload: StorePoolResetCreateRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch = create_pool_reset_batch(db, confirm_replace=payload.confirm_replace)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_pool_reset_batch(batch)
+
+
+@router.get(
+    "/browser-collection/pool-resets/latest",
+    response_model=StorePoolResetBatchRead | None,
+)
+def browser_collection_latest_pool_reset(db: Session = Depends(get_db)) -> dict | None:
+    batch = get_latest_pool_reset_batch(db)
+    return serialize_pool_reset_batch(batch) if batch else None
+
+
+@router.post(
+    "/browser-collection/pool-resets/{batch_id}/start",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_start_pool_reset(
+    batch_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return serialize_pool_reset_batch(start_pool_reset_batch(db, batch_id))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/browser-collection/pool-resets/{batch_id}/cancel",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_cancel_pool_reset(
+    batch_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return serialize_pool_reset_batch(cancel_pool_reset_batch(db, batch_id))
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/browser-collection/pool-resets/claim",
+    response_model=StorePoolResetClaimRead,
+)
+def browser_collection_claim_pool_reset(
+    payload: StorePoolResetClaimRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        claimed = claim_pool_reset_store(db, payload.worker_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if claimed is None:
+        batch = get_latest_pool_reset_batch(db)
+        return {
+            "batch": serialize_pool_reset_batch(batch) if batch else None,
+            "store": None,
+            "claim_token": None,
+            "candidate_limit": 0,
+            "target_url": None,
+            "target_date": batch.target_date if batch else None,
+        }
+    batch, task, token, candidate_limit = claimed
+    serialized = serialize_pool_reset_batch(batch)
+    task_data = next(item for item in serialized["stores"] if item["id"] == task.id)
+    return {
+        "batch": serialized,
+        "store": task_data,
+        "claim_token": token,
+        "candidate_limit": candidate_limit,
+        "target_url": task.claimed_page_url,
+        "target_date": batch.target_date,
+    }
+
+
+@router.post("/browser-collection/pool-resets/heartbeat")
+def browser_collection_pool_reset_heartbeat(
+    payload: StorePoolResetHeartbeatRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return record_pool_reset_heartbeat(
+            db,
+            payload.worker_id,
+            payload.claim_token,
+            worker_label=payload.worker_label,
+            extension_version=payload.extension_version,
+            capabilities=payload.capabilities,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/browser-collection/pool-resets/tasks/{task_id}/page",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_pool_reset_page(
+    task_id: int,
+    payload: StorePoolResetPageRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch = record_pool_reset_page(
+            db,
+            task_id,
+            payload.worker_id,
+            payload.claim_token,
+            payload.expected_store_id,
+            payload.page,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_pool_reset_batch(batch)
+
+
+@router.post(
+    "/browser-collection/pool-resets/tasks/{task_id}/failure",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_pool_reset_failure(
+    task_id: int,
+    payload: StorePoolResetFailureRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch = record_pool_reset_failure(
+            db,
+            task_id,
+            payload.worker_id,
+            payload.claim_token,
+            payload.error_type,
+            payload.error_message,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_pool_reset_batch(batch)
+
+
+@router.post(
+    "/browser-collection/pool-resets/tasks/{task_id}/challenge",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_pool_reset_challenge(
+    task_id: int,
+    payload: StorePoolResetChallengeRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch = record_pool_reset_challenge(
+            db,
+            task_id,
+            payload.worker_id,
+            payload.claim_token,
+            payload.error_message,
+            payload.page_url,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_pool_reset_batch(batch)
+
+
+@router.post(
+    "/browser-collection/pool-resets/tasks/{task_id}/resume",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_pool_reset_resume(
+    task_id: int,
+    payload: StorePoolResetResumeRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch = resume_pool_reset_after_challenge(
+            db,
+            task_id,
+            payload.worker_id,
+            payload.claim_token,
+            payload.page_url,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_pool_reset_batch(batch)
+
+
+@router.post(
+    "/browser-collection/pool-resets/tasks/{task_id}/retry",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_pool_reset_retry(
+    task_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch = retry_pool_reset_store(db, task_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_pool_reset_batch(batch)
 
 
 @router.post("/browser-collection/control/worker", response_model=BrowserCollectionControlRead)
@@ -1170,7 +1411,7 @@ def browser_collection_claim(
 ) -> dict:
     run, item = claim_next_item(db, payload.worker_id if payload else None)
     return {
-        "run": serialize_run(run),
+        "run": serialize_run(run) if run else None,
         "item": serialize_item(item, include_targets=True) if item else None,
         "claim_token": item.claim_token if item else None,
     }
@@ -1301,6 +1542,63 @@ def browser_collection_challenge(
 
 
 @router.post(
+    "/browser-collection/items/{item_id}/identity-review",
+    response_model=BrowserCollectionRunRead,
+)
+def browser_collection_identity_review(
+    item_id: int,
+    payload: BrowserCollectionIdentityReviewRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    item = _browser_collection_item(db, item_id, "STORE")
+    try:
+        run = record_store_identity_review(
+            db,
+            item,
+            payload.page_url,
+            payload.identity_error_type,
+            payload.error_message,
+            payload.evidence.model_dump(),
+            worker_id=payload.worker_id,
+            claim_token=payload.claim_token,
+        )
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_run(run)
+
+
+@router.post(
+    "/browser-collection/items/{item_id}/identity-review/confirm",
+    response_model=BrowserCollectionRunRead,
+)
+def browser_collection_identity_review_confirm(
+    item_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return serialize_run(confirm_store_identity_review(db, item_id))
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/browser-collection/items/{item_id}/identity-review/reject",
+    response_model=BrowserCollectionRunRead,
+)
+def browser_collection_identity_review_reject(
+    item_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return serialize_run(reject_store_identity_review(db, item_id))
+    except ValueError as error:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
     "/browser-collection/runs/{run_id}/resume",
     response_model=BrowserCollectionRunRead,
 )
@@ -1368,6 +1666,7 @@ def browser_collection_heartbeat(
             worker_id=payload.worker_id,
             worker_label=payload.worker_label,
             extension_version=payload.extension_version,
+            capabilities=payload.capabilities,
         )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
@@ -1537,8 +1836,11 @@ def update_product(
     product = db.get(Product, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    values = payload.model_dump(exclude_unset=True)
+    for field, value in values.items():
         setattr(product, field, value)
+    if "status" in values:
+        product.pool_reset_reactivation_eligible = False
     db.commit()
     db.refresh(product)
     return product
@@ -1547,6 +1849,27 @@ def update_product(
 @router.post("/products/{product_id}/deactivate", response_model=ProductRead)
 def deactivate_product(product_id: int, db: Session = Depends(get_db)) -> Product:
     return update_product(product_id, ProductUpdate(status="inactive"), db)
+
+
+@router.post(
+    "/products/clear-active",
+    response_model=ProductMonitorClearResponse,
+)
+def clear_active_monitored_products(
+    payload: ProductMonitorClearRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    active_store_ids = select(Store.id).where(Store.status == "active")
+    result = db.execute(
+        update(Product)
+        .where(
+            Product.status == "active",
+            Product.store_id.in_(active_store_ids),
+        )
+        .values(status="inactive", pool_reset_reactivation_eligible=True)
+    )
+    db.commit()
+    return {"deactivated_count": max(result.rowcount or 0, 0)}
 
 
 @router.post("/products/{product_id}/collect", response_model=ProductSnapshotRead)

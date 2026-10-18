@@ -1,4 +1,5 @@
 from datetime import date
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -7,6 +8,10 @@ from app.api import schemas
 from app.db import models
 from app.api.schemas import BrowserStoreProduct, HistoricalSalesPoint
 from app.db.models import (
+    BrowserCollectionControl,
+    BrowserCollectionItem,
+    BrowserCollectionRun,
+    BrowserCollectionWorker,
     CollectionAttempt,
     Product,
     ProductDailyMetric,
@@ -402,4 +407,562 @@ def test_pool_reset_replacement_excludes_candidate_id_or_url_owned_by_another_st
     assert any(item["reason"] == expected_reason for item in result["diagnostics"])
     assert db_session.get(Product, foreign_product.id).store_id == foreign_store.id
     assert db_session.get(Product, old_target_product.id).status == "inactive"
+
+
+def _make_store(db_session, store_id, *, status="active"):
+    store = Store(
+        aliexpress_store_id=store_id,
+        name=f"Store {store_id}",
+        url=f"https://www.aliexpress.com/store/{store_id}",
+        status=status,
+    )
+    db_session.add(store)
+    db_session.flush()
+    return store
+
+
+def _held_reset_batch(db_session, monkeypatch, store_ids=("1100000030",)):
+    from app.services import store_pool_reset
+
+    monkeypatch.setattr(store_pool_reset, "_reset_target_date", lambda: date(2026, 10, 16))
+    for store_id in store_ids:
+        _make_store(db_session, store_id)
+    return store_pool_reset.create_pool_reset_batch(db_session, confirm_replace=True)
+
+
+def test_create_pool_reset_batch_snapshots_only_active_stores_and_freezes_seven_dates(
+    db_session, monkeypatch
+):
+    from app.services.store_pool_reset import create_pool_reset_batch
+
+    active_a = _make_store(db_session, "1100000030")
+    active_b = _make_store(db_session, "1100000031")
+    inactive = _make_store(db_session, "1100000032", status="inactive")
+    inactive_product = Product(
+        store_id=inactive.id,
+        aliexpress_product_id="100500000032",
+        url="https://www.aliexpress.com/item/100500000032.html",
+        status="active",
+    )
+    db_session.add(inactive_product)
+    db_session.flush()
+    from app.services import store_pool_reset
+
+    monkeypatch.setattr(store_pool_reset, "_reset_target_date", lambda: date(2026, 10, 16))
+    batch = create_pool_reset_batch(db_session, confirm_replace=True)
+    assert batch.status == "PENDING"
+    assert batch.dispatch_enabled is False
+    assert (batch.target_date, batch.window_start, batch.window_end) == (
+        date(2026, 10, 16), date(2026, 10, 9), date(2026, 10, 15)
+    )
+    assert {task.store_id for task in batch.stores} == {active_a.id, active_b.id}
+
+    monkeypatch.setattr(store_pool_reset, "_reset_target_date", lambda: date(2026, 10, 17))
+    assert (batch.target_date, batch.window_start, batch.window_end) == (
+        date(2026, 10, 16), date(2026, 10, 9), date(2026, 10, 15)
+    )
+    assert db_session.get(Product, inactive_product.id).status == "active"
+
+
+def test_pool_reset_start_requires_selected_online_capable_worker_and_no_daily_claim(
+    db_session, monkeypatch
+):
+    from app.services import browser_collection
+    from app.services.store_pool_reset import start_pool_reset_batch
+    from app.services.browser_collection import utcnow
+
+    monkeypatch.setattr(
+        browser_collection, "_target_date", lambda value=None: date(2026, 10, 16)
+    )
+    batch = _held_reset_batch(db_session, monkeypatch)
+    with pytest.raises(ValueError, match="选择采集电脑"):
+        start_pool_reset_batch(db_session, batch.id)
+
+    worker = BrowserCollectionWorker(
+        worker_id="reset-worker",
+        label="Reset Worker",
+        extension_version="0.6.90",
+        capabilities=[],
+        last_heartbeat_at=utcnow(),
+    )
+    control = db_session.get(BrowserCollectionControl, 1)
+    control.selected_worker_id = worker.worker_id
+    control.selected_worker_label = worker.label
+    db_session.add(worker)
+    db_session.flush()
+    with pytest.raises(ValueError, match="不支持监控池重建"):
+        start_pool_reset_batch(db_session, batch.id)
+
+    worker.capabilities = ["store_pool_reset_v1"]
+    run = BrowserCollectionRun(
+        target_date=date(2026, 10, 16), trigger="MANUAL", status="RUNNING",
+        phase="STORE_DISCOVERY", dispatch_enabled=True,
+    )
+    daily_store = db_session.query(Store).filter_by(aliexpress_store_id="1100000030").one()
+    daily_item = BrowserCollectionItem(
+        run=run,
+        target_type="STORE",
+        target_key=f"store:{daily_store.id}",
+        store_id=daily_store.id,
+        target_url=daily_store.url,
+        position=1,
+        status="RUNNING",
+        claimed_at=utcnow(),
+        lease_expires_at=utcnow() + timedelta(minutes=4),
+        claimed_worker_id=worker.worker_id,
+        claim_token="daily-claim-token",
+    )
+    db_session.add(daily_item)
+    db_session.flush()
+    with pytest.raises(ValueError, match="每日采集任务仍在运行"):
+        start_pool_reset_batch(db_session, batch.id)
+    assert batch.status == "PENDING"
+    assert batch.dispatch_enabled is False
+    assert daily_item.status == "RUNNING"
+    assert run.dispatch_enabled is True
+
+    daily_item.status = "PENDING"
+    daily_item.claimed_at = None
+    daily_item.lease_expires_at = None
+    daily_item.claimed_worker_id = None
+    daily_item.claim_token = None
+    db_session.flush()
+    started = start_pool_reset_batch(db_session, batch.id)
+    assert started.status == "RUNNING"
+    assert started.dispatch_enabled is True
+    assert run.dispatch_enabled is True
+
+
+def test_pool_reset_api_creates_held_batch_only(client, db_session, monkeypatch):
+    from app.services import store_pool_reset
+
+    _make_store(db_session, "1100000033")
+    monkeypatch.setattr(store_pool_reset, "_reset_target_date", lambda: date(2026, 10, 16))
+
+    rejected = client.post("/api/browser-collection/pool-resets", json={"confirm_replace": False})
+    assert rejected.status_code == 422
+    created = client.post("/api/browser-collection/pool-resets", json={"confirm_replace": True})
+    assert created.status_code == 200, created.text
+    assert created.json()["status"] == "PENDING"
+    assert created.json()["dispatch_enabled"] is False
+    assert len(created.json()["stores"]) == 1
+    latest = client.get("/api/browser-collection/pool-resets/latest")
+    assert latest.status_code == 200
+    assert latest.json()["id"] == created.json()["id"]
+
+
+def test_daily_claim_is_withheld_during_pool_reset_without_daily_run_mutation(
+    client, db_session, monkeypatch
+):
+    from app.services import browser_collection
+    from app.services import store_pool_reset
+    from app.services.browser_collection import utcnow
+
+    monkeypatch.setattr(
+        browser_collection, "_target_date", lambda value=None: date(2026, 10, 16)
+    )
+    store = _make_store(db_session, "1100000034")
+    batch = _held_reset_batch(db_session, monkeypatch, store_ids=())
+    task = batch.stores[0]
+    batch.status = "RUNNING"
+    batch.dispatch_enabled = True
+    worker = BrowserCollectionWorker(
+        worker_id="reset-worker-active",
+        label="Reset Worker",
+        extension_version="0.6.90",
+        capabilities=["store_pool_reset_v1"],
+        last_heartbeat_at=utcnow(),
+    )
+    control = db_session.get(BrowserCollectionControl, 1)
+    control.selected_worker_id = worker.worker_id
+    control.selected_worker_label = worker.label
+    db_session.add(worker)
+    run = BrowserCollectionRun(
+        target_date=date(2026, 10, 16), trigger="MANUAL", status="RUNNING",
+        phase="STORE_DISCOVERY", dispatch_enabled=True,
+    )
+    daily_item = BrowserCollectionItem(
+        run=run, target_type="STORE", target_key=f"store:{store.id}", store_id=store.id,
+        target_url=store.url, position=1, status="PENDING",
+    )
+    db_session.add(daily_item)
+    db_session.commit()
+    old_last_heartbeat = run.last_heartbeat_at
+
+    response = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": worker.worker_id}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["item"] is None
+    assert response.json()["run"]["status"] == "RUNNING"
+    db_session.refresh(run)
+    db_session.refresh(daily_item)
+    assert run.status == "RUNNING"
+    assert run.dispatch_enabled is True
+    assert run.last_heartbeat_at == old_last_heartbeat
+    assert daily_item.status == "PENDING"
+    assert task.status == "PENDING"
+
+
+def _start_reset_for_page_tests(db_session, monkeypatch):
+    from app.services import store_pool_reset
+    from app.services.browser_collection import utcnow
+
+    _make_store(db_session, "1100000090")
+    batch = _held_reset_batch(db_session, monkeypatch, store_ids=())
+    worker = BrowserCollectionWorker(
+        worker_id="reset-page-worker",
+        label="Reset Page Worker",
+        extension_version="0.6.90",
+        capabilities=["store_pool_reset_v1"],
+        last_heartbeat_at=utcnow(),
+    )
+    control = db_session.get(BrowserCollectionControl, 1)
+    control.selected_worker_id = worker.worker_id
+    control.selected_worker_label = worker.label
+    db_session.add(worker)
+    db_session.flush()
+    store_pool_reset.start_pool_reset_batch(db_session, batch.id)
+    return batch, worker
+
+
+def _reset_page(store_id, page_number, candidates, *, has_next, complete=True, known=True):
+    page_url = (
+        f"https://www.aliexpress.com/store/{store_id}/pages/all-items.html"
+        f"?sortType=bestmatch_sort&shop_sortType=orders_desc&page={page_number}"
+    )
+    next_page_url = (
+        f"https://www.aliexpress.com/store/{store_id}/pages/all-items.html"
+        f"?sortType=bestmatch_sort&shop_sortType=orders_desc&page={page_number + 1}"
+        if has_next else None
+    )
+    return {
+        "page_url": page_url,
+        "pagination_known": known,
+        "has_next_page": has_next,
+        "next_page_url": next_page_url,
+        "scan_complete": complete,
+        "candidates": candidates,
+        "diagnostics": {},
+    }
+
+
+def _reset_page_candidate(index, target_date=date(2026, 10, 16)):
+    product_id = f"100500{index:07d}"
+    return {
+        "platform_product_id": product_id,
+        "url": f"https://www.aliexpress.com/item/{product_id}.html",
+        "title": f"Candidate {index}",
+        "historical_sales": [
+            {
+                "date": (target_date - timedelta(days=offset)).isoformat(),
+                "value": index + offset,
+                "value_type": "daily_increment",
+            }
+            for offset in range(1, 8)
+        ],
+        "history_source": "ixspy_visible_daily_increment",
+        "history_daily_capture_complete": True,
+        "history_expected_dates": [
+            (target_date - timedelta(days=offset)).isoformat()
+            for offset in range(1, 8)
+        ],
+        "history_missing_dates": [],
+    }
+
+
+def test_pool_reset_claims_one_orders_page_and_finalizes_only_after_sixty_candidates(
+    db_session, monkeypatch
+):
+    from app.services.store_pool_reset import (
+        claim_pool_reset_store,
+        record_pool_reset_page,
+    )
+
+    batch, worker = _start_reset_for_page_tests(db_session, monkeypatch)
+    first = claim_pool_reset_store(db_session, worker.worker_id)
+    assert first is not None
+    _, task, first_token, limit = first
+    assert limit == 50
+    first_url = task.next_page_url
+    page_one = _reset_page(
+        task.platform_store_id,
+        1,
+        [_reset_page_candidate(index) for index in range(1, 51)],
+        has_next=True,
+    )
+    page_one["page_url"] = first_url
+
+    checkpoint = record_pool_reset_page(
+        db_session,
+        task.id,
+        worker.worker_id,
+        first_token,
+        task.platform_store_id,
+        page_one,
+    )
+    db_session.refresh(task)
+    assert task.status == "PENDING"
+    assert task.scanned_candidate_count == 50
+    assert task.scanned_page_count == 1
+    assert len(task.staged_candidates) == 50
+    assert "page=2" in task.next_page_url
+    assert db_session.query(Product).filter_by(store_id=task.store_id).count() == 0
+    assert checkpoint.status == "RUNNING"
+
+    second = claim_pool_reset_store(db_session, worker.worker_id)
+    assert second is not None
+    _, task, second_token, limit = second
+    assert limit == 10
+    page_two = _reset_page(
+        task.platform_store_id,
+        2,
+        [_reset_page_candidate(index) for index in range(51, 61)],
+        has_next=True,
+    )
+    page_two["page_url"] = task.next_page_url
+
+    completed = record_pool_reset_page(
+        db_session,
+        task.id,
+        worker.worker_id,
+        second_token,
+        task.platform_store_id,
+        page_two,
+    )
+    db_session.refresh(task)
+    assert task.status == "SUCCEEDED"
+    assert task.scanned_candidate_count == 60
+    assert task.scanned_page_count == 2
+    assert task.next_page_url is None
+    assert db_session.query(Product).filter_by(store_id=task.store_id, status="active").count() == 20
+    assert completed.status == "COMPLETED"
+    assert len(batch.stores) == 1
+
+
+def test_incomplete_pool_reset_page_does_not_advance_or_replace_pool(db_session, monkeypatch):
+    from app.services.store_pool_reset import claim_pool_reset_store, record_pool_reset_page
+
+    _, worker = _start_reset_for_page_tests(db_session, monkeypatch)
+    claimed = claim_pool_reset_store(db_session, worker.worker_id)
+    _, task, token, _ = claimed
+    original_url = task.next_page_url
+    incomplete = _reset_page(
+        task.platform_store_id,
+        1,
+        [_reset_page_candidate(1)],
+        has_next=True,
+        complete=False,
+    )
+    incomplete["page_url"] = original_url
+
+    with pytest.raises(ValueError, match="完整"):
+        record_pool_reset_page(
+            db_session,
+            task.id,
+            worker.worker_id,
+            token,
+            task.platform_store_id,
+            incomplete,
+        )
+
+    db_session.refresh(task)
+    assert task.status == "RUNNING"
+    assert task.scanned_candidate_count == 0
+    assert task.next_page_url == original_url
+    assert task.staged_candidates == []
+    assert db_session.query(Product).filter_by(store_id=task.store_id).count() == 0
+
+
+def test_pool_reset_page_result_is_idempotent_for_same_claim_and_rejects_changed_replay(
+    db_session, monkeypatch
+):
+    from app.services.store_pool_reset import claim_pool_reset_store, record_pool_reset_page
+
+    _, worker = _start_reset_for_page_tests(db_session, monkeypatch)
+    _, task, token, _ = claim_pool_reset_store(db_session, worker.worker_id)
+    page = _reset_page(
+        task.platform_store_id,
+        1,
+        [_reset_page_candidate(1)],
+        has_next=False,
+    )
+    page["page_url"] = task.next_page_url
+
+    first = record_pool_reset_page(
+        db_session, task.id, worker.worker_id, token, task.platform_store_id, page
+    )
+    task_id = task.id
+    second = record_pool_reset_page(
+        db_session, task_id, worker.worker_id, token, task.platform_store_id, page
+    )
+    assert first.id == second.id
+    assert db_session.query(Product).filter_by(store_id=task.store_id, status="active").count() == 1
+
+    changed = {**page, "diagnostics": {"changed": True}}
+    with pytest.raises(ValueError, match="重复提交"):
+        record_pool_reset_page(
+            db_session, task_id, worker.worker_id, token, task.platform_store_id, changed
+        )
+
+
+def test_pool_reset_challenge_keeps_claim_and_resume_requires_same_orders_page(
+    db_session, monkeypatch
+):
+    from app.services.store_pool_reset import (
+        claim_pool_reset_store,
+        record_pool_reset_challenge,
+        resume_pool_reset_after_challenge,
+    )
+
+    batch, worker = _start_reset_for_page_tests(db_session, monkeypatch)
+    _, task, token, _ = claim_pool_reset_store(db_session, worker.worker_id)
+    page_url = task.claimed_page_url
+
+    paused = record_pool_reset_challenge(
+        db_session,
+        task.id,
+        worker.worker_id,
+        token,
+        "平台需要验证",
+        page_url,
+    )
+    db_session.refresh(task)
+    assert paused.status == "NEEDS_VERIFICATION"
+    assert task.status == "NEEDS_VERIFICATION"
+    assert task.claim_token == token
+    assert task.next_page_url == page_url
+
+    with pytest.raises(ValueError, match="已改变"):
+        resume_pool_reset_after_challenge(
+            db_session,
+            task.id,
+            worker.worker_id,
+            token,
+            f"https://www.aliexpress.com/store/1100000091/pages/all-items.html?shop_sortType=orders_desc",
+        )
+
+    resumed = resume_pool_reset_after_challenge(
+        db_session, task.id, worker.worker_id, token, page_url
+    )
+    db_session.refresh(task)
+    assert resumed.status == "RUNNING"
+    assert task.status == "RUNNING"
+    assert task.claim_token == token
+    assert batch.id == resumed.id
+
+
+def test_pool_reset_failed_store_retry_resumes_same_page_and_keeps_old_pool(
+    db_session, monkeypatch
+):
+    from app.services.store_pool_reset import (
+        claim_pool_reset_store,
+        record_pool_reset_failure,
+        retry_pool_reset_store,
+    )
+
+    _, worker = _start_reset_for_page_tests(db_session, monkeypatch)
+    store = db_session.query(Store).filter_by(aliexpress_store_id="1100000090").one()
+    existing = Product(
+        store_id=store.id,
+        aliexpress_product_id="1005009999000",
+        url="https://www.aliexpress.com/item/1005009999000.html",
+        status="active",
+    )
+    db_session.add(existing)
+    db_session.flush()
+    claimed = claim_pool_reset_store(db_session, worker.worker_id)
+    _, task, token, _ = claimed
+    first_url = task.claimed_page_url
+
+    record_pool_reset_failure(
+        db_session, task.id, worker.worker_id, token, "page_timeout", "page timeout"
+    )
+    claimed_again = claim_pool_reset_store(db_session, worker.worker_id)
+    _, task, token, _ = claimed_again
+    assert task.claimed_page_url == first_url
+    record_pool_reset_failure(
+        db_session, task.id, worker.worker_id, token, "page_timeout", "page timeout"
+    )
+    db_session.refresh(task)
+    assert task.status == "FAILED"
+    assert db_session.get(Product, existing.id).status == "active"
+
+    retried = retry_pool_reset_store(db_session, task.id)
+    db_session.refresh(task)
+    assert retried.status == "PENDING"
+    assert retried.dispatch_enabled is False
+    assert task.status == "PENDING"
+    assert task.page_attempt_count == 0
+    assert task.next_page_url == first_url
+    assert db_session.get(Product, existing.id).status == "active"
+
+
+def test_pool_reset_api_claim_heartbeat_and_page_do_not_mutate_daily_run(
+    client, db_session, monkeypatch
+):
+    from app.services import store_pool_reset
+    from app.services.browser_collection import utcnow
+
+    store = _make_store(db_session, "1100000092")
+    monkeypatch.setattr(store_pool_reset, "_reset_target_date", lambda: date(2026, 10, 16))
+    batch = store_pool_reset.create_pool_reset_batch(db_session, confirm_replace=True)
+    worker = BrowserCollectionWorker(
+        worker_id="reset-api-worker",
+        label="Reset API Worker",
+        extension_version="0.6.90",
+        capabilities=["store_pool_reset_v1"],
+        last_heartbeat_at=utcnow(),
+    )
+    control = db_session.get(BrowserCollectionControl, 1)
+    control.selected_worker_id = worker.worker_id
+    control.selected_worker_label = worker.label
+    db_session.add(worker)
+    db_session.commit()
+    store_pool_reset.start_pool_reset_batch(db_session, batch.id)
+
+    claim_response = client.post(
+        "/api/browser-collection/pool-resets/claim",
+        json={"worker_id": worker.worker_id},
+    )
+    assert claim_response.status_code == 200, claim_response.text
+    claim = claim_response.json()
+    assert claim["store"]["platform_store_id"] == store.aliexpress_store_id
+    assert claim["candidate_limit"] == 50
+    assert claim["target_url"] == claim["store"]["next_page_url"]
+
+    heartbeat = client.post(
+        "/api/browser-collection/pool-resets/heartbeat",
+        json={
+            "worker_id": worker.worker_id,
+            "claim_token": claim["claim_token"],
+            "capabilities": ["store_pool_reset_v1"],
+            "extension_version": "0.6.90",
+        },
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    page_url = claim["target_url"]
+    page = {
+        "page_url": page_url,
+        "pagination_known": True,
+        "has_next_page": False,
+        "next_page_url": None,
+        "scan_complete": True,
+        "candidates": [_reset_page_candidate(92)],
+        "diagnostics": {"scanned_candidate_count": 1},
+    }
+    accepted = client.post(
+        f"/api/browser-collection/pool-resets/tasks/{claim['store']['id']}/page",
+        json={
+            "worker_id": worker.worker_id,
+            "claim_token": claim["claim_token"],
+            "expected_store_id": store.aliexpress_store_id,
+            "page": page,
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == "COMPLETED"
+    assert db_session.query(Product).filter_by(store_id=store.id, status="active").count() == 1
+    assert db_session.query(BrowserCollectionRun).count() == 0
 

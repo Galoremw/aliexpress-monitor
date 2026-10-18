@@ -5,12 +5,14 @@ import pytest
 from app.db.models import (
     BrowserCollectionItem,
     BrowserCollectionRun,
+    BrowserCollectionWorker,
     Product,
     ProductDailyMetric,
     ProductSnapshot,
     Store,
     StorePageDiscoveryState,
     StoreSnapshot,
+    StoreUrlIdentity,
 )
 from app.services.browser_collection import _products_with_recent_history_for_date
 from app.services.metrics import calculate_product_daily_metrics
@@ -336,6 +338,100 @@ def test_wrong_worker_cannot_finish_claimed_item(client, db_session):
     assert item.status == "RUNNING"
 
 
+def test_store_identity_mismatch_is_not_automatically_retried(client, db_session):
+    store = create_store(client, "990213")
+    create_store(client, "9902131")
+    create_product(client, store["id"], "1005009921301")
+    claim = claim_item(client).json()
+    item_id = claim["item"]["id"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{item_id}/failure",
+        json=add_claim_credentials({
+            "error_type": "store_identity_mismatch",
+            "error_message": "目标店铺 ID 与实际页面不一致",
+        }, item_id),
+    )
+
+    assert response.status_code == 200
+    assert db_session.get(BrowserCollectionItem, item_id).status == "FAILED"
+    assert response.json()["failed_count"] == 1
+    assert response.json()["status"] == "PAUSED"
+    assert response.json()["paused_reason"] == "store_identity_mismatch"
+    assert response.json()["dispatch_enabled"] is False
+    assert response.json()["pending_count"] == 1
+    assert request_claim(client).json()["item"] is None
+
+
+def test_store_evidence_rejection_is_not_automatically_retried(client, db_session):
+    store = create_store(client, "990215")
+    create_product(client, store["id"], "1005009921501")
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/failure",
+        json=add_claim_credentials({
+            "error_type": "extension_collection_error",
+            "error_message": "商品 ID 匹配与店铺页扫描证据不一致",
+        }, claim["id"]),
+    )
+
+    assert response.status_code == 200
+    assert db_session.get(BrowserCollectionItem, claim["id"]).status == "FAILED"
+    assert response.json()["failed_count"] == 1
+    assert response.json()["pending_count"] == 0
+
+
+def test_product_collection_errors_keep_the_existing_retry_behavior(client, db_session):
+    store = create_store(client, "990216")
+    product = create_product(client, store["id"], "1005009921601")
+    client.post(f"/api/products/{product['id']}/browser-collection")
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/failure",
+        json=add_claim_credentials({
+            "error_type": "extension_collection_error",
+            "error_message": "商品页面临时读取失败",
+        }, claim["id"]),
+    )
+
+    assert response.status_code == 200
+    assert db_session.get(BrowserCollectionItem, claim["id"]).status == "PENDING"
+    assert response.json()["pending_count"] == 1
+
+
+def test_store_page_load_failure_is_retried_only_once(client, db_session):
+    store = create_store(client, "990214")
+    create_product(client, store["id"], "1005009921401")
+    first_claim = claim_item(client).json()
+    item_id = first_claim["item"]["id"]
+
+    first_failure = client.post(
+        f"/api/browser-collection/items/{item_id}/failure",
+        json=add_claim_credentials({
+            "error_type": "page_not_ready",
+            "error_message": "店铺页暂时未加载完成",
+        }, item_id),
+    )
+
+    assert first_failure.status_code == 200
+    assert db_session.get(BrowserCollectionItem, item_id).status == "PENDING"
+    second_claim = claim_item(client).json()
+    assert second_claim["item"]["attempt_count"] == 2
+
+    second_failure = client.post(
+        f"/api/browser-collection/items/{item_id}/failure",
+        json=add_claim_credentials({
+            "error_type": "page_not_ready",
+            "error_message": "店铺页暂时未加载完成",
+        }, item_id),
+    )
+
+    assert second_failure.status_code == 200
+    assert db_session.get(BrowserCollectionItem, item_id).status == "FAILED"
+
+
 def test_collection_result_requires_claim_credentials(client, db_session):
     store = create_store(client, "990212")
     product = create_product(client, store["id"], "1005009921201")
@@ -499,6 +595,348 @@ def test_queued_store_writes_observed_and_pending_without_changing_pool(client, 
     assert metrics[target_date - timedelta(days=3)].estimated_sales == 0
     assert metrics[target_date - timedelta(days=3)].is_estimable is False
     assert metrics[target_date - timedelta(days=3)].reason == "ixspy_store_page_pending"
+
+
+def test_queued_store_accepts_verified_route_alias_bound_to_task_store(client, db_session):
+    store = create_store(client, "990142")
+    product = create_product(client, store["id"], "1005009914201")
+    target_date = date.today()
+    payload = monitored_store_payload("990142", product["aliexpress_product_id"], target_date, {})
+    alias_url = "https://www.aliexpress.com/store/990242/pages/all-items.html?shop_sortType=orders_desc"
+    payload["url"] = alias_url
+    payload["raw_data"]["visited_page_urls"] = [alias_url]
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990142",
+        "route_store_id": "990242",
+        "heading_store_id": "990142",
+    }
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.query(Product).filter_by(store_id=store["id"]).count() == 1
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    assert snapshot.raw_payload["diagnostics"]["visited_page_urls"] == [alias_url]
+
+
+def test_queued_store_accepts_route_alias_verified_by_explicit_store_id(client, db_session):
+    store = create_store(client, "990152")
+    product = create_product(client, store["id"], "1005009915201")
+    target_date = date.today()
+    alias_url = "https://www.aliexpress.com/store/990252/pages/all-items.html?shop_sortType=orders_desc"
+    payload = monitored_store_payload("990152", product["aliexpress_product_id"], target_date, {})
+    payload["url"] = alias_url
+    payload["raw_data"]["visited_page_urls"] = [alias_url]
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990152",
+        "route_store_id": "990252",
+        "heading_store_id": None,
+        "labeled_store_ids": ["990152"],
+    }
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    assert snapshot.raw_payload["diagnostics"]["visited_page_urls"] == [alias_url]
+
+
+def test_queued_store_accepts_backend_approved_url_identity(client, db_session):
+    store = create_store(client, "990154")
+    product = create_product(client, store["id"], "1005009915401")
+    target_date = date.today()
+    alias_url = "https://www.aliexpress.com/store/990254/pages/all-items.html?shop_sortType=orders_desc"
+    db_session.add(StoreUrlIdentity(
+        store_id=store["id"],
+        route_store_id="990254",
+        normalized_page_identity="www.aliexpress.com/store/990254/pages/all-items.html",
+        first_observed_url=alias_url,
+        evidence={"ixspy_store_name": "Reviewed Store"},
+    ))
+    db_session.commit()
+    payload = monitored_store_payload("990154", product["aliexpress_product_id"], target_date, {})
+    payload["url"] = alias_url
+    payload["raw_data"]["visited_page_urls"] = [alias_url]
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990154",
+        "route_store_id": "990254",
+        "heading_store_id": None,
+        "labeled_store_ids": [],
+        "ixspy_store_name": " Reviewed   Store ",
+        "identity_method": "backend_approved_url_alias",
+        "page_url": alias_url,
+    }
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+
+
+def test_queued_store_rejects_backend_approved_url_identity_with_conflicting_name(
+    client, db_session
+):
+    store = create_store(client, "990155")
+    product = create_product(client, store["id"], "1005009915501")
+    target_date = date.today()
+    alias_url = "https://www.aliexpress.com/store/990255/pages/all-items.html?shop_sortType=orders_desc"
+    db_session.add(StoreUrlIdentity(
+        store_id=store["id"],
+        route_store_id="990255",
+        normalized_page_identity="www.aliexpress.com/store/990255/pages/all-items.html",
+        first_observed_url=alias_url,
+        evidence={"ixspy_store_name": "Reviewed Store"},
+    ))
+    db_session.commit()
+    payload = monitored_store_payload("990155", product["aliexpress_product_id"], target_date, {})
+    payload["url"] = alias_url
+    payload["raw_data"]["visited_page_urls"] = [alias_url]
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990155",
+        "route_store_id": "990255",
+        "heading_store_id": None,
+        "labeled_store_ids": [],
+        "ixspy_store_name": "A Different Store",
+        "identity_method": "backend_approved_url_alias",
+        "page_url": alias_url,
+    }
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 409
+
+
+def test_queued_store_rejects_alias_with_conflicting_heading_even_if_store_id_label_matches(client):
+    store = create_store(client, "990153")
+    product = create_product(client, store["id"], "1005009915301")
+    target_date = date.today()
+    alias_url = "https://www.aliexpress.com/store/990253/pages/all-items.html?shop_sortType=orders_desc"
+    payload = monitored_store_payload("990153", product["aliexpress_product_id"], target_date, {})
+    payload["url"] = alias_url
+    payload["raw_data"]["visited_page_urls"] = [alias_url]
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990153",
+        "route_store_id": "990253",
+        "heading_store_id": "990999",
+        "labeled_store_ids": ["990153"],
+    }
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 409
+
+
+def test_queued_store_accepts_multiple_page_verified_route_aliases(client, db_session):
+    store = create_store(client, "990242")
+    product = create_product(client, store["id"], "1005009924201")
+    target_date = date.today()
+    payload = monitored_store_payload("990242", product["aliexpress_product_id"], target_date, {})
+    alias_urls = [
+        "https://www.aliexpress.com/store/990342/pages/all-items.html?page=1&shop_sortType=orders_desc",
+        "https://www.aliexpress.com/store/990442/pages/all-items.html?page=2&shop_sortType=orders_desc",
+    ]
+    payload["raw_data"]["visited_page_urls"] = alias_urls
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990242",
+        "route_store_id": "990442",
+        "heading_store_id": "990242",
+        "labeled_store_ids": ["990242"],
+    }
+    payload["raw_data"]["page_scans"] = [
+        {
+            "url": page_url,
+            "store_identity": {
+                "target_store_id": "990242",
+                "route_store_id": page_url.split("/store/")[1].split("/")[0],
+                "heading_store_id": "990242",
+                "labeled_store_ids": ["990242"],
+            },
+        }
+        for page_url in alias_urls
+    ]
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    assert snapshot.raw_payload["diagnostics"]["visited_page_urls"] == alias_urls
+
+
+def test_queued_store_advances_candidate_cursor_on_verified_route_alias(client, db_session):
+    store = create_store(client, "990149")
+    route_alias_id = "990249"
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    alias_page_one = (
+        f"https://www.aliexpress.com/store/{route_alias_id}/pages/all-items.html"
+        "?sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
+    candidate = _history_candidate("1005009934901", target_date)
+    candidate_page = _candidate_page(alias_page_one, route_alias_id, [candidate])
+    payload = _daily_store_request("990149", alias_page_one, target_date, [], candidate_page)
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990149",
+        "route_store_id": route_alias_id,
+        "heading_store_id": "990149",
+    }
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.query(Product).filter_by(store_id=store["id"], status="active").count() == 1
+    state = db_session.get(StorePageDiscoveryState, store["id"])
+    assert state.last_outcome == "advanced"
+    assert f"/store/{route_alias_id}/pages/all-items.html" in state.next_page_url
+    assert "page=2" in state.next_page_url
+
+
+def test_queued_store_rejects_route_alias_without_matching_page_identity(client, db_session):
+    store = create_store(client, "990150")
+    product = create_product(client, store["id"], "1005009915001")
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    alias_url = "https://www.aliexpress.com/store/990250/pages/all-items.html?shop_sortType=orders_desc"
+    payload = monitored_store_payload(
+        "990150", product["aliexpress_product_id"], target_date, {}
+    )
+    payload["url"] = alias_url
+    payload["raw_data"]["visited_page_urls"] = [alias_url]
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990150",
+        "route_store_id": "990250",
+        "heading_store_id": "990150",
+        "labeled_store_ids": ["990999"],
+    }
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 409
+
+
+def test_queued_store_accepts_unique_title_matched_product_id_alias(client, db_session):
+    store = create_store(client, "990143")
+    monitored_id = "1005010587192858"
+    observed_id = "3256810400878106"
+    monitored = create_product(client, store["id"], monitored_id)
+    target = db_session.get(Product, monitored["id"])
+    target.title = "已采集 No-Drill Toothbrush Holder"
+    db_session.commit()
+    target_date = date.today()
+    values = {target_date - timedelta(days=offset): offset for offset in range(1, 8)}
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+    payload = monitored_store_payload("990143", monitored_id, target_date, values)
+    page_url = payload["raw_data"]["visited_page_urls"][0]
+    payload["products"][0].update({
+        "title": "No-Drill Toothbrush Holder",
+        "observed_product_id": observed_id,
+        "observed_url": f"https://www.aliexpress.com/item/{observed_id}.html",
+        "observed_page_url": page_url,
+        "identity_match_method": "exact_title",
+    })
+    payload["raw_data"]["page_scans"] = [{
+        "url": page_url,
+        "visible_product_ids": [observed_id],
+        "identity_matches": [{
+            "monitored_product_id": monitored_id,
+            "observed_product_id": observed_id,
+            "match_method": "exact_title",
+            "page_url": page_url,
+        }],
+    }]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert db_session.query(Product).filter_by(store_id=store["id"]).count() == 1
+    assert db_session.get(Product, monitored["id"]).aliexpress_product_id == monitored_id
+    snapshot = db_session.query(ProductSnapshot).filter_by(product_id=monitored["id"]).one()
+    assert snapshot.raw_data["identity_match"] == {
+        "monitored_product_id": monitored_id,
+        "observed_product_id": observed_id,
+        "observed_url": f"https://www.aliexpress.com/item/{observed_id}.html",
+        "observed_page_url": page_url,
+        "match_method": "exact_title",
+    }
+
+
+def test_queued_store_rejects_title_mismatch_for_observed_product_id_alias(client, db_session):
+    store = create_store(client, "990144")
+    monitored_id = "1005010587192858"
+    observed_id = "3256810400878106"
+    monitored = create_product(client, store["id"], monitored_id)
+    db_session.get(Product, monitored["id"]).title = "No-Drill Toothbrush Holder"
+    db_session.commit()
+    target_date = date.today()
+    payload = monitored_store_payload("990144", monitored_id, target_date, {})
+    page_url = payload["raw_data"]["visited_page_urls"][0]
+    payload["products"][0].update({
+        "title": "A different product title",
+        "observed_product_id": observed_id,
+        "observed_url": f"https://www.aliexpress.com/item/{observed_id}.html",
+        "observed_page_url": page_url,
+        "identity_match_method": "exact_title",
+    })
+    payload["raw_data"]["page_scans"] = [{
+        "url": page_url,
+        "visible_product_ids": [observed_id],
+        "identity_matches": [{
+            "monitored_product_id": monitored_id,
+            "observed_product_id": observed_id,
+            "match_method": "exact_title",
+        }],
+    }]
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 409
+    assert "标题不匹配" in response.json()["detail"]
+    assert db_session.query(ProductSnapshot).filter_by(product_id=monitored["id"]).count() == 0
 
 
 def test_queued_store_persists_page_chart_and_worker_diagnostics(client, db_session):
@@ -745,7 +1183,8 @@ def test_collect_all_queues_real_stores_when_custom_monitor_container_exists(cli
 def test_store_claim_contains_only_active_monitored_ids(client, db_session):
     selected = create_store(client, "990106")
     other = create_store(client, "990107")
-    create_product(client, selected["id"], "1005009910602")
+    tracked = create_product(client, selected["id"], "1005009910602")
+    db_session.get(Product, tracked["id"]).title = "Tracked toothbrush holder"
     inactive = create_product(client, selected["id"], "1005009910601")
     create_product(client, other["id"], "1005009910701")
     db_session.get(Product, inactive["id"]).status = "inactive"
@@ -756,6 +1195,11 @@ def test_store_claim_contains_only_active_monitored_ids(client, db_session):
 
     assert claim["store_id"] == selected["id"]
     assert claim["monitored_product_ids"] == ["1005009910602"]
+    assert claim["monitored_products"] == [{
+        "platform_product_id": "1005009910602",
+        "title": "Tracked toothbrush holder",
+        "url": tracked["url"],
+    }]
 
 
 def test_manual_store_collection_queues_empty_pool_for_discovery(client, db_session):
@@ -1709,7 +2153,7 @@ def test_manual_today_rerun_keeps_filter_test_items_skipped(client, db_session):
     assert rerun.json()["pending_count"] == 0
 
 
-def test_challenge_pauses_and_resume_releases_the_item(client):
+def test_challenge_resume_preserves_the_claim_for_the_verified_store_tab(client):
     store = create_store(client, "990103")
     create_product(client, store["id"], "100500993001")
     client.post(
@@ -1730,7 +2174,24 @@ def test_challenge_pauses_and_resume_releases_the_item(client):
     resumed = client.post(f"/api/browser-collection/runs/{paused.json()['id']}/resume")
     assert resumed.status_code == 200
     assert resumed.json()["status"] == "RUNNING"
-    assert resumed.json()["current_item"] is None
+    current = resumed.json()["current_item"]
+    assert current["id"] == claim["id"]
+    assert current["status"] == "RUNNING"
+    assert current["attempt_count"] == 1
+
+    heartbeat = client.post(
+        "/api/browser-collection/heartbeat",
+        json={
+            "worker_id": _last_claim_credentials["worker_id"],
+            "active_claims": [{
+                "item_id": claim["id"],
+                "claim_token": _last_claim_credentials["claim_token"],
+            }],
+        },
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    assert heartbeat.json()["current_item"]["id"] == claim["id"]
+    assert request_claim(client).json()["item"] is None
 
 
 def test_completing_challenged_page_clears_pause_reason(client):
@@ -1896,6 +2357,41 @@ def test_manual_pause_preserves_pause_when_item_is_retried(client, db_session):
     assert retried.json()["paused_reason"] == "manual_pause"
 
 
+def test_retrying_failed_item_keeps_verification_blocked_queue_paused(client, db_session):
+    first_store = create_store(client, "991201")
+    second_store = create_store(client, "991202")
+    create_product(client, first_store["id"], "1005009912011")
+    create_product(client, second_store["id"], "1005009912021")
+    run = client.post(
+        "/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"}
+    ).json()
+    first, second = db_session.query(BrowserCollectionItem).order_by(
+        BrowserCollectionItem.position
+    ).all()
+    first.status = "NEEDS_VERIFICATION"
+    first.error_type = "platform_challenge"
+    first.error_message = "AliExpress 要求人工完成验证"
+    second.status = "FAILED"
+    second.error_type = "store_identity_mismatch"
+    second.error_message = "店铺身份不匹配"
+    run_row = db_session.get(BrowserCollectionRun, run["id"])
+    run_row.status = "NEEDS_VERIFICATION"
+    run_row.paused_reason = "platform_challenge"
+    run_row.dispatch_enabled = False
+    db_session.commit()
+
+    response = client.post(f"/api/browser-collection/items/{second.id}/retry")
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "NEEDS_VERIFICATION"
+    assert result["paused_reason"] == "platform_challenge"
+    assert result["dispatch_enabled"] is False
+    statuses = {item["id"]: item["status"] for item in result["items"]}
+    assert statuses[first.id] == "NEEDS_VERIFICATION"
+    assert statuses[second.id] == "PENDING"
+
+
 def test_expired_lease_can_be_reclaimed(client, db_session):
     store = create_store(client, "990104")
     create_product(client, store["id"], "100500994001")
@@ -2003,7 +2499,7 @@ def test_heartbeat_requeues_an_item_that_exceeds_the_max_runtime(client, db_sess
     )
     claimed = claim_item(client).json()["item"]
     item = db_session.get(BrowserCollectionItem, claimed["id"])
-    item.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=13)
+    item.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=21)
     item.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=4)
     db_session.commit()
 
@@ -2026,7 +2522,7 @@ def test_store_item_runtime_allows_longer_chart_batch(client, db_session):
     client.post(f"/api/stores/{store['id']}/browser-collection")
     claimed = claim_item(client).json()["item"]
     item = db_session.get(BrowserCollectionItem, claimed["id"])
-    item.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=5, seconds=30)
+    item.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=13)
     item.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
     db_session.commit()
 
@@ -2077,7 +2573,7 @@ def test_heartbeat_updates_counts_when_a_second_stalled_attempt_fails(client, db
     db_session.commit()
     second = claim_item(client).json()["item"]
     item = db_session.get(BrowserCollectionItem, second["id"])
-    item.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=13)
+    item.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=21)
     db_session.commit()
 
     response = client.post(
@@ -2298,6 +2794,79 @@ def test_empty_pool_daily_store_accepts_candidate_page(client, db_session):
     assert len(metrics) == 7
 
 
+def test_daily_pool_fill_reactivates_only_reset_cleared_products(client, db_session):
+    store = create_store(client, "990317")
+    reset_cleared = create_product(client, store["id"], "1005009931701")
+    manually_deactivated = create_product(client, store["id"], "1005009931702")
+    reset_product = db_session.get(Product, reset_cleared["id"])
+    reset_product.status = "inactive"
+    reset_product.pool_reset_reactivation_eligible = True
+    manual_product = db_session.get(Product, manually_deactivated["id"])
+    manual_product.status = "inactive"
+    db_session.commit()
+
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    reset_candidate = _history_candidate(reset_product.aliexpress_product_id, target_date)
+    manual_candidate = _history_candidate(manual_product.aliexpress_product_id, target_date)
+    payload = _daily_store_request(
+        "990317", page_url, target_date, [],
+        _candidate_page(page_url, "990317", [reset_candidate, manual_candidate]),
+    )
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert reset_product.status == "active"
+    assert reset_product.pool_reset_reactivation_eligible is False
+    assert manual_product.status == "inactive"
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    scan = snapshot.raw_payload["diagnostics"]["candidate_scan"]
+    assert scan["added_ids"] == [reset_product.aliexpress_product_id]
+    assert {
+        item["product_id"]: item["reason"] for item in scan["skip_reasons"]
+    } == {manual_product.aliexpress_product_id: "inactive_product_not_reactivated"}
+
+
+def test_reset_cleared_candidate_requires_complete_daily_history(client, db_session):
+    store = create_store(client, "990318")
+    product_data = create_product(client, store["id"], "1005009931801")
+    product = db_session.get(Product, product_data["id"])
+    product.status = "inactive"
+    product.pool_reset_reactivation_eligible = True
+    db_session.commit()
+
+    target_date = date.today()
+    client.post("/api/browser-collection/runs/ensure", json={"target_date": target_date.isoformat()})
+    claim = claim_item(client).json()["item"]
+    page_url = claim["discovery_page_url"]
+    incomplete = _history_candidate(product.aliexpress_product_id, target_date, complete=False)
+    payload = _daily_store_request(
+        "990318", page_url, target_date, [],
+        _candidate_page(page_url, "990318", [incomplete]),
+    )
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert product.status == "inactive"
+    assert product.pool_reset_reactivation_eligible is True
+    snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
+    scan = snapshot.raw_payload["diagnostics"]["candidate_scan"]
+    assert scan["skip_reasons"] == [{
+        "product_id": product.aliexpress_product_id,
+        "reason": "incomplete_or_cumulative_ixspy",
+    }]
+
+
 def test_candidate_page_with_unknown_pagination_fills_pool_without_wrapping_cursor(client, db_session):
     store = create_store(client, "990313")
     target_date = date.today()
@@ -2437,3 +3006,295 @@ def test_malformed_candidate_page_url_preserves_monitored_metrics(client, db_ses
     assert all(metric.is_estimable for metric in metrics)
     assert db_session.get(StorePageDiscoveryState, store["id"]).next_page_url == page_url
     assert response.json()["items"][0]["status"] == "PARTIAL"
+
+
+def _identity_review_payload(claim, page_url=None, *, route_store_id="1105179516"):
+    return {
+        "worker_id": "worker-test",
+        "claim_token": claim["claim_token"],
+        "page_url": page_url
+        or f"https://www.aliexpress.com/store/{route_store_id}/pages/all-items.html?sortType=orders_desc",
+        "identity_error_type": "store_identity_mismatch",
+        "error_message": "页面身份与监控店铺信息不一致",
+        "evidence": {
+            "route_store_id": route_store_id,
+            "heading_store_id": None,
+            "labeled_store_ids": [],
+            "page_title": "AMZSTEM Pop Toys Store - AliExpress",
+            "ixspy_store_name": "AMZSTEM Pop Toys Store",
+            "identity_method": "ixspy_store_name",
+        },
+    }
+
+
+def _report_identity_review(client, claim, payload=None):
+    return client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review",
+        json=payload or _identity_review_payload(claim),
+    )
+
+
+def test_store_identity_review_pauses_with_structured_evidence(client, db_session):
+    store = create_store(client, "990321")
+    create_product(client, store["id"], "1005009932101")
+    claim = claim_item(client).json()
+
+    response = _report_identity_review(client, claim)
+
+    assert response.status_code == 200, response.text
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    assert item.status == "NEEDS_VERIFICATION"
+    assert item.error_type == "store_identity_review"
+    assert item.identity_review_url == _identity_review_payload(claim)["page_url"]
+    assert item.identity_review_evidence["identity_error_type"] == "store_identity_mismatch"
+    assert item.identity_review_evidence["ixspy_store_name"] == "AMZSTEM Pop Toys Store"
+    assert response.json()["status"] == "NEEDS_VERIFICATION"
+    assert response.json()["paused_reason"] == "store_identity_review"
+    assert response.json()["dispatch_enabled"] is False
+    assert response.json()["current_item"]["identity_review_pending"] is True
+
+
+def test_confirm_store_identity_review_records_alias_and_resumes_current_item(
+    client, db_session
+):
+    store = create_store(client, "990322")
+    create_product(client, store["id"], "1005009932201")
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
+    )
+
+    assert response.status_code == 200, response.text
+    alias = db_session.query(StoreUrlIdentity).one()
+    assert alias.store_id == store["id"]
+    assert alias.route_store_id == "1105179516"
+    assert alias.normalized_page_identity == (
+        "www.aliexpress.com/store/1105179516/pages/all-items.html"
+    )
+    assert alias.source_item_id == claim["item"]["id"]
+    assert alias.evidence["ixspy_store_name"] == "AMZSTEM Pop Toys Store"
+    current = response.json()["current_item"]
+    assert current["id"] == claim["item"]["id"]
+    assert current["status"] == "RUNNING"
+    assert response.json()["status"] == "RUNNING"
+    assert response.json()["paused_reason"] is None
+    assert response.json()["dispatch_enabled"] is True
+
+
+def test_store_collection_items_receive_only_their_store_approved_url_identities(
+    client, db_session
+):
+    first_store = create_store(client, "990331")
+    create_product(client, first_store["id"], "1005009933101")
+    second_store = create_store(client, "990332")
+    create_product(client, second_store["id"], "1005009933201")
+    aliases = [
+        StoreUrlIdentity(
+            store_id=first_store["id"],
+            route_store_id="1105179516",
+            normalized_page_identity=(
+                "www.aliexpress.com/store/1105179516/pages/all-items.html"
+            ),
+            first_observed_url=(
+                "https://www.aliexpress.com/store/1105179516/pages/all-items.html"
+            ),
+            evidence={"ixspy_store_name": "AMZSTEM Pop Toys Store"},
+        ),
+        StoreUrlIdentity(
+            store_id=second_store["id"],
+            route_store_id="1105182474",
+            normalized_page_identity=(
+                "www.aliexpress.com/store/1105182474/pages/all-items.html"
+            ),
+            first_observed_url=(
+                "https://www.aliexpress.com/store/1105182474/pages/all-items.html"
+            ),
+            evidence={"ixspy_store_name": "Other Store"},
+        ),
+    ]
+    db_session.add_all(aliases)
+    db_session.commit()
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+
+    response = client.get("/api/browser-collection/runs/today")
+
+    assert response.status_code == 200
+    store_items = {
+        item["store_id"]: item
+        for item in response.json()["items"]
+        if item["target_type"] == "STORE"
+    }
+    assert store_items[first_store["id"]]["approved_store_url_identities"] == [{
+        "route_store_id": "1105179516",
+        "normalized_page_identity": (
+            "www.aliexpress.com/store/1105179516/pages/all-items.html"
+        ),
+        "evidence": {"ixspy_store_name": "AMZSTEM Pop Toys Store"},
+    }]
+    assert store_items[second_store["id"]]["approved_store_url_identities"] == [{
+        "route_store_id": "1105182474",
+        "normalized_page_identity": (
+            "www.aliexpress.com/store/1105182474/pages/all-items.html"
+        ),
+        "evidence": {"ixspy_store_name": "Other Store"},
+    }]
+
+
+def test_reject_store_identity_review_fails_item_without_alias_and_keeps_run_paused(
+    client, db_session
+):
+    store = create_store(client, "990323")
+    create_product(client, store["id"], "1005009932301")
+    another_store = create_store(client, "9903231")
+    create_product(client, another_store["id"], "1005009932311")
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/reject"
+    )
+
+    assert response.status_code == 200, response.text
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    assert item.status == "FAILED"
+    assert item.error_type == "store_identity_rejected"
+    assert db_session.query(StoreUrlIdentity).count() == 0
+    assert response.json()["status"] == "PAUSED"
+    assert response.json()["paused_reason"] == "store_identity_rejected"
+    assert response.json()["dispatch_enabled"] is False
+    assert response.json()["pending_count"] == 1
+
+
+def test_identity_confirmation_is_idempotent_and_rejects_cross_store_collision(
+    client, db_session
+):
+    first_store = create_store(client, "990324")
+    create_product(client, first_store["id"], "1005009932401")
+    second_store = create_store(client, "990325")
+    create_product(client, second_store["id"], "1005009932501")
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    first_claim = claim_item(client).json()
+    first_review = _report_identity_review(client, first_claim)
+    assert first_review.status_code == 200, first_review.text
+
+    first_confirm = client.post(
+        f"/api/browser-collection/items/{first_claim['item']['id']}/identity-review/confirm"
+    )
+    repeated_confirm = client.post(
+        f"/api/browser-collection/items/{first_claim['item']['id']}/identity-review/confirm"
+    )
+    assert first_confirm.status_code == 200, first_confirm.text
+    assert repeated_confirm.status_code == 200, repeated_confirm.text
+    assert db_session.query(StoreUrlIdentity).count() == 1
+
+    failed = client.post(
+        f"/api/browser-collection/items/{first_claim['item']['id']}/failure",
+        json=add_claim_credentials(
+            {"error_type": "test_terminal", "error_message": "finish first task"},
+            first_claim["item"]["id"],
+        ),
+    )
+    assert failed.status_code == 200, failed.text
+    second_claim = request_claim(client).json()
+    assert second_claim["item"]["store_id"] == second_store["id"]
+    second_review = _report_identity_review(client, second_claim)
+    assert second_review.status_code == 200, second_review.text
+
+    collision = client.post(
+        f"/api/browser-collection/items/{second_claim['item']['id']}/identity-review/confirm"
+    )
+
+    assert collision.status_code == 409
+    assert db_session.query(StoreUrlIdentity).count() == 1
+    assert db_session.get(BrowserCollectionItem, second_claim["item"]["id"]).status == (
+        "NEEDS_VERIFICATION"
+    )
+
+
+def test_identity_decision_rejects_stale_or_unclaimed_item(client, db_session):
+    store = create_store(client, "990326")
+    create_product(client, store["id"], "1005009932601")
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    item = db_session.query(BrowserCollectionItem).filter_by(target_type="STORE").one()
+
+    response = client.post(
+        f"/api/browser-collection/items/{item.id}/identity-review/confirm"
+    )
+
+    assert response.status_code == 409
+    assert db_session.query(StoreUrlIdentity).count() == 0
+    assert item.status == "PENDING"
+
+
+def test_identity_review_rejects_url_evidence_mismatch(client, db_session):
+    store = create_store(client, "990327")
+    create_product(client, store["id"], "1005009932701")
+    claim = claim_item(client).json()
+    payload = _identity_review_payload(
+        claim,
+        "https://www.aliexpress.com/store/1105182474/pages/all-items.html",
+        route_store_id="1105179516",
+    )
+
+    response = _report_identity_review(client, claim, payload)
+
+    assert response.status_code == 409
+    assert db_session.get(BrowserCollectionItem, claim["item"]["id"]).status == "RUNNING"
+    assert db_session.query(StoreUrlIdentity).count() == 0
+
+
+def test_confirmation_requires_online_selected_worker_without_partial_mutation(
+    client, db_session
+):
+    store = create_store(client, "990328")
+    create_product(client, store["id"], "1005009932801")
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+    worker = db_session.get(BrowserCollectionWorker, "worker-test")
+    worker.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    db_session.commit()
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
+    )
+
+    assert response.status_code == 409
+    assert db_session.query(StoreUrlIdentity).count() == 0
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    run = db_session.get(BrowserCollectionRun, claim["item"]["run_id"])
+    assert item.status == "NEEDS_VERIFICATION"
+    assert item.error_type == "store_identity_review"
+    assert run.paused_reason == "store_identity_review"
+    assert run.dispatch_enabled is False
+
+
+def test_platform_challenge_cannot_use_identity_decisions(client, db_session):
+    store = create_store(client, "990329")
+    create_product(client, store["id"], "1005009932901")
+    claim = claim_item(client).json()
+    challenge = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/challenge",
+        json={
+            "worker_id": "worker-test",
+            "claim_token": claim["claim_token"],
+            "error_message": "AliExpress CAPTCHA",
+            "page_url": "https://www.aliexpress.com/punish",
+        },
+    )
+    assert challenge.status_code == 200, challenge.text
+
+    report = _report_identity_review(client, claim)
+    confirm = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
+    )
+    reject = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/reject"
+    )
+
+    assert report.status_code == 409
+    assert confirm.status_code == 409
+    assert reject.status_code == 409
+    assert challenge.json()["paused_reason"] == "platform_challenge"
+    assert db_session.query(StoreUrlIdentity).count() == 0

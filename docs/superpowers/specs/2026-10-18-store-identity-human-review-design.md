@@ -1,6 +1,6 @@
 # Store Identity Human Review and URL Alias Design
 
-**Status:** Awaiting user review
+**Status:** 用户已确认；源码与自动化测试已完成，生产部署另行授权
 **Date:** 2026-10-18
 
 ## Goal

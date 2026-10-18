@@ -9,10 +9,13 @@ const FIRST_PRODUCT_NOTIFICATION_ID = "aliexpress-monitor-first-product";
 const DIANXIAOMI_NOTIFICATION_ID = "aliexpress-monitor-dianxiaomi-confirmation";
 const DIANXIAOMI_URL = "https://www.dianxiaomi.com/web/productCrawl/dataAcquisition";
 const COLLECTION_RESPONSE_TIMEOUT_MS = 90 * 1000;
-const STORE_COLLECTION_RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
+const STORE_COLLECTION_RESPONSE_TIMEOUT_MS = 18 * 60 * 1000;
 const STORE_PAGE_RESPONSE_TIMEOUT_MS = 4 * 60 * 1000;
-const STORE_COLLECTION_WORK_MS = 8 * 60 * 1000;
+const STORE_CANDIDATE_SCAN_RESPONSE_TIMEOUT_MS = 15 * 60 * 1000;
+const STORE_PAGE_NAVIGATION_TIMEOUT_MS = 90 * 1000;
+const STORE_COLLECTION_WORK_MS = 15 * 60 * 1000;
 const STORE_PROGRESS_STORAGE_PREFIX = "browserCollectionStoreProgress:";
+const POOL_RESET_CAPABILITY = "store_pool_reset_v1";
 const tabProductIds = new Map();
 let automationBusy = false;
 let automationGeneration = 0;
@@ -257,6 +260,7 @@ async function automationState() {
     "reviewKnownKeys",
     "reviewProbeResult",
     "challengePaused",
+    "identityReviewPaused",
     "challengeProvider",
     "firstProductPresentedRunId",
     "browserCollectionWorkerMode",
@@ -301,7 +305,6 @@ async function ensureIdleAutomationTab(workerWindow, state) {
     ? await chrome.tabs.get(state.idleAutomationTabId).catch(() => null)
     : null;
   const idleTab = (trackedIdleTab?.windowId === workerWindow.id
-    && trackedIdleTab.url === "about:blank"
     && !protectedTabIds.has(trackedIdleTab.id)
     ? trackedIdleTab
     : null)
@@ -321,15 +324,39 @@ async function ensureIdleAutomationTab(workerWindow, state) {
   return idleTab;
 }
 
+async function groupAutomationTabs(tabIds, windowId) {
+  const eligibleTabs = (await Promise.all([...new Set(tabIds)].map((tabId) => chrome.tabs.get(tabId).catch(() => null))))
+    .filter((tab) => tab && tab.windowId === windowId);
+  if (!eligibleTabs.length) return null;
+  const saved = await chrome.storage.local.get(["automationTabGroupId", "automationTabGroupWindowId"]);
+  let groupId = saved.automationTabGroupWindowId === windowId ? saved.automationTabGroupId : null;
+  try {
+    if (!groupId || !(await chrome.tabGroups.get(groupId).catch(() => null))) {
+      groupId = await chrome.tabs.group({ tabIds: eligibleTabs.map((tab) => tab.id) });
+    } else {
+      await chrome.tabs.group({ tabIds: eligibleTabs.map((tab) => tab.id), groupId });
+    }
+    await chrome.storage.local.set({ automationTabGroupId: groupId, automationTabGroupWindowId: windowId });
+    await chrome.tabGroups.update(groupId, { title: "AliExpress 采集任务", color: "green", collapsed: true });
+    return groupId;
+  } catch {
+    return null;
+  }
+}
+
 async function ensureAutomationWindow({ ensureIdle = true, focus = null } = {}) {
   const state = await automationState();
   const foregroundCollection = focus ?? state.browserCollectionWorkerMode === true;
   const windowState = foregroundCollection
     ? "maximized"
     : state.browserCollectionIsolatedProfileAuthorized === true ? "normal" : "minimized";
+  const dashboardTab = state.automationDashboardTabId
+    ? await chrome.tabs.get(state.automationDashboardTabId).catch(() => null)
+    : null;
   let workerWindow = state.automationWindowId && state.automationWindowBackground
     ? await chrome.windows.get(state.automationWindowId).catch(() => null)
     : null;
+  if (workerWindow?.id && workerWindow.id === dashboardTab?.windowId) workerWindow = null;
   if (workerWindow?.id) {
     await chrome.windows.update(workerWindow.id, { focused: foregroundCollection, state: windowState }).catch(() => undefined);
   } else {
@@ -350,6 +377,41 @@ async function ensureAutomationWindow({ ensureIdle = true, focus = null } = {}) 
   });
   if (ensureIdle) await ensureIdleAutomationTab(workerWindow, state);
   return workerWindow;
+}
+
+async function migrateTrackedAutomationTabs(state) {
+  const dashboardTab = state.automationDashboardTabId
+    ? await chrome.tabs.get(state.automationDashboardTabId).catch(() => null)
+    : null;
+  if (!dashboardTab) return state;
+  const trackedTabIds = [state.automationTabId, state.prefetchedTabId, state.idleAutomationTabId]
+    .filter((tabId) => Number.isInteger(tabId) && tabId !== dashboardTab.id);
+  const trackedTabs = await Promise.all(trackedTabIds.map((tabId) => chrome.tabs.get(tabId).catch(() => null)));
+  const tabsToMove = trackedTabs.filter((tab) => tab?.windowId === dashboardTab.windowId);
+  if (!tabsToMove.length) return state;
+
+  const workerWindow = await ensureAutomationWindow({ ensureIdle: false });
+  if (!workerWindow) return state;
+  for (const tab of tabsToMove) {
+    await chrome.tabs.move(tab.id, { windowId: workerWindow.id, index: -1 });
+    const movedTab = await chrome.tabs.get(tab.id).catch(() => null);
+    if (movedTab?.windowId !== workerWindow.id) {
+      throw new Error("采集页未能迁移到独立采集窗口，暂不继续处理在途任务");
+    }
+  }
+
+  const taskTabIds = [state.automationTabId, state.prefetchedTabId]
+    .filter((tabId) => Number.isInteger(tabId));
+  await groupAutomationTabs(taskTabIds, workerWindow.id);
+  if (Number.isInteger(state.automationTabId)) {
+    await chrome.tabs.update(state.automationTabId, { active: true }).catch(() => undefined);
+  }
+  if (state.browserCollectionWorkerMode === true) {
+    await chrome.windows.update(workerWindow.id, { focused: true, state: "maximized" }).catch(() => undefined);
+  }
+  const migratedState = await automationState();
+  await ensureIdleAutomationTab(workerWindow, migratedState);
+  return automationState();
 }
 
 async function guardAutomationWindowFocus(windowId) {
@@ -389,8 +451,8 @@ async function syncDedicatedWorkerMode() {
       "https://*.onrender.com/*",
     ],
   });
-  const isolatedLocalTab = tabs.some((tab) => isIsolatedBrowserCollectorUrl(tab.url));
-  const remoteWorkerTab = tabs.some((tab) => {
+  const isolatedLocalTab = tabs.find((tab) => isIsolatedBrowserCollectorUrl(tab.url));
+  const remoteWorkerTab = tabs.find((tab) => {
     try {
       const url = new URL(tab.url);
       return url.searchParams.get("browser_collection") === "1"
@@ -419,13 +481,16 @@ async function syncDedicatedWorkerMode() {
   });
   const dianxiaomiEnabled = localDianxiaomiWorker
     || (state.dianxiaomiLocalProfileEnabled === true && !explicitNonLocalWorker);
-  const isolatedLocalEnabled = isolatedLocalTab || state.browserCollectionIsolatedProfileAuthorized === true;
-  const remoteWorkerEnabled = remoteWorkerTab || state.browserCollectionRemoteProfileEnabled === true;
+  const isolatedLocalEnabled = Boolean(isolatedLocalTab);
+  const remoteWorkerEnabled = Boolean(remoteWorkerTab);
   await chrome.storage.local.set({
     browserCollectionWorkerMode: isolatedLocalEnabled || remoteWorkerEnabled,
     browserCollectionLocalProfileEnabled: isolatedLocalEnabled,
     browserCollectionIsolatedProfileAuthorized: isolatedLocalEnabled,
     browserCollectionRemoteProfileEnabled: remoteWorkerEnabled,
+    ...((isolatedLocalTab || remoteWorkerTab)
+      ? { automationDashboardTabId: (isolatedLocalTab || remoteWorkerTab).id }
+      : {}),
     dianxiaomiWorkerMode: dianxiaomiEnabled,
     dianxiaomiLocalProfileEnabled: localDianxiaomiWorker
       || (state.dianxiaomiLocalProfileEnabled === true && !explicitNonLocalWorker),
@@ -448,7 +513,7 @@ async function ensureWorkerModesInitialized() {
 async function clearAutomationItem() {
   await chrome.storage.local.remove([
     "automationItem", "automationClaimToken", "automationItemPrefetched", "automationTaskKind", "reviewKnownKeys", "reviewProbeResult",
-    "challengePaused", "challengeProvider",
+    "challengePaused", "identityReviewPaused", "challengeProvider",
   ]);
 }
 
@@ -461,33 +526,35 @@ async function releaseAutomationTab(tabId) {
   const existingIdleTab = state.idleAutomationTabId && state.idleAutomationTabId !== tabId
     ? await chrome.tabs.get(state.idleAutomationTabId).catch(() => null)
     : null;
-  const idleTabId = existingIdleTab?.windowId === state.automationWindowId && existingIdleTab.url === "about:blank"
-    ? existingIdleTab.id
-    : tabId;
+  const existingIdleIsReusable = existingIdleTab?.windowId === state.automationWindowId
+    && existingIdleTab.id !== state.automationDashboardTabId;
   if (state.automationTabId === tabId) {
     if (state.prefetchedItem && state.prefetchedTabId) {
+      if (existingIdleIsReusable) await chrome.tabs.remove(existingIdleTab.id).catch(() => undefined);
       await chrome.storage.local.set({
         automationTabId: state.prefetchedTabId,
         automationItem: state.prefetchedItem,
         ...(state.prefetchedClaimToken ? { automationClaimToken: state.prefetchedClaimToken } : {}),
         automationItemPrefetched: true,
         automationTaskKind: state.prefetchedTaskKind || "PRODUCT",
-        idleAutomationTabId: idleTabId,
         ...(state.prefetchedTaskKind === "REVIEW" ? { reviewKnownKeys: state.prefetchedReviewKnownKeys || [] } : {}),
       });
+      await chrome.storage.local.remove("idleAutomationTabId");
       await chrome.storage.local.remove([
         "prefetchedTabId", "prefetchedItem", "prefetchedClaimToken", "prefetchedTaskKind", "prefetchedReviewKnownKeys",
       ]);
       await chrome.tabs.update(state.prefetchedTabId, { active: true }).catch(() => undefined);
       return;
     }
+    if (existingIdleIsReusable) await chrome.tabs.remove(existingIdleTab.id).catch(() => undefined);
     await clearAutomationItem();
-    await chrome.storage.local.set({ idleAutomationTabId: idleTabId });
+    await chrome.storage.local.remove("automationTabId");
+    await chrome.storage.local.set({ idleAutomationTabId: tabId });
     return;
   }
   if (state.prefetchedTabId === tabId) {
     await clearPrefetchedItem();
-    await chrome.storage.local.set({ idleAutomationTabId: idleTabId });
+    await chrome.storage.local.set({ idleAutomationTabId: existingIdleIsReusable ? existingIdleTab.id : tabId });
   }
 }
 
@@ -504,7 +571,9 @@ async function holdPrefetchedItem(reason) {
     }),
   }).catch(() => undefined);
   if (state.prefetchedTabId) {
-    await closeItemTab(state.prefetchedTabId);
+    const prefetchedTabId = state.prefetchedTabId;
+    await clearPrefetchedItem();
+    await chrome.tabs.remove(prefetchedTabId).catch(() => undefined);
   } else {
     await clearPrefetchedItem();
   }
@@ -552,6 +621,10 @@ async function sendCollectMessage(
     ...(storeProgressContext ? {
       item_id: storeProgressContext.itemId,
       claim_token: storeProgressContext.claimToken,
+      monitored_products: storeProgressContext.monitoredProducts || [],
+      expected_store_id: storeProgressContext.expectedStoreId,
+      verified_store_identity: storeProgressContext.verifiedStoreIdentity || null,
+      approved_store_url_identities: storeProgressContext.approvedStoreUrlIdentities || [],
     } : {}),
   };
   try {
@@ -562,12 +635,17 @@ async function sendCollectMessage(
   }
 }
 
-async function sendStoreCandidateScanMessage(tabId, targetDate, storeId, pageUrl) {
+async function sendStoreCandidateScanMessage(tabId, item, storeId, pageUrl, storeIdentity, priorCandidates) {
   const message = {
     type: "STORE_CANDIDATE_SCAN",
-    targetDate,
+    targetDate: item.target_date,
+    item_id: item.id,
+    claim_token: (await automationState()).automationClaimToken,
     expectedStoreId: storeId,
     expectedPageUrl: pageUrl,
+    verifiedStoreIdentity: storeIdentity || null,
+    approvedStoreUrlIdentities: item.approved_store_url_identities || [],
+    priorCandidates: priorCandidates || [],
   };
   try {
     return await chrome.tabs.sendMessage(tabId, message);
@@ -577,16 +655,136 @@ async function sendStoreCandidateScanMessage(tabId, targetDate, storeId, pageUrl
   }
 }
 
-function safeStoreOrdersUrl(url, storeId) {
+function safeStoreOrdersUrl(url, storeId, routeAliasId = null) {
   try {
     const parsed = new URL(url);
+    const allowedIds = new Set([String(storeId), ...(routeAliasId ? [String(routeAliasId)] : [])]);
+    const routeId = parsed.pathname.match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
     return /(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
       && parsed.protocol === "https:"
-      && parsed.pathname === `/store/${storeId}/pages/all-items.html`
+      && allowedIds.has(routeId)
       && parsed.searchParams.get("shop_sortType") === "orders_desc";
   } catch {
     return false;
   }
+}
+
+function storeOrdersPageIdentity(url) {
+  try {
+    const parsed = new URL(url);
+    if (!/(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
+      || parsed.protocol !== "https:"
+      || parsed.searchParams.get("shop_sortType") !== "orders_desc") return null;
+    const storeId = parsed.pathname.match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
+    if (!storeId) return null;
+    const pageParam = [...parsed.searchParams.entries()]
+      .find(([key]) => ["page", "pagenum", "pageno"].includes(key.toLowerCase()));
+    return { storeId, page: pageParam?.[1] || "1" };
+  } catch {
+    return null;
+  }
+}
+
+function storeOrdersUrlIdentity(url) {
+  const page = storeOrdersPageIdentity(url);
+  if (!page) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) return null;
+    return {
+      route_store_id: page.storeId,
+      normalized_page_identity: `${parsed.hostname.toLowerCase()}${parsed.pathname}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function approvedStoreUrlIdentity(url, storeId, approvedIdentities = []) {
+  const current = storeOrdersUrlIdentity(url);
+  if (!current || !Array.isArray(approvedIdentities)) return null;
+  return approvedIdentities.find((identity) =>
+    String(identity?.route_store_id || "") === current.route_store_id
+    && identity?.normalized_page_identity === current.normalized_page_identity
+    && String(storeId || "") !== current.route_store_id
+  ) || null;
+}
+
+function normalizedStoreName(value) {
+  return typeof value === "string"
+    ? value.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase()
+    : "";
+}
+
+function storeIdentityProofHasConflict(proof, storeId) {
+  const displayedIds = [proof?.heading_store_id, ...(proof?.labeled_store_ids || [])]
+    .filter((value) => value != null).map(String);
+  return displayedIds.some((id) => id !== String(storeId));
+}
+
+function storeRouteAliasIsVerified(url, storeId, approvedIdentities, proof) {
+  const page = storeOrdersPageIdentity(url);
+  if (!page || page.storeId === String(storeId) || !proof
+    || proof.target_store_id !== String(storeId)
+    || String(proof.route_store_id) !== page.storeId
+    || storeIdentityProofHasConflict(proof, storeId)) return false;
+  const matchingDisplayedId = String(proof.heading_store_id || "") === String(storeId)
+    || (Array.isArray(proof.labeled_store_ids)
+      && proof.labeled_store_ids.map(String).includes(String(storeId)));
+  if (matchingDisplayedId) return true;
+  if (proof.page_url !== url) return false;
+
+  const approvedAlias = approvedStoreUrlIdentity(url, storeId, approvedIdentities);
+  const savedName = approvedAlias?.evidence?.ixspy_store_name;
+  const currentName = proof.ixspy_store_name;
+  const namesConflict = Boolean(savedName && currentName
+    && normalizedStoreName(savedName) !== normalizedStoreName(currentName));
+  const proofPage = storeOrdersUrlIdentity(proof.page_url);
+  const currentPage = storeOrdersUrlIdentity(url);
+  return Boolean(approvedAlias
+    && proof.identity_method === "backend_approved_url_alias"
+    && proofPage?.route_store_id === currentPage?.route_store_id
+    && proofPage?.normalized_page_identity === currentPage?.normalized_page_identity
+    && !namesConflict);
+}
+
+function storeOrdersUrlAllowedForTask(url, storeId, approvedIdentities = [], identityProof = null) {
+  const page = storeOrdersPageIdentity(url);
+  if (!page) return false;
+  if (page.storeId === String(storeId)) return true;
+  if (approvedStoreUrlIdentity(url, storeId, approvedIdentities)) return true;
+  const proofPage = storeOrdersUrlIdentity(identityProof?.page_url);
+  const currentPage = storeOrdersUrlIdentity(url);
+  const explicitIds = [identityProof?.heading_store_id, ...(identityProof?.labeled_store_ids || [])]
+    .filter((value) => value != null).map(String);
+  return Boolean(identityProof
+    && identityProof.target_store_id === String(storeId)
+    && proofPage?.route_store_id === currentPage?.route_store_id
+    && proofPage?.normalized_page_identity === currentPage?.normalized_page_identity
+    && explicitIds.includes(String(storeId))
+    && !storeIdentityProofHasConflict(identityProof, storeId));
+}
+
+function inferredNextStoreOrdersUrl(url, storeId, routeAliasId = null) {
+  const identity = storeOrdersPageIdentity(url);
+  const allowedIds = new Set([String(storeId), ...(routeAliasId ? [String(routeAliasId)] : [])]);
+  if (!identity || !allowedIds.has(identity.storeId)) return null;
+  const parsed = new URL(url);
+  const pageParam = [...parsed.searchParams.keys()]
+    .find((key) => ["page", "pagenum", "pageno"].includes(key.toLowerCase())) || "page";
+  const currentPage = parsed.searchParams.get(pageParam) || "1";
+  if (!/^\d+$/.test(currentPage)) return null;
+  parsed.searchParams.set(pageParam, String(Number(currentPage) + 1));
+  return parsed.href;
+}
+
+function isPendingStorePage(tab, expectedUrl) {
+  if (!tab?.pendingUrl) return false;
+  const pendingPage = storeOrdersPageIdentity(tab.pendingUrl);
+  const expectedPage = storeOrdersPageIdentity(expectedUrl);
+  return Boolean(pendingPage && expectedPage
+    && pendingPage.storeId === expectedPage.storeId
+    && pendingPage.page === expectedPage.page);
 }
 
 function storeProgressKey(itemId) {
@@ -644,10 +842,44 @@ function addVisitedStorePage(progress, pageUrl) {
   }
 }
 
+function expectedStoreCollectionDates(targetDate) {
+  const target = Date.parse(`${targetDate}T00:00:00Z`);
+  return Number.isFinite(target)
+    ? Array.from({ length: 7 }, (_, index) => new Date(target - (7 - index) * 86400000).toISOString().slice(0, 10))
+    : [];
+}
+
 function mergeStoreDiagnosticRecord(records, diagnostic, key, limit) {
   if (!diagnostic || !diagnostic[key]) return Array.isArray(records) ? records : [];
   const existing = Array.isArray(records) ? records : [];
-  return [...existing.filter((record) => record?.[key] !== diagnostic[key]), diagnostic].slice(-limit);
+  const previous = existing.find((record) => record?.[key] === diagnostic[key]);
+  let merged = diagnostic;
+  if (previous && key === "url") {
+    merged = { ...previous, ...diagnostic };
+    for (const field of ["visible_product_ids", "matched_product_ids"]) {
+      if (Array.isArray(previous[field]) || Array.isArray(diagnostic[field])) {
+        merged[field] = [...new Set([
+          ...(previous[field] || []),
+          ...(diagnostic[field] || []),
+        ].map(String))];
+      }
+    }
+    if (Array.isArray(previous.identity_matches) || Array.isArray(diagnostic.identity_matches)) {
+      const matches = new Map();
+      for (const match of [...(previous.identity_matches || []), ...(diagnostic.identity_matches || [])]) {
+        if (!match || typeof match !== "object") continue;
+        const identity = JSON.stringify([
+          match.monitored_product_id,
+          match.observed_product_id,
+          match.match_method,
+          match.page_url,
+        ]);
+        matches.set(identity, match);
+      }
+      merged.identity_matches = [...matches.values()];
+    }
+  }
+  return [...existing.filter((record) => record?.[key] !== diagnostic[key]), merged].slice(-limit);
 }
 
 function mergeStoreDiagnostics(progress, diagnostics) {
@@ -670,12 +902,16 @@ async function saveStoreProductProgress(message, sender, sendResponse) {
     const productId = String(product?.platform_product_id || "");
     const targets = [...new Set((item?.monitored_product_ids || []).map(String))].sort();
     const pageUrl = sender?.tab?.url;
+    const routeId = storeOrdersPageIdentity(pageUrl)?.storeId;
+    const identity = product?.store_identity;
+    const routeAliasIsVerified = routeId !== storeId
+      && storeRouteAliasIsVerified(pageUrl, storeId, item?.approved_store_url_identities, identity);
     if (!item || item.target_type !== "STORE"
       || Number(item.id) !== Number(message.item_id)
       || state.automationTabId !== sender?.tab?.id
       || state.automationClaimToken !== message.claim_token
       || !storeId || !targets.includes(productId)
-      || !safeStoreOrdersUrl(pageUrl, storeId)
+      || !safeStoreOrdersUrl(pageUrl, storeId, routeAliasIsVerified ? routeId : null)
       || productIdFromUrl(product?.url) !== productId) {
       sendResponse({ ok: false });
       return;
@@ -697,11 +933,187 @@ async function saveStoreProductProgress(message, sender, sendResponse) {
   }
 }
 
-async function waitForStorePage(tabId, expectedUrl, timeoutMs = 30000) {
+async function saveStoreCandidateProgress(message, sender, sendResponse) {
+  try {
+    const state = await automationState();
+    const item = state.automationItem;
+    const storeId = item?.target_url
+      ? new URL(item.target_url).pathname.match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1]
+      : null;
+    const product = message.product;
+    const productId = String(product?.platform_product_id || "");
+    const targets = [...new Set((item?.monitored_product_ids || []).map(String))].sort();
+    const pageUrl = sender?.tab?.url;
+    const routePage = storeOrdersPageIdentity(pageUrl);
+    const expectedPage = storeOrdersPageIdentity(message.expected_page_url);
+    const taskPage = storeOrdersPageIdentity(item?.discovery_page_url || item?.target_url);
+    const identity = product?.store_identity;
+    const routeAliasIsVerified = routePage?.storeId !== storeId
+      && storeRouteAliasIsVerified(
+        pageUrl, storeId, item?.approved_store_url_identities, identity,
+      );
+    const pageMatchesTask = Boolean(routePage && expectedPage && taskPage
+      && routePage.page === expectedPage.page
+      && routePage.page === taskPage.page
+      && message.expected_page_url === pageUrl);
+    const history = product?.historical_sales;
+    const expectedDates = product?.history_expected_dates;
+    const missingDates = product?.history_missing_dates;
+    const chartRead = product?.history_read_diagnostic;
+    const requiredDates = expectedStoreCollectionDates(item?.target_date);
+    const completeRead = product?.history_daily_capture_complete === true
+      && Array.isArray(expectedDates) && expectedDates.length === 7
+      && expectedDates.every((date, index) => date === requiredDates[index])
+      && Array.isArray(history) && history.length === 7
+      && expectedDates.every((date) => history.some((point) => point?.date === date));
+    const unavailableRead = chartRead?.outcome === "unavailable"
+      && typeof chartRead.source === "string"
+      && (/^ixspy_store_(?:card_|product_chart_unavailable)/.test(chartRead.source)
+        || chartRead.source === "ixspy_data_unavailable")
+      && !chartRead.error
+      && Array.isArray(expectedDates) && expectedDates.length === 7
+      && expectedDates.every((date, index) => date === requiredDates[index])
+      && Array.isArray(missingDates) && expectedDates.every((date) => missingDates.includes(date))
+      && Array.isArray(history) && history.length === 0;
+    if (!item || item.target_type !== "STORE"
+      || Number(item.id) !== Number(message.item_id)
+      || state.automationTabId !== sender?.tab?.id
+      || state.automationClaimToken !== message.claim_token
+      || message.expected_store_id !== storeId
+      || !pageMatchesTask
+      || !safeStoreOrdersUrl(pageUrl, storeId, routeAliasIsVerified ? routePage.storeId : null)
+      || !identity || identity.target_store_id !== storeId
+      || String(identity.route_store_id) !== routePage?.storeId
+      || identity.page_url !== pageUrl
+      || productIdFromUrl(product?.url) !== productId
+      || (!completeRead && !unavailableRead)) {
+      sendResponse({ ok: false });
+      return;
+    }
+
+    const { key, progress } = await loadStoreProgress(item, storeId, targets);
+    const saved = progress.candidate_page_progress;
+    const savedPage = storeOrdersPageIdentity(saved?.page_url);
+    const samePageProgress = saved
+      && String(saved.run_id) === String(item.run_id)
+      && String(saved.item_id) === String(item.id)
+      && saved.target_date === item.target_date
+      && String(saved.store_id) === storeId
+      && saved.page_url === pageUrl
+      && savedPage?.page === routePage.page;
+    const candidatePageProgress = samePageProgress
+      ? saved
+      : {
+        run_id: item.run_id,
+        item_id: item.id,
+        store_id: storeId,
+        target_date: item.target_date,
+        page_url: pageUrl,
+        products: {},
+      };
+    if (!candidatePageProgress.run_id) candidatePageProgress.run_id = item.run_id;
+    if (!candidatePageProgress.item_id) candidatePageProgress.item_id = item.id;
+    candidatePageProgress.products = {
+      ...(candidatePageProgress.products || {}),
+      [productId]: product,
+    };
+    progress.candidate_page_progress = candidatePageProgress;
+    addVisitedStorePage(progress, pageUrl);
+    await chrome.storage.local.set({ [key]: progress });
+    sendResponse({ ok: true });
+  } catch {
+    sendResponse({ ok: false });
+  }
+}
+
+async function waitForStorePage(
+  tabId,
+  expectedUrl,
+  timeoutMs = STORE_PAGE_NAVIGATION_TIMEOUT_MS,
+  expectedStoreId = null,
+  approvedStoreUrlIdentities = [],
+) {
+  const expectedPage = storeOrdersPageIdentity(expectedUrl);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab?.status === "complete" && tab.url === expectedUrl) return;
+    if (tab && [tab.url, tab.pendingUrl].some(isAliExpressChallengePage)) {
+      const error = new Error("AliExpress 要求人工完成验证");
+      error.code = "PLATFORM_CHALLENGE";
+      throw error;
+    }
+    if (tab?.status === "complete" && !tab.pendingUrl) {
+      const currentPage = storeOrdersPageIdentity(tab.url);
+      if (expectedPage && currentPage && currentPage.page === expectedPage.page) {
+        const targetStoreId = String(expectedStoreId || expectedPage.storeId);
+        if (currentPage.storeId === targetStoreId) {
+          return {
+            ...currentPage,
+            store_identity: {
+              target_store_id: targetStoreId,
+              route_store_id: currentPage.storeId,
+              page_url: tab.url,
+              heading_store_id: null,
+              labeled_store_ids: [],
+            },
+          };
+        }
+        const identity = await sendCollectMessage(tabId, "STORE_IDENTITY", null, undefined, {
+          expectedStoreId: targetStoreId,
+          approvedStoreUrlIdentities,
+        }).catch(() => null);
+        const proof = identity?.store_identity;
+        const labeledStoreIds = Array.isArray(proof?.labeled_store_ids)
+          ? proof.labeled_store_ids.map(String)
+          : [];
+        const headingMismatch = proof?.heading_store_id != null
+          && String(proof.heading_store_id) !== targetStoreId;
+        const labeledMismatch = labeledStoreIds.some((id) => id !== targetStoreId);
+        const matchingDisplayedId = String(proof?.heading_store_id || "") === targetStoreId
+          || labeledStoreIds.includes(targetStoreId);
+        const approvedAlias = approvedStoreUrlIdentity(tab.url, targetStoreId, approvedStoreUrlIdentities);
+        const savedName = approvedAlias?.evidence?.ixspy_store_name;
+        const currentName = proof?.ixspy_store_name;
+        const namesConflict = Boolean(savedName && currentName
+          && normalizedStoreName(savedName) !== normalizedStoreName(currentName));
+        const backendAliasProof = Boolean(approvedAlias
+          && identity?.state === "ready"
+          && identity.platform_store_id === targetStoreId
+          && proof?.identity_method === "backend_approved_url_alias"
+          && proof?.target_store_id === targetStoreId
+          && String(proof.route_store_id) === currentPage.storeId
+          && proof.page_url === tab.url
+          && !storeIdentityProofHasConflict(proof, targetStoreId)
+          && !namesConflict);
+        if (identity?.state === "ready" && identity.platform_store_id === targetStoreId
+          && proof?.target_store_id === targetStoreId
+          && String(proof.route_store_id) === currentPage.storeId
+          && proof.page_url === tab.url
+          && matchingDisplayedId && !headingMismatch && !labeledMismatch) {
+          return { ...currentPage, store_identity: proof };
+        }
+        if (backendAliasProof) {
+          return { ...currentPage, store_identity: proof };
+        }
+        if (identity?.state === "identity_review"
+          || identity?.error_type === "store_identity_mismatch"
+          || identity?.error_type === "store_identity_unverified") {
+          const error = new Error(identity.message || "页面店铺身份与任务目标不一致");
+          error.code = "STORE_IDENTITY_REVIEW";
+          error.error_type = identity.error_type || "store_identity_unverified";
+          error.page_url = identity.page_url || tab.url;
+          error.evidence = identity.evidence || {
+            route_store_id: currentPage.storeId,
+            heading_store_id: proof?.heading_store_id || null,
+            labeled_store_ids: labeledStoreIds,
+            page_title: null,
+            ixspy_store_name: proof?.ixspy_store_name || null,
+            identity_method: "unverified",
+          };
+          throw error;
+        }
+      }
+    }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error("店铺下一页未在限定时间内加载完成");
@@ -719,14 +1131,82 @@ async function collectStorePages(tabId, item) {
   }
   const targetSet = new Set(targets);
   const { key: progressKey, progress, products } = await loadStoreProgress(item, storeId, targets);
-  const visited = new Set(progress.visited_page_urls);
+  const approvedStoreUrlIdentities = item.approved_store_url_identities || [];
+  let routeStoreId = storeId;
+  let storeIdentity = null;
+  const visited = new Set(progress.visited_page_urls.filter((pageUrl) =>
+    storeOrdersUrlAllowedForTask(pageUrl, storeId, approvedStoreUrlIdentities)));
   const visitedThisAttempt = new Set();
   const startedAt = Date.now();
   let collectionInterrupted = false;
   for (let page = 0; targets.length && products.size < targets.length
     && page < 10 && Date.now() - startedAt < STORE_COLLECTION_WORK_MS; page += 1) {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab || !safeStoreOrdersUrl(tab.url, storeId) || visitedThisAttempt.has(tab.url)) break;
+    let tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) return { state: "failed", message: "采集标签页已关闭，无法恢复目标店铺 Orders 页" };
+    if (isAliExpressChallengePage(tab.url)) {
+      return { state: "challenge", message: "AliExpress 要求人工完成验证" };
+    }
+    const currentPage = storeOrdersPageIdentity(tab.url);
+    if (!storeIdentity && currentPage && currentPage.storeId !== storeId
+      && storeOrdersUrlAllowedForTask(
+        tab.url, storeId, approvedStoreUrlIdentities, progress.store_identity,
+      )) {
+      storeIdentity = progress.store_identity;
+    }
+    const isKnownStorePage = storeOrdersUrlAllowedForTask(
+      tab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+    );
+    const isPotentialAliasPage = currentPage && currentPage.storeId !== storeId;
+    if (!isKnownStorePage) {
+      const recoveryBudgetMs = Math.min(STORE_PAGE_NAVIGATION_TIMEOUT_MS, storeCollectionWorkRemaining(startedAt));
+      if (recoveryBudgetMs <= 0) {
+        return { state: "failed", message: "店铺采集页地址异常，任务时间不足以恢复 Orders 页" };
+      }
+      try {
+        if (!isPotentialAliasPage && !isPendingStorePage(tab, item.target_url)) {
+          await chrome.tabs.update(tabId, { url: item.target_url, active: true });
+        }
+        const recoveryUrl = isPotentialAliasPage ? tab.url : item.target_url;
+        const readyPage = await waitForStorePage(
+          tabId, recoveryUrl, recoveryBudgetMs, storeId, approvedStoreUrlIdentities,
+        );
+        routeStoreId = readyPage.storeId;
+        storeIdentity = readyPage.store_identity || storeIdentity;
+      } catch (error) {
+        if (error?.code === "PLATFORM_CHALLENGE") {
+          return { state: "challenge", message: error.message };
+        }
+        if (error?.code === "STORE_IDENTITY_REVIEW") {
+          return {
+            state: "identity_review",
+            error_type: error.error_type,
+            message: error.message,
+            page_url: error.page_url,
+            evidence: error.evidence,
+          };
+        }
+        if (error?.code === "STORE_IDENTITY_UNVERIFIED") {
+          return { state: "store_identity_unverified", error_type: "store_identity_unverified", message: error.message };
+        }
+        const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+        const currentUrl = String(currentTab?.url || "标签页已关闭").slice(0, 240);
+        return {
+          state: "failed",
+          error_type: error?.code === "STORE_IDENTITY_MISMATCH" ? "store_identity_mismatch" : "page_not_ready",
+          message: error?.code === "STORE_IDENTITY_MISMATCH"
+            ? `${error.message}，当前页面：${currentUrl}；已停止采集，请核实监控店铺链接。`
+            : `验证后未能恢复目标店铺 Orders 页（当前页面：${currentUrl}；${error?.message || "导航失败"}）`,
+        };
+      }
+      tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab || !storeOrdersUrlAllowedForTask(
+        tab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+      )) {
+        const currentUrl = String(tab?.url || "标签页已关闭").slice(0, 240);
+        return { state: "failed", message: `恢复后仍未到达目标店铺 Orders 页（当前页面：${currentUrl}）` };
+      }
+    }
+    if (visitedThisAttempt.has(tab.url)) break;
     const pageResponseBudgetMs = Math.min(
       STORE_PAGE_RESPONSE_TIMEOUT_MS,
       storeCollectionWorkRemaining(startedAt),
@@ -745,6 +1225,10 @@ async function collectStorePages(tabId, item) {
           targets.filter((productId) => !products.has(productId)), {
             itemId: item.id,
             claimToken: (await automationState()).automationClaimToken,
+            monitoredProducts: item.monitored_products || [],
+            expectedStoreId: storeId,
+            verifiedStoreIdentity: storeIdentity,
+            approvedStoreUrlIdentities,
           }),
         pageResponseBudgetMs,
         "店铺列表页读取超时",
@@ -781,9 +1265,18 @@ async function collectStorePages(tabId, item) {
       return response;
     }
     const result = response.page_result;
-    if (result.platform_store_id !== storeId || result.url !== tab.url) {
+    if (result.platform_store_id !== storeId || result.url !== tab.url
+      || (result.store_identity?.target_store_id && result.store_identity.target_store_id !== storeId)) {
       return { state: "failed", message: "店铺列表页与目标店铺不匹配" };
     }
+    const resultRouteId = storeOrdersPageIdentity(tab.url)?.storeId;
+    if (!resultRouteId || (routeStoreId !== storeId && routeStoreId !== resultRouteId)) {
+      return { state: "failed", error_type: "store_identity_mismatch", message: "店铺路由别名在任务中发生变化" };
+    }
+    routeStoreId = resultRouteId;
+    storeIdentity = result.store_identity || storeIdentity;
+    progress.route_store_id = routeStoreId;
+    progress.store_identity = storeIdentity;
     for (const product of result.products || []) {
       if (!targetSet.has(String(product.platform_product_id))) {
         return { state: "failed", message: "页面返回非监控池商品" };
@@ -791,23 +1284,51 @@ async function collectStorePages(tabId, item) {
       mergeStoreProduct(products, product);
     }
     mergeStoreDiagnostics(progress, result.diagnostics);
+    const nextUrl = result.next_page_url || (result.has_next_page
+      ? inferredNextStoreOrdersUrl(tab.url, storeId, routeStoreId)
+      : null);
+    const pageScan = result.diagnostics?.page_scan || {};
+    const matchedProductIds = (result.products || [])
+      .map((product) => String(product.platform_product_id))
+      .filter((productId) => targetSet.has(productId));
+    progress.page_scans = mergeStoreDiagnosticRecord(progress.page_scans, {
+      ...pageScan,
+      url: pageScan.url || tab.url,
+      scan_source: pageScan.url ? (pageScan.scan_source || "page_collector") : "worker_fallback",
+      result_product_count: (result.products || []).length,
+      matched_product_ids: [...new Set([...(pageScan.matched_product_ids || []), ...matchedProductIds].map(String))],
+      unmatched_target_ids: targets.filter((productId) => !products.has(productId)),
+      pagination_known: pageScan.pagination_known === true
+        || result.pagination_known === true
+        || result.has_next_page === true
+        || Boolean(result.next_page_url),
+      has_next_page: Boolean(result.has_next_page),
+      next_page_url: nextUrl,
+      route_store_id: routeStoreId,
+      store_identity: pageScan.store_identity || storeIdentity,
+    }, "url", 10);
     progress.products = Object.fromEntries(products);
     progress.visited_page_urls = [...visited];
     await chrome.storage.local.set({ [progressKey]: progress });
     if (products.size === targets.length || !result.has_next_page) break;
-    const nextUrl = result.next_page_url;
-    if (!nextUrl || !safeStoreOrdersUrl(nextUrl, storeId) || visitedThisAttempt.has(nextUrl)) break;
-    const navigationBudgetMs = Math.min(30000, storeCollectionWorkRemaining(startedAt));
+    if (!nextUrl || !storeOrdersUrlAllowedForTask(
+      nextUrl, storeId, approvedStoreUrlIdentities, storeIdentity,
+    ) || visitedThisAttempt.has(nextUrl)) break;
+    const navigationBudgetMs = Math.min(STORE_PAGE_NAVIGATION_TIMEOUT_MS, storeCollectionWorkRemaining(startedAt));
     if (navigationBudgetMs <= 0) {
       collectionInterrupted = true;
       break;
     }
     await chrome.tabs.update(tabId, { url: nextUrl, active: true });
-    await waitForStorePage(tabId, nextUrl, navigationBudgetMs);
+    const readyPage = await waitForStorePage(
+      tabId, nextUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities,
+    );
+    routeStoreId = readyPage.storeId;
+    storeIdentity = readyPage.store_identity || storeIdentity;
   }
 
   let candidatePage = null;
-  const discoveryUrl = item.discovery_page_url;
+  const discoveryUrl = item.discovery_page_url || item.target_url;
   if (!collectionInterrupted && targets.length < 20 && discoveryUrl) {
     const incompleteCandidatePage = (outcome, message = null, diagnostics = {}) => ({
       page_url: discoveryUrl,
@@ -818,9 +1339,12 @@ async function collectStorePages(tabId, item) {
       candidates: [],
       diagnostics: { outcome, ...(message ? { message: String(message).slice(0, 300) } : {}), ...diagnostics },
     });
-    if (!safeStoreOrdersUrl(discoveryUrl, storeId)) {
+    if (!storeOrdersUrlIdentity(discoveryUrl)) {
       candidatePage = incompleteCandidatePage("invalid_cursor_url");
     } else {
+      const cursorIsVerified = storeOrdersUrlAllowedForTask(
+        discoveryUrl, storeId, approvedStoreUrlIdentities, storeIdentity,
+      );
       const cursorIsVisited = visited.has(discoveryUrl);
       if (!cursorIsVisited && visited.size >= 11) {
         candidatePage = incompleteCandidatePage("unique_page_limit_reached");
@@ -833,37 +1357,93 @@ async function collectStorePages(tabId, item) {
           candidatePage = incompleteCandidatePage("collector_tab_unavailable");
         } else {
           try {
-            if (tab.url !== discoveryUrl) {
-              await chrome.tabs.update(tabId, { url: discoveryUrl, active: true });
-              const navigationBudgetMs = Math.min(30000, storeCollectionWorkRemaining(startedAt));
+            const needsCursorNavigation = tab.url !== discoveryUrl || tab.pendingUrl;
+            if (needsCursorNavigation) {
+              if (!isPendingStorePage(tab, discoveryUrl)) {
+                await chrome.tabs.update(tabId, { url: discoveryUrl, active: true });
+              }
+            }
+            if (needsCursorNavigation || !cursorIsVerified) {
+              const navigationBudgetMs = Math.min(STORE_PAGE_NAVIGATION_TIMEOUT_MS, storeCollectionWorkRemaining(startedAt));
               if (navigationBudgetMs <= 0) throw new Error("店铺任务工作时间预算已用完");
-              await waitForStorePage(tabId, discoveryUrl, navigationBudgetMs);
+              const readyPage = await waitForStorePage(
+                tabId, discoveryUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities,
+              );
+              routeStoreId = readyPage.storeId;
+              storeIdentity = readyPage.store_identity || storeIdentity;
             }
             pageReady = true;
           } catch (error) {
-            candidatePage = incompleteCandidatePage("page_load_timeout", error?.message);
+            if (error?.code === "PLATFORM_CHALLENGE") {
+              return { state: "challenge", message: error.message };
+            }
+            if (error?.code === "STORE_IDENTITY_UNVERIFIED") {
+              return { state: "store_identity_unverified", error_type: "store_identity_unverified", message: error.message };
+            }
+            if (error?.code === "STORE_IDENTITY_REVIEW") {
+              return {
+                state: "identity_review",
+                error_type: error.error_type,
+                message: error.message,
+                page_url: error.page_url,
+                evidence: error.evidence,
+              };
+            }
+            if (error?.code === "STORE_IDENTITY_MISMATCH") {
+              return {
+                state: "failed",
+                error_type: "store_identity_mismatch",
+                message: `身份探测：${error.message}`,
+              };
+            }
+            candidatePage = incompleteCandidatePage(
+              error?.code === "STORE_IDENTITY_MISMATCH" ? "page_identity_mismatch" : "page_load_timeout",
+              error?.message,
+            );
           }
         }
         if (pageReady) {
           const currentTab = await chrome.tabs.get(tabId).catch(() => null);
-          if (!currentTab || currentTab.url !== discoveryUrl || !safeStoreOrdersUrl(currentTab.url, storeId)) {
+          if (!currentTab || !storeOrdersUrlAllowedForTask(
+            currentTab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+          )
+            || storeOrdersPageIdentity(currentTab.url)?.page !== storeOrdersPageIdentity(discoveryUrl)?.page) {
             candidatePage = incompleteCandidatePage("cursor_page_mismatch");
           } else {
-            visited.add(discoveryUrl);
-            addVisitedStorePage(progress, discoveryUrl);
+            const candidatePageUrl = currentTab.url;
+            visited.add(candidatePageUrl);
+            addVisitedStorePage(progress, candidatePageUrl);
+            const savedCandidateProgress = progress.candidate_page_progress;
+            const savedPageIdentity = storeOrdersPageIdentity(savedCandidateProgress?.page_url);
+            const currentPageIdentity = storeOrdersPageIdentity(candidatePageUrl);
+            const priorCandidates = savedCandidateProgress
+              && savedCandidateProgress.target_date === item.target_date
+              && String(savedCandidateProgress.store_id) === storeId
+              && savedPageIdentity?.page === currentPageIdentity?.page
+              && String(savedPageIdentity?.storeId) === String(currentPageIdentity?.storeId)
+              ? Object.values(savedCandidateProgress.products || {})
+              : [];
             try {
               const responseBudgetMs = Math.min(
-                STORE_PAGE_RESPONSE_TIMEOUT_MS,
+                STORE_CANDIDATE_SCAN_RESPONSE_TIMEOUT_MS,
                 storeCollectionWorkRemaining(startedAt),
               );
               if (responseBudgetMs <= 0) throw new Error("店铺任务工作时间预算已用完");
               const response = await withTimeout(
-                sendStoreCandidateScanMessage(tabId, item.target_date, storeId, discoveryUrl),
+                sendStoreCandidateScanMessage(
+                  tabId, item, storeId, candidatePageUrl, storeIdentity, priorCandidates,
+                ),
                 responseBudgetMs,
                 "店铺候选页读取超时",
               );
-              if (response?.state === "challenge" || response?.state === "ixspy_login") {
+              if (["challenge", "ixspy_login", "store_identity_unverified", "identity_review"].includes(response?.state)) {
                 return response;
+              }
+              if (response?.error_type === "store_identity_unverified") {
+                return { state: "store_identity_unverified", error_type: "store_identity_unverified", message: response.message };
+              }
+              if (response?.error_type === "store_identity_mismatch") {
+                return { state: "failed", error_type: "store_identity_mismatch", message: response.message };
               }
               const pageResult = response?.page_result;
               if (response?.state !== "ready" || !pageResult) {
@@ -871,18 +1451,23 @@ async function collectStorePages(tabId, item) {
                   "page_scan_failed", response?.message || "候选页未能完整读取",
                   response?.diagnostics ? { collector: response.diagnostics } : {},
                 );
-              } else if (String(pageResult.platform_store_id) !== storeId || pageResult.url !== discoveryUrl) {
+              } else if (String(pageResult.platform_store_id) !== storeId || pageResult.url !== candidatePageUrl) {
                 candidatePage = incompleteCandidatePage("page_identity_mismatch", null, {
                   actual_store_id: pageResult.platform_store_id || null,
                   actual_url: pageResult.url || null,
                 });
               } else {
                 const scanComplete = pageResult.scan_complete === true;
-                const nextPageUrl = safeStoreOrdersUrl(pageResult.next_page_url, storeId)
+                storeIdentity = pageResult.store_identity || storeIdentity;
+                progress.route_store_id = routeStoreId;
+                progress.store_identity = storeIdentity;
+              const nextPageUrl = storeOrdersUrlAllowedForTask(
+                pageResult.next_page_url, storeId, approvedStoreUrlIdentities, storeIdentity,
+              )
                   ? pageResult.next_page_url
                   : null;
                 candidatePage = {
-                  page_url: discoveryUrl,
+                  page_url: candidatePageUrl,
                   pagination_known: pageResult.pagination_known === true,
                   has_next_page: Boolean(pageResult.has_next_page),
                   next_page_url: nextPageUrl,
@@ -913,6 +1498,21 @@ async function collectStorePages(tabId, item) {
     }
   }
 
+  if (!visited.size) {
+    const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+    const outcome = candidatePage?.diagnostics?.outcome || "orders_page_not_read";
+    const probeDetail = String(candidatePage?.diagnostics?.message || "").slice(0, 220);
+    const currentUrl = String(currentTab?.url || "标签页已关闭").slice(0, 240);
+    const pendingUrl = String(currentTab?.pendingUrl || "无").slice(0, 240);
+    return {
+      state: "failed",
+      error_type: outcome === "page_identity_mismatch" ? "store_identity_mismatch"
+        : ["page_load_timeout", "cursor_page_mismatch"].includes(outcome) ? "page_not_ready"
+          : "extension_collection_error",
+      message: `目标店铺 Orders 页未读取（阶段：${outcome}${probeDetail ? `；身份探测：${probeDetail}` : ""}；当前 URL：${currentUrl}；待加载 URL：${pendingUrl}；标签页状态：${currentTab?.status || "unknown"}）`,
+    };
+  }
+
   const workerIdentity = await browserCollectionWorkerIdentity();
   const orderedProducts = targets.map((productId) => products.get(productId)).filter(Boolean);
   return {
@@ -924,6 +1524,7 @@ async function collectStorePages(tabId, item) {
       ...(candidatePage ? { candidate_page: candidatePage } : {}),
       raw_data: {
         collection_mode: "monitored_store_daily",
+        ...(storeIdentity ? { store_identity: storeIdentity } : {}),
         worker_id: workerIdentity.worker_id,
         worker_label: workerIdentity.worker_label,
         monitored_product_ids: targets,
@@ -981,15 +1582,10 @@ async function closeItemTab(tabId) {
   if (trackedTaskTab) {
     const nextState = await automationState();
     const keepAsIdle = workerWindow && nextState.idleAutomationTabId === tabId;
-    if (keepAsIdle) {
-      await chrome.tabs.update(tabId, { url: "about:blank", active: false }).catch(async () => {
-        await chrome.tabs.remove(tabId).catch(() => undefined);
-        await chrome.storage.local.remove("idleAutomationTabId");
-      });
-    } else {
+    if (!keepAsIdle) {
       await chrome.tabs.remove(tabId).catch(() => undefined);
     }
-    if (ownedWorkerWindow && workerWindow) {
+    if (ownedWorkerWindow && workerWindow && !nextState.automationItem && !nextState.prefetchedItem) {
       await ensureIdleAutomationTab(workerWindow, await automationState());
     }
   }
@@ -1070,6 +1666,8 @@ async function closeAutomationWindow() {
     "automationWindowId",
     "automationWindowOwned",
     "automationWindowBackground",
+    "automationTabGroupId",
+    "automationTabGroupWindowId",
     "automationDashboardTabId",
     "automationTabId",
     "automationItem",
@@ -1091,24 +1689,25 @@ async function closeAutomationWindow() {
   await Promise.all([...new Set(tabs)].map((tabId) => chrome.tabs.remove(tabId).catch(() => undefined)));
 }
 
-async function minimizeAutomationWindow() {
+async function keepAutomationWindowForeground() {
   const state = await automationState();
-  if (state.automationWindowBackground && state.automationWindowId) {
+  if (state.automationWindowBackground && state.automationWindowId && state.browserCollectionWorkerMode === true) {
     await chrome.windows.update(state.automationWindowId, {
-      focused: false,
-      state: state.browserCollectionWorkerMode === true
-        ? "minimized"
-        : state.browserCollectionIsolatedProfileAuthorized === true ? "normal" : "minimized",
+      focused: true,
+      state: "maximized",
     }).catch(() => undefined);
   }
 }
 
-async function notifyChallenge(item) {
+async function notifyChallenge(item, { provider = "ALIEXPRESS", message = null } = {}) {
+  const identityReview = provider === "STORE_IDENTITY";
   await chrome.notifications.create(NOTIFICATION_ID, {
     type: "basic",
     iconUrl: "icon.svg",
-    title: "AliExpress 自动采集已暂停",
-    message: `${item.title || "当前页面"}需要人工完成平台验证，通过后任务会自动继续。`,
+    title: identityReview ? "店铺身份待核验" : "AliExpress 自动采集已暂停",
+    message: identityReview
+      ? `${message || `${item.title || "当前店铺"}的页面身份需要核实。`} 请在监控台确认后继续。`
+      : `${item.title || "当前页面"}需要人工完成平台验证，通过后任务会自动继续。`,
     priority: 2,
     requireInteraction: true,
   }).catch(() => undefined);
@@ -1149,7 +1748,7 @@ async function presentChallengeTab(tabId) {
   await chrome.tabs.update(tabId, { active: true }).catch(() => undefined);
 }
 
-async function pauseForAliExpressChallenge(tabId, message = "AliExpress 要求人工完成验证") {
+async function pauseForAliExpressChallenge(tabId, message = "AliExpress 要求人工完成验证", provider = "ALIEXPRESS") {
   const state = await automationState();
   if (!state.automationItem || state.automationTabId !== tabId || state.challengePaused) return;
   const item = state.automationItem;
@@ -1164,9 +1763,53 @@ async function pauseForAliExpressChallenge(tabId, message = "AliExpress 要求�
       error_message: message,
     }),
   });
-  await chrome.storage.local.set({ challengePaused: true, challengeProvider: "ALIEXPRESS" });
-  if (!reviewTask) await holdPrefetchedItem("检测到平台验证，先暂停预加载项");
-  await notifyChallenge(item);
+  await chrome.storage.local.set({ challengePaused: true, challengeProvider: provider });
+  if (!reviewTask) await holdPrefetchedItem(provider === "STORE_IDENTITY"
+    ? "店铺身份待核验，先暂停预加载项"
+    : "检测到平台验证，先暂停预加载项");
+  await notifyChallenge(item, { provider, message });
+  await presentChallengeTab(tabId);
+}
+
+async function pauseForStoreIdentityReview(tabId, message) {
+  const state = await automationState();
+  if (!state.automationItem || state.automationTaskKind === "REVIEW"
+    || state.automationTaskKind === "POOL_RESET"
+    || state.automationTabId !== tabId || state.identityReviewPaused) return;
+  const item = state.automationItem;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const pageUrl = message?.page_url || tab?.url || "";
+  const routeIdentity = storeOrdersUrlIdentity(pageUrl);
+  const evidence = message?.evidence && typeof message.evidence === "object"
+    ? message.evidence
+    : {
+      route_store_id: routeIdentity?.route_store_id || "",
+      heading_store_id: null,
+      labeled_store_ids: [],
+      page_title: null,
+      ixspy_store_name: null,
+      identity_method: "unverified",
+    };
+  const identityErrorType = ["store_identity_mismatch", "store_identity_unverified"]
+    .includes(message?.error_type) ? message.error_type : "store_identity_unverified";
+  if (!routeIdentity || evidence.route_store_id !== routeIdentity.route_store_id) {
+    await finishAutomationFailure(state, "store_identity_evidence_invalid", "店铺身份证据与当前页面地址不一致");
+    return;
+  }
+  await api(`/api/browser-collection/items/${item.id}/identity-review`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(await browserCollectionWorkerIdentity()),
+      claim_token: state.automationClaimToken,
+      page_url: pageUrl,
+      identity_error_type: identityErrorType,
+      error_message: String(message?.message || "店铺页面身份需要人工核实").slice(0, 2000),
+      evidence,
+    }),
+  });
+  await chrome.storage.local.set({ identityReviewPaused: true, challengePaused: false });
+  await holdPrefetchedItem("店铺身份待人工审核，已退回预加载项");
+  await notifyChallenge(item, { provider: "STORE_IDENTITY", message: message?.message });
   await presentChallengeTab(tabId);
 }
 
@@ -1261,8 +1904,12 @@ async function processAutomationTabInternal(tabId, generation = null) {
       }),
     });
     await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
-    await minimizeAutomationWindow();
+    await keepAutomationWindowForeground();
     await closeItemTab(tabId);
+    return;
+  }
+  if (state.automationTaskKind === "POOL_RESET") {
+    await processPoolResetTab(tabId, state);
     return;
   }
   if (item.target_type === "STORE") {
@@ -1290,6 +1937,11 @@ async function processAutomationTabInternal(tabId, generation = null) {
     return;
   }
 
+  if (result?.state === "identity_review" || result?.state === "store_identity_unverified") {
+    await pauseForStoreIdentityReview(tabId, result);
+    return;
+  }
+
   if (result?.state === "ixspy_login") {
     await pauseForIxspyLogin(tabId, result.message);
     return;
@@ -1298,7 +1950,7 @@ async function processAutomationTabInternal(tabId, generation = null) {
   if (!result?.payload) {
     await finishAutomationFailure(
       state,
-      result?.state === "partial" ? "observable_data_missing" : "page_not_ready",
+      result?.error_type || (result?.state === "partial" ? "observable_data_missing" : "extension_collection_error"),
       result?.message || "页面在限定时间内没有出现可读取的公开数据",
     );
     return;
@@ -1329,7 +1981,7 @@ async function processAutomationTabInternal(tabId, generation = null) {
   }
   await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
   await chrome.notifications.clear(FIRST_PRODUCT_NOTIFICATION_ID).catch(() => undefined);
-  await minimizeAutomationWindow();
+  await keepAutomationWindowForeground();
   await closeItemTab(tabId);
 }
 
@@ -1341,7 +1993,8 @@ async function processAutomationTab(tabId) {
   const generation = ++automationGeneration;
   automationBusy = true;
   try {
-    if (startingState.automationItem && startingState.automationTaskKind !== "REVIEW") {
+    if (startingState.automationItem
+      && !["REVIEW", "POOL_RESET"].includes(startingState.automationTaskKind)) {
       const run = await sendBrowserCollectionHeartbeat().catch(() => null);
       await prefetchNextBrowserItem(run).catch(() => undefined);
     }
@@ -1350,9 +2003,36 @@ async function processAutomationTab(tabId) {
     if (generation !== automationGeneration) return;
     const state = await automationState();
     if (Number(state.automationItem?.id) !== itemId) return;
+    if (error?.code === "PLATFORM_CHALLENGE") {
+      if (state.automationTaskKind === "POOL_RESET") {
+        await pauseForPoolResetChallenge(tabId, error.message || "AliExpress 要求人工验证");
+        return;
+      }
+      await pauseForAliExpressChallenge(tabId, error.message || "AliExpress 要求人工完成验证");
+      return;
+    }
+    if (error?.code === "STORE_IDENTITY_REVIEW") {
+      await pauseForStoreIdentityReview(tabId, {
+        error_type: error.error_type,
+        message: error.message,
+        page_url: error.page_url,
+        evidence: error.evidence,
+      });
+      return;
+    }
+    if (state.automationTaskKind === "POOL_RESET") {
+      await reportPoolResetFailure(
+        state,
+        error?.code === "STORE_IDENTITY_MISMATCH" ? "store_identity_mismatch" : "pool_reset_extension_error",
+        error.message || "监控池重建扩展执行失败",
+      );
+      return;
+    }
     await finishAutomationFailure(
       state,
-      error?.code === "COLLECTION_TIMEOUT" ? "browser_item_stalled" : "extension_collection_error",
+      error?.code === "STORE_IDENTITY_MISMATCH"
+        ? "store_identity_mismatch"
+        : error?.code === "COLLECTION_TIMEOUT" ? "browser_item_stalled" : "extension_collection_error",
       error.message || "扩展采集失败",
     );
   } finally {
@@ -1389,7 +2069,8 @@ async function openAutomationItem(item, taskKind = "PRODUCT", knownKeys = [], { 
   const idleTab = !prefetch && currentState.idleAutomationTabId
     ? await chrome.tabs.get(currentState.idleAutomationTabId).catch(() => null)
     : null;
-  const reusableIdleTab = idleTab?.windowId === workerWindow.id && idleTab.url === "about:blank"
+  const reusableIdleTab = idleTab?.windowId === workerWindow.id
+    && (idleTab.url === "about:blank" || isAliExpressPage(idleTab.url))
     ? idleTab
     : null;
   const tab = reusableIdleTab
@@ -1401,19 +2082,7 @@ async function openAutomationItem(item, taskKind = "PRODUCT", knownKeys = [], { 
     });
   if (reusableIdleTab) await chrome.storage.local.remove("idleAutomationTabId");
   const windowId = tab.windowId;
-  const saved = await chrome.storage.local.get("automationTabGroupId");
-  let groupId = saved.automationTabGroupId;
-  try {
-    if (!groupId || !(await chrome.tabGroups.get(groupId).catch(() => null))) {
-      groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-      await chrome.storage.local.set({ automationTabGroupId: groupId });
-    } else {
-      await chrome.tabs.group({ tabIds: [tab.id], groupId });
-    }
-    await chrome.tabGroups.update(groupId, { title: "AliExpress 采集任务", color: "green", collapsed: true });
-  } catch {
-    // Tab grouping is optional; keep collection in the background if grouping is unavailable.
-  }
+  await groupAutomationTabs([tab.id], windowId);
   if (!prefetch) await focusWindowForSingleProductTest(item, windowId, prefetch);
   await chrome.storage.local.set({
     automationWindowId: windowId,
@@ -1433,6 +2102,7 @@ async function openAutomationItem(item, taskKind = "PRODUCT", knownKeys = [], { 
         automationTaskKind: taskKind,
         ...(taskKind === "REVIEW" ? { reviewKnownKeys: knownKeys } : {}),
         challengePaused: false,
+        identityReviewPaused: false,
         challengeProvider: null,
       }),
   });
@@ -1441,7 +2111,8 @@ async function openAutomationItem(item, taskKind = "PRODUCT", knownKeys = [], { 
 async function prefetchNextBrowserItem(run) {
   if (!run || !["RUNNING", "PENDING"].includes(run.status)) return;
   const state = await automationState();
-  if (state.prefetchedItem || state.automationTaskKind === "REVIEW"
+  if (run.phase !== "PRODUCT_COLLECTION" || state.automationItem?.target_type !== "PRODUCT"
+    || state.prefetchedItem || state.automationTaskKind === "REVIEW"
     || state.challengePaused
     || state.automationItem?.target_key === `product:${state.automationItem.product_id}:single`) return;
   const workerWindow = state.automationWindowId
@@ -1477,6 +2148,7 @@ async function sendBrowserCollectionHeartbeat() {
       body: JSON.stringify({
         ...identity,
         extension_version: chrome.runtime.getManifest().version,
+        capabilities: [POOL_RESET_CAPABILITY],
         active_claims: activeClaims,
       }),
     });
@@ -1487,9 +2159,228 @@ async function sendBrowserCollectionHeartbeat() {
   }
 }
 
+async function sendPoolResetHeartbeat(claimToken = null) {
+  const identity = await browserCollectionWorkerIdentity();
+  return api("/api/browser-collection/pool-resets/heartbeat", {
+    method: "POST",
+    body: JSON.stringify({
+      ...identity,
+      extension_version: chrome.runtime.getManifest().version,
+      capabilities: [POOL_RESET_CAPABILITY],
+      ...(claimToken ? { claim_token: claimToken } : {}),
+    }),
+  });
+}
+
+async function reportPoolResetFailure(state, errorType, message) {
+  if (!state.automationItem || state.automationTaskKind !== "POOL_RESET") return;
+  await api(`/api/browser-collection/pool-resets/tasks/${state.automationItem.id}/failure`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(await browserCollectionWorkerIdentity()),
+      claim_token: state.automationClaimToken,
+      error_type: errorType,
+      error_message: message || "店铺页扫描失败",
+    }),
+  });
+  if (state.automationTabId) await closeItemTab(state.automationTabId);
+}
+
+async function pauseForPoolResetChallenge(tabId, message) {
+  const state = await automationState();
+  if (!state.automationItem || state.automationTaskKind !== "POOL_RESET"
+    || state.automationTabId !== tabId || state.challengePaused) return;
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  await api(`/api/browser-collection/pool-resets/tasks/${state.automationItem.id}/challenge`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(await browserCollectionWorkerIdentity()),
+      claim_token: state.automationClaimToken,
+      error_message: message || "AliExpress 需要人工验证",
+      page_url: tab?.url || state.automationItem.target_url,
+    }),
+  });
+  await chrome.storage.local.set({ challengePaused: true, challengeProvider: "ALIEXPRESS" });
+  await notifyChallenge(state.automationItem);
+  await presentChallengeTab(tabId);
+}
+
+async function submitPoolResetPage(state, pageResult) {
+  const item = state.automationItem;
+  const storeId = String(item?.platform_store_id || "");
+  const tab = state.automationTabId
+    ? await chrome.tabs.get(state.automationTabId).catch(() => null)
+    : null;
+  if (!item || state.automationTaskKind !== "POOL_RESET" || !storeId || !tab
+    || pageResult?.platform_store_id !== storeId || pageResult?.url !== tab.url
+    || !safeStoreOrdersUrl(tab.url, storeId)) {
+    throw new Error("店铺重建页身份与后端任务不一致");
+  }
+  const candidates = pageResult.candidates || [];
+  if (pageResult.scan_complete !== true || pageResult.pagination_known !== true) {
+    await reportPoolResetFailure(state, "incomplete_orders_page", "商品卡片或分页状态未完整读取；保留原监控池并重试当前页");
+    return false;
+  }
+  const diagnostics = {
+    ...(pageResult.diagnostics || {}),
+    scanned_candidate_count: candidates.length,
+  };
+  await api(`/api/browser-collection/pool-resets/tasks/${item.id}/page`, {
+    method: "POST",
+    body: JSON.stringify({
+      ...(await browserCollectionWorkerIdentity()),
+      claim_token: state.automationClaimToken,
+      expected_store_id: storeId,
+      page: {
+        page_url: pageResult.url,
+        pagination_known: pageResult.pagination_known,
+        has_next_page: pageResult.has_next_page,
+        next_page_url: pageResult.next_page_url,
+        scan_complete: pageResult.scan_complete,
+        candidates,
+        diagnostics,
+      },
+    }),
+  });
+  await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
+  await closeItemTab(state.automationTabId);
+  return true;
+}
+
+async function processPoolResetTab(tabId, state) {
+  const item = state.automationItem;
+  const storeId = String(item?.platform_store_id || "");
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || !storeId || !safeStoreOrdersUrl(tab.url, storeId)) {
+    await reportPoolResetFailure(state, "store_identity_mismatch", "打开的页面不是本任务指定的店铺 Orders 页");
+    return;
+  }
+  const result = await sendStoreCandidateScanMessage(
+    tabId,
+    item.target_date,
+    storeId,
+    item.target_url,
+  );
+  if (result?.state === "challenge") {
+    await pauseForPoolResetChallenge(tabId, result.message);
+    return;
+  }
+  if (result?.state === "ixspy_login") {
+    await pauseForPoolResetChallenge(tabId, result.message || "IXSPY 登录需要人工完成");
+    return;
+  }
+  if (result?.state !== "ready" || !result.page_result) {
+    await reportPoolResetFailure(
+      state,
+      result?.error_type || "orders_page_scan_failed",
+      result?.message || "未能完整读取店铺商品页",
+    );
+    return;
+  }
+  await submitPoolResetPage(state, result.page_result);
+}
+
+async function pollPoolResetAutomation(batch, initialState) {
+  if (initialState.automationItem && initialState.automationTaskKind !== "POOL_RESET") return;
+  await sendPoolResetHeartbeat(initialState.automationTaskKind === "POOL_RESET"
+    ? initialState.automationClaimToken
+    : null);
+  let state = await automationState();
+  if (state.automationItem && state.automationTaskKind === "POOL_RESET") {
+    const tab = state.automationTabId
+      ? await chrome.tabs.get(state.automationTabId).catch(() => null)
+      : null;
+    if (!tab) {
+      const workerWindow = await ensureAutomationWindow();
+      if (!workerWindow?.id) return;
+      const reopened = await chrome.tabs.create({
+        windowId: workerWindow.id,
+        url: state.automationItem.target_url,
+        active: true,
+      });
+      await chrome.storage.local.set({ automationTabId: reopened.id, challengePaused: false });
+      return;
+    }
+    if (batch.status === "NEEDS_VERIFICATION" || state.challengePaused) {
+      if (isAliExpressChallengePage(tab.url) || tab.status !== "complete") return;
+      const result = await sendStoreCandidateScanMessage(
+        tab.id,
+        state.automationItem.target_date,
+        String(state.automationItem.platform_store_id),
+        state.automationItem.target_url,
+      );
+      if (result?.state === "challenge" || result?.state === "ixspy_login") return;
+      if (result?.state !== "ready" || !result.page_result?.scan_complete) return;
+      await api(`/api/browser-collection/pool-resets/tasks/${state.automationItem.id}/resume`, {
+        method: "POST",
+        body: JSON.stringify({
+          ...(await browserCollectionWorkerIdentity()),
+          claim_token: state.automationClaimToken,
+          page_url: result.page_result.url,
+        }),
+      });
+      await chrome.storage.local.set({ challengePaused: false });
+      state = await automationState();
+      await submitPoolResetPage(state, result.page_result);
+      return;
+    }
+    if (tab.status === "complete") await processPoolResetTab(tab.id, state);
+    return;
+  }
+  if (batch.status !== "RUNNING" || !batch.dispatch_enabled) return;
+  const claimed = await api("/api/browser-collection/pool-resets/claim", {
+    method: "POST",
+    body: JSON.stringify(await browserCollectionWorkerIdentity()),
+  });
+  if (!claimed.store || !claimed.claim_token || !claimed.target_url) return;
+  const item = {
+    id: claimed.store.id,
+    target_type: "STORE",
+    target_key: `pool-reset:${claimed.batch.id}:${claimed.store.id}`,
+    platform_store_id: claimed.store.platform_store_id,
+    store_id: claimed.store.store_id,
+    title: claimed.store.store_name,
+    target_url: claimed.target_url,
+    target_date: claimed.target_date,
+  };
+  await openAutomationItem(item, "POOL_RESET", [], { claimToken: claimed.claim_token });
+}
+
 async function pollAutomation() {
   await ensureWorkerModesInitialized();
   if (!(await browserCollectionWorkerEnabled())) return;
+  let initialState = await automationState();
+  let latestReset = null;
+  try {
+    latestReset = await api("/api/browser-collection/pool-resets/latest");
+  } catch {
+    latestReset = null;
+  }
+  const resetActive = latestReset?.dispatch_enabled === true
+    && ["RUNNING", "NEEDS_VERIFICATION"].includes(latestReset.status);
+  if (initialState.automationTaskKind === "POOL_RESET" && !resetActive) {
+    if (initialState.automationTabId) await closeItemTab(initialState.automationTabId);
+    else await clearAutomationItem();
+    initialState = await automationState();
+  }
+  if (resetActive) {
+    if (automationBusy) return;
+    automationBusy = true;
+    try {
+      await pollPoolResetAutomation(latestReset, initialState);
+    } catch (error) {
+      if (initialState.automationTaskKind === "POOL_RESET") {
+        await reportPoolResetFailure(
+          initialState,
+          "pool_reset_extension_error",
+          error?.message || "监控池重建扩展执行失败",
+        ).catch(() => undefined);
+      }
+    } finally {
+      automationBusy = false;
+    }
+    return;
+  }
   if (automationBusy) {
     await recoverSettledBusyItem();
     return;
@@ -1499,6 +2390,7 @@ async function pollAutomation() {
     const run = await sendBrowserCollectionHeartbeat();
     if (!run) return;
     let state = await resetStaleAutomationState(run);
+    state = await migrateTrackedAutomationTabs(state);
 
     if (state.automationItem && state.automationTabId) {
       const activeTaskTab = await chrome.tabs.get(state.automationTabId).catch(() => null);
@@ -1535,6 +2427,42 @@ async function pollAutomation() {
         void processAutomationTab(activeTab.id);
       }
       return;
+    }
+
+    if (state.identityReviewPaused) {
+      const reviewedItem = run.items?.find((item) =>
+        Number(item.id) === Number(state.automationItem?.id));
+      if (run.status === "NEEDS_VERIFICATION"
+        && run.paused_reason === "store_identity_review") return;
+      if (run.status === "RUNNING" && reviewedItem?.status === "RUNNING"
+        && state.automationTabId) {
+        const tab = await chrome.tabs.get(state.automationTabId).catch(() => null);
+        if (tab) {
+          await chrome.storage.local.set({
+            automationItem: reviewedItem,
+            identityReviewPaused: false,
+          });
+          await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
+          state = await automationState();
+          automationBusy = false;
+          void processAutomationTab(tab.id);
+          return;
+        }
+      }
+      if (state.automationTabId) await closeItemTab(state.automationTabId);
+      else await clearAutomationItem();
+      state = await automationState();
+    }
+
+    if (state.challengePaused && run.status === "RUNNING") {
+      const resumedItem = run.items?.find((item) => Number(item.id) === Number(state.automationItem?.id));
+      if (resumedItem?.status === "RUNNING" && state.automationTabId) {
+        await chrome.storage.local.set({ challengePaused: false });
+        await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
+        await chrome.notifications.clear("aliexpress-monitor-ixspy-login").catch(() => undefined);
+        await chrome.storage.local.remove("challengeProvider");
+        state = await automationState();
+      }
     }
 
     if (state.challengePaused && state.automationTaskKind === "REVIEW") {
@@ -1575,21 +2503,27 @@ async function pollAutomation() {
         : null;
       if (!tab || tab.status !== "complete") return;
       const storeProbe = state.automationItem?.target_type === "STORE";
+      let storeId = null;
+      if (storeProbe) {
+        storeId = new URL(state.automationItem.target_url).pathname
+          .match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
+        if (!storeId || isAliExpressChallengePage(tab.url)) return;
+        if (!storeOrdersPageIdentity(tab.url)) {
+          await chrome.tabs.update(tab.id, { url: state.automationItem.target_url, active: true });
+          return;
+        }
+      }
       const probe = await sendCollectMessage(
         tab.id,
         storeProbe ? "STORE_IDENTITY" : state.automationItem?.target_type,
         state.automationItem?.target_date,
+        undefined,
+        storeProbe ? { expectedStoreId: storeId } : null,
       );
       if (probe?.state === "challenge") return;
       if (probe?.state === "ixspy_login") return;
       if (storeProbe) {
-        const storeId = new URL(state.automationItem.target_url).pathname
-          .match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
         if (probe?.state !== "ready" || !storeId || probe.platform_store_id !== storeId) return;
-        if (!safeStoreOrdersUrl(tab.url, storeId)) {
-          await chrome.tabs.update(tab.id, { url: state.automationItem.target_url, active: true });
-          return;
-        }
       } else if (!probe?.payload) return;
       await chrome.storage.local.set({ challengePaused: false });
       await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
@@ -1908,6 +2842,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void saveStoreProductProgress(message, sender, sendResponse);
     return true;
   }
+  if (message?.type === "store-candidate-progress") {
+    void saveStoreCandidateProgress(message, sender, sendResponse);
+    return true;
+  }
   if (message?.type === "dashboard-context") {
     void (async () => {
       const localDianxiaomiDashboard = message.dianxiaomi_local_dashboard === true
@@ -1916,16 +2854,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const stored = await chrome.storage.local.get("apiAccessTokens");
       const workerMode = message.worker_mode === true;
       if (message.browser_collection_mode_explicit) {
-        const currentAutomation = await automationState();
         const dashboardUrl = new URL(sender?.tab?.url || "http://127.0.0.1");
         const loopbackDashboard = isLoopbackMonitorDashboard(dashboardUrl.href);
         const isolatedLocalEnabled = message.browser_collection_mode === true
           && isIsolatedBrowserCollectorUrl(dashboardUrl.href);
         const remoteWorkerEnabled = message.browser_collection_mode === true && !loopbackDashboard;
         const workerEnabled = isolatedLocalEnabled || remoteWorkerEnabled;
-        const reuseDashboardWindow = workerEnabled
-          && Number.isInteger(sender?.tab?.windowId)
-          && !currentAutomation.automationWindowOwned;
         await chrome.storage.local.set({
           browserCollectionWorkerMode: workerEnabled,
           browserCollectionLocalProfileEnabled: isolatedLocalEnabled,
@@ -1934,11 +2868,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           ...(workerEnabled && Number.isInteger(sender?.tab?.id)
             ? { automationDashboardTabId: sender.tab.id }
             : {}),
-          ...(reuseDashboardWindow ? {
-            automationWindowId: sender.tab.windowId,
-            automationWindowOwned: false,
-            automationWindowBackground: false,
-          } : {}),
         });
         browserCollectionModeReady = true;
         if (!workerEnabled) await closeAutomationWindow();

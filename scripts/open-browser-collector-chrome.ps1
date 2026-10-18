@@ -37,7 +37,7 @@ $chromeArguments = @(
     "--load-extension=`"$extensionPath`"",
     "--no-first-run",
     "--no-default-browser-check",
-    "--start-minimized",
+    "--start-maximized",
     $dashboardUrl
 )
 Start-Process -FilePath $chromePath -ArgumentList $chromeArguments

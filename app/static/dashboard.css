@@ -96,6 +96,16 @@ html { scroll-behavior: smooth; }
 .browser-queue-item-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .browser-queue-item-meta { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .browser-queue-item-side { display: flex; align-items: center; gap: 10px; }
+.browser-identity-evidence { min-width: 0; display: grid; gap: 3px; margin-top: 5px; padding: 8px 10px; border-left: 3px solid var(--warning); background: #fff8e8; font-size: 12px; }
+.browser-identity-evidence > span { overflow-wrap: anywhere; }
+.browser-identity-url { overflow-wrap: anywhere; }
+.browser-identity-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.browser-identity-actions .link-button { border: 1px solid transparent; border-radius: 4px; padding: 5px 9px; color: #111; font-size: 12px; }
+.browser-identity-actions .identity-confirm { background: #a8d8b5; border-color: #7ebf91; color: #111; }
+.browser-identity-actions .identity-confirm:hover { background: #92cfa2; }
+.browser-identity-actions .identity-reject { background: #e9a4a4; border-color: #d97d7d; color: #111; }
+.browser-identity-actions .identity-reject:hover { background: #df9090; }
+.browser-identity-actions .link-button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 .browser-item-error { color: var(--danger); font-size: 12px; }
 .status-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .status-grid > * { min-height: 72px; display: flex; flex-direction: column; justify-content: center; gap: 5px; padding: 12px 16px; border-right: 1px solid var(--line); color: var(--ink); }
@@ -136,7 +146,7 @@ input:focus, select:focus { outline: 2px solid #9bd8c3; outline-offset: 1px; bor
   .inline-rename[hidden] { display: none; }
 .inline-rename input { width: min(220px, 35vw); height: 30px; padding: 4px 7px; border: 1px solid #b9c9be; }
 .inline-rename .link-button { padding-inline: 3px; }
-  .store-summary-actions { display: inline-flex; align-items: center; justify-self: end; gap: 12px; }
+  .store-summary-actions { display: inline-flex; align-items: center; justify-self: start; gap: 12px; }
 .store-detail-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .store-links { display: flex; gap: 18px; padding-bottom: 8px; }
 .compact-rename label { width: 220px; }

@@ -5,7 +5,7 @@ const vm = require("node:vm");
 const test = require("node:test");
 const TEST_TARGET_DATE = "2026-09-29";
 
-function loadCollector({ expandYearView = false, sameChartInDailyMode = false, ixspyAvailable = true, ixspyMountAfterMs = 0, ixspyChartMountAfterMs = 0, ixspyLoginRequired = false, dailyChartReadyAfterSamples = 0, animationFramesPaused = false, tooltipDelayMs = 0, unlabeledTooltip = false, splitTooltipParts = false, tooltipFormat = "sales", missingDailyIndexes = [], negativeDailyIndex = null, throwOnChartQuery = false, collectionDeadlineCapMs = 3000 } = {}) {
+function loadCollector({ expandYearView = false, sameChartInDailyMode = false, ixspyAvailable = true, ixspyMountAfterMs = 0, ixspyChartMountAfterMs = 0, ixspyLoginRequired = false, dailyChartReadyAfterSamples = 0, animationFramesPaused = false, tooltipDelayMs = 0, unlabeledTooltip = false, splitTooltipParts = false, tooltipFormat = "sales", missingDailyIndexes = [], negativeDailyIndex = null, throwOnChartQuery = false, collectionDeadlineCapMs = 3000, identityFixture = null } = {}) {
   const collectorStartedAt = Date.now();
   const ixspyIsAvailable = () => ixspyAvailable && Date.now() - collectorStartedAt >= ixspyMountAfterMs;
   const ixspyChartIsAvailable = () => ixspyIsAvailable()
@@ -17,6 +17,8 @@ function loadCollector({ expandYearView = false, sameChartInDailyMode = false, i
   let dailyChartSamples = 0;
   let fullDomScans = 0;
   let shortTimerCalls = 0;
+  let identityCardOpen = false;
+  let safeLinkClickHandler = null;
   const dailyValues = Array.from({ length: 28 }, (_, index) =>
     index >= 21 ? [7, 0, 2, 4, 1, 3, 5][index - 21] : index % 4,
   );
@@ -159,12 +161,38 @@ function loadCollector({ expandYearView = false, sameChartInDailyMode = false, i
     parentElement: summary,
     getBoundingClientRect: () => rect(300, 40),
   };
-  const allNodes = [heading, summary, panel, chart, canvas, totalButton, incrementButton, fullYearButton, tooltip, tooltipDatePart, tooltipValuePart, loginButton];
+  const storeHeading = identityFixture ? {
+    tagName: identityFixture.headingTag || (identityFixture.headingIsLink ? "A" : "DIV"),
+    className: identityFixture.headingClassName ?? "store-title",
+    innerText: identityFixture.heading,
+    textContent: identityFixture.heading,
+    getAttribute: () => null,
+    closest: (selector) => selector === "a[href]" && identityFixture.headingIsLink ? storeHeading : null,
+    addEventListener(type, listener, options) {
+      if (type === "click" && options?.capture) safeLinkClickHandler = listener;
+    },
+    removeEventListener(type, listener) {
+      if (type === "click" && safeLinkClickHandler === listener) safeLinkClickHandler = null;
+    },
+    getBoundingClientRect: () => rect(240, 32),
+    dispatchEvent(event) {
+      if (event.type === "click" && safeLinkClickHandler) safeLinkClickHandler(event);
+      if (event.type === "click" && identityFixture.opensOnClick) identityCardOpen = true;
+      if (event.type === "click") identityFixture.clickDefaultPrevented = event.defaultPrevented;
+    },
+  } : null;
+  const allNodes = [heading, summary, panel, chart, canvas, totalButton, incrementButton, fullYearButton, tooltip, tooltipDatePart, tooltipValuePart, loginButton, ...(storeHeading ? [storeHeading] : [])];
   const document = {
     visibilityState: "hidden",
-    title: "IXSPY Fixture Product - AliExpress",
+    title: identityFixture?.title || "IXSPY Fixture Product - AliExpress",
     images: [],
-    body: { innerText: `${"IXSPY Fixture Product with public product details 134 sold ".repeat(12)}${ixspyLoginRequired ? " 登录/注册可见" : ""}` },
+    body: {
+      get innerText() {
+        if (!identityFixture) return `${"IXSPY Fixture Product with public product details 134 sold ".repeat(12)}${ixspyLoginRequired ? " 登录/注册可见" : ""}`;
+        return `${identityFixture.heading}${identityCardOpen ? `\nStore info\nStore name ${identityFixture.heading}\nStore ID ${identityFixture.storeId}` : ""}`;
+      },
+      get textContent() { return this.innerText; },
+    },
     documentElement: { querySelectorAll: () => allNodes },
     querySelector(selector) {
       if (throwOnChartQuery && selector === "#trade_chart") throw new Error("chart node unavailable");
@@ -178,6 +206,9 @@ function loadCollector({ expandYearView = false, sameChartInDailyMode = false, i
     },
     querySelectorAll(selector) {
       if (selector === "*") fullDomScans += 1;
+      if (selector.startsWith("h1, h2, [role='heading'], [class*='store' i]")
+        && storeHeading && /store/i.test(storeHeading.className)) return [storeHeading];
+      if (selector.includes("button") && storeHeading?.tagName === "BUTTON") return [storeHeading];
       if (selector === 'script[type="application/ld+json"]') return [];
       if (selector === "*") return allNodes;
       if (selector === ".sales-180") return ixspyIsAvailable() ? [panel] : [];
@@ -195,7 +226,9 @@ function loadCollector({ expandYearView = false, sameChartInDailyMode = false, i
   const context = {
     document,
     window: {},
-    location: { href: "https://www.aliexpress.com/item/1005001234567890.html", pathname: "/item/1005001234567890.html" },
+    location: identityFixture
+      ? { href: identityFixture.url, pathname: new URL(identityFixture.url).pathname }
+      : { href: "https://www.aliexpress.com/item/1005001234567890.html", pathname: "/item/1005001234567890.html" },
     URL,
     Date,
     Map,
@@ -206,7 +239,10 @@ function loadCollector({ expandYearView = false, sameChartInDailyMode = false, i
     RegExp,
     Promise,
     MutationObserver: class { observe() {} disconnect() {} },
-    MouseEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
+    MouseEvent: class {
+      constructor(type, init) { this.type = type; this.defaultPrevented = false; Object.assign(this, init); }
+      preventDefault() { this.defaultPrevented = true; }
+    },
     PointerEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     getComputedStyle: (element) => ({
       display: "block",
@@ -269,7 +305,7 @@ test("does not expand the full-year view and restores the original chart mode", 
   const result = await collector.collect("PRODUCT", TEST_TARGET_DATE);
 
   assert.equal(result.state, "ready");
-  assert.equal(result.payload.raw_data.extractor_version, "extension-content-0.6.76");
+  assert.equal(result.payload.raw_data.extractor_version, "extension-content-0.6.103");
   assert.equal(result.payload.raw_data.history_full_year_control_found, true);
   assert.equal(result.payload.raw_data.history_full_year_view_opened, false);
   assert.equal(result.payload.raw_data.history_daily_mode_selected, true);
@@ -437,4 +473,73 @@ test("marks an overdue history capture instead of saving an unannotated product 
   assert.equal(result.payload.raw_data.history_source, "visible_ixspy_capture_timeout");
   assert.equal(result.payload.raw_data.history_daily_capture_complete, false);
   assert.equal(result.payload.raw_data.history_missing_dates.length, 7);
+});
+
+test("verifies an AliExpress route alias by opening the store identity card", async () => {
+  const targetStoreId = "1105179516";
+  const result = await loadCollector({
+    identityFixture: {
+      url: "https://www.aliexpress.com/store/1105182474/pages/all-items.html?shop_sortType=orders_desc",
+      heading: "AMZSTEM Pop Toys Store",
+      title: "AMZSTEM Pop Toys Store - AliExpress",
+      storeId: targetStoreId,
+      opensOnClick: true,
+    },
+  }).collect("STORE_IDENTITY", null, { expected_store_id: targetStoreId });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.platform_store_id, targetStoreId);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.store_identity.labeled_store_ids)), [targetStoreId]);
+});
+
+test("opens the store identity card when the store heading is an anchor without navigating", async () => {
+  const targetStoreId = "1105179516";
+  const identityFixture = {
+    url: "https://www.aliexpress.com/store/1105182474/pages/all-items.html?shop_sortType=orders_desc",
+    heading: "AMZSTEM Pop Toys Store",
+    title: "AMZSTEM Pop Toys Store - AliExpress",
+    storeId: targetStoreId,
+    headingIsLink: true,
+    opensOnClick: true,
+  };
+  const result = await loadCollector({ identityFixture })
+    .collect("STORE_IDENTITY", null, { expected_store_id: targetStoreId });
+
+  assert.equal(result.state, "ready");
+  assert.deepEqual(JSON.parse(JSON.stringify(result.store_identity.labeled_store_ids)), [targetStoreId]);
+  assert.equal(identityFixture.clickDefaultPrevented, true);
+});
+
+test("finds a clickable store title when it is a button without a store-specific class", async () => {
+  const targetStoreId = "1105179516";
+  const result = await loadCollector({
+    identityFixture: {
+      url: "https://www.aliexpress.com/store/1105182474/pages/all-items.html?shop_sortType=orders_desc",
+      heading: "AMZSTEM Pop Toys Store",
+      title: "AMZSTEM Pop Toys Store - AliExpress",
+      storeId: targetStoreId,
+      headingTag: "BUTTON",
+      headingClassName: "merchant-title",
+      opensOnClick: true,
+    },
+  }).collect("STORE_IDENTITY", null, { expected_store_id: targetStoreId });
+
+  assert.equal(result.state, "ready", result.message);
+  assert.equal(result.platform_store_id, targetStoreId);
+});
+
+test("sends a conflicting route alias identity card to manual review", async () => {
+  const result = await loadCollector({
+    identityFixture: {
+      url: "https://www.aliexpress.com/store/1105182474/pages/all-items.html?shop_sortType=orders_desc",
+      heading: "AMZSTEM Pop Toys Store",
+      title: "AMZSTEM Pop Toys Store - AliExpress",
+      storeId: "1105182474",
+      opensOnClick: true,
+    },
+  }).collect("STORE_IDENTITY", null, { expected_store_id: "1105179516" });
+
+  assert.equal(result.state, "identity_review");
+  assert.equal(result.error_type, "store_identity_mismatch");
+  assert.match(result.message, /1105182474/);
 });

@@ -113,7 +113,7 @@ def claim_next_task(db: Session, worker_id: str = "chrome-extension") -> tuple[R
         task_query()
         .where(ReviewCollectionTask.status == "PENDING")
         .order_by(ReviewCollectionTask.created_at, ReviewCollectionTask.id)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True, of=ReviewCollectionTask)
         .limit(1)
     )
     if task is None:

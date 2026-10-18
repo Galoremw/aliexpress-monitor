@@ -536,6 +536,24 @@ if (document.querySelector(".collect-reviews")) {
   window.setInterval(refreshReviewTaskStates, 5000);
 }
 
+document.querySelectorAll(".deactivate-store").forEach((button) => {
+  button.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const storeName = button.dataset.storeName || "该店铺";
+    if (!window.confirm(`确定删除“${storeName}”的监控吗？店铺将从活跃监控中移除，商品及历史数据会保留。`)) return;
+    button.disabled = true;
+    try {
+      await jsonRequest(`/api/stores/${button.dataset.storeId}/deactivate`, { method: "POST" });
+      notify(`店铺“${storeName}”已移出监控，历史数据已保留`);
+      window.location.reload();
+    } catch (error) {
+      notify(error.message, true);
+      button.disabled = false;
+    }
+  });
+});
+
 document.querySelectorAll(".deactivate-product").forEach((button) => {
   button.addEventListener("click", async () => {
     if (!window.confirm("确定删除这个商品的监控吗？历史快照会保留，但它将不再参与自动采集和店铺汇总。")) return;
@@ -671,7 +689,9 @@ function renderBrowserCollectionFilter() {
   const caption = section.querySelector("#browser-list-caption");
   if (title) title.textContent = `${label}任务 · ${filteredItems.length}`;
   if (caption) caption.textContent = browserCollectionFilter === "verification"
-    ? "请在本机 Chrome 中完成正常登录或验证后继续"
+    ? browserCollectionRun?.paused_reason === "store_identity_review"
+      ? "采集队列已暂停，等待人工确认当前店铺身份"
+      : "请在本机 Chrome 中完成正常登录或验证后继续"
     : "店铺商品展示页读取已监控商品的 IXSPY 最近 7 日增量；缺失日期标记待补";
   list.innerHTML = filteredItems.map(renderBrowserCollectionItem).join("")
     || `<p class="muted-value">当前没有${escapeDianxiaomiHtml(label)}任务。</p>`;
@@ -690,12 +710,28 @@ function renderBrowserCollectionFilter() {
 }
 
 function renderBrowserCollectionItem(item) {
+  const identityReview = item.status === "NEEDS_VERIFICATION"
+    && item.identity_review_pending === true;
   const status = item.status === "SKIPPED" && item.error_type === "queue_cancelled"
-    ? "已取消" : browserCollectionStatusLabels[item.status] || item.status;
+    ? "已取消" : identityReview ? "待确认店铺身份"
+      : browserCollectionStatusLabels[item.status] || item.status;
   const statusClass = ["SUCCEEDED"].includes(item.status) ? "success"
     : ["FAILED", "SKIPPED", "NEEDS_VERIFICATION"].includes(item.status) ? "error" : "";
-  const action = ["FAILED", "PARTIAL"].includes(item.status)
-    ? `<button class="link-button" type="button" data-browser-item-action="retry" data-browser-item-id="${item.id}">重新排队</button>` : "";
+  const identityEvidence = item.identity_review_evidence || {};
+  const reviewedUrl = escapeDianxiaomiHtml(item.identity_review_url || "");
+  const visibleStoreIds = [
+    identityEvidence.heading_store_id,
+    ...(Array.isArray(identityEvidence.labeled_store_ids) ? identityEvidence.labeled_store_ids : []),
+  ].filter((id) => id != null && String(id)).map(String);
+  const reviewDetails = identityReview
+    ? `<div class="browser-identity-evidence"><strong>人工核验店铺身份</strong><span>采集页面：${reviewedUrl
+      ? `<a class="browser-identity-url" href="${reviewedUrl}" target="_blank" rel="noreferrer">${reviewedUrl}</a>`
+      : "未记录"}</span><span>页面标题：${escapeDianxiaomiHtml(identityEvidence.page_title || "未识别")}</span><span>IXSPY 店铺名称：${escapeDianxiaomiHtml(identityEvidence.ixspy_store_name || "未识别")}</span><span>页面显示 ID：${escapeDianxiaomiHtml(visibleStoreIds.join("、") || "未识别")}</span></div>`
+    : "";
+  const action = identityReview
+    ? `<div class="browser-identity-actions"><button class="link-button identity-confirm" type="button" data-browser-item-action="identity-confirm" data-browser-item-id="${item.id}">确定无误</button><button class="link-button identity-reject" type="button" data-browser-item-action="identity-reject" data-browser-item-id="${item.id}">错误</button></div>`
+    : ["FAILED", "PARTIAL"].includes(item.status)
+      ? `<button class="link-button" type="button" data-browser-item-action="retry" data-browser-item-id="${item.id}">重新排队</button>` : "";
   const kind = item.target_type === "STORE" ? "店铺商品发现" : `商品 #${item.product_id ?? "—"}`;
   const title = escapeDianxiaomiHtml(item.title || kind);
   const url = escapeDianxiaomiHtml(item.target_url);
@@ -703,7 +739,7 @@ function renderBrowserCollectionItem(item) {
     .filter(Boolean).map(escapeDianxiaomiHtml).join(" · ");
   const error = item.error_message ? `<span class="browser-item-error">${escapeDianxiaomiHtml(item.error_message)}</span>` : "";
   const time = item.completed_at || item.claimed_at;
-  return `<article class="browser-queue-item"><div class="browser-queue-item-main"><strong class="browser-queue-item-title">${title}</strong><span class="browser-queue-item-meta">${details} · <a href="${url}" target="_blank" rel="noreferrer">打开目标页</a></span>${time ? `<span class="browser-queue-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(time))}</span>` : ""}${error}</div><div class="browser-queue-item-side"><span class="dianxiaomi-status ${statusClass}">${status}</span>${action}</div></article>`;
+  return `<article class="browser-queue-item"><div class="browser-queue-item-main"><strong class="browser-queue-item-title">${title}</strong><span class="browser-queue-item-meta">${details} · <a href="${url}" target="_blank" rel="noreferrer">打开目标页</a></span>${time ? `<span class="browser-queue-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(time))}</span>` : ""}${error}${reviewDetails}</div><div class="browser-queue-item-side"><span class="dianxiaomi-status ${statusClass}">${status}</span>${action}</div></article>`;
 }
 
 function formatBrowserTime(value) {
@@ -729,6 +765,9 @@ function browserWorkerState(run) {
     return { label: "采集队列已手动暂停", className: "pending" };
   }
   if (run.status === "NEEDS_VERIFICATION") {
+    if (run.paused_reason === "store_identity_review") {
+      return { label: "等待人工确认店铺身份；队列已暂停", className: "partial" };
+    }
     const item = (run.items || []).find((candidate) => candidate.status === "NEEDS_VERIFICATION");
     const message = item?.error_message || "";
     return {
@@ -826,11 +865,13 @@ function updateBrowserCollection(run) {
   });
 
   const needsVerification = run.status === "NEEDS_VERIFICATION";
+  const identityReview = needsVerification && run.paused_reason === "store_identity_review";
+  const platformVerification = needsVerification && !identityReview;
   const paused = run.status === "PAUSED";
   const cancelled = paused && run.paused_reason === "manual_cancel";
   if (challenge) {
-    challenge.hidden = !needsVerification;
-    if (needsVerification) {
+    challenge.hidden = !platformVerification;
+    if (platformVerification) {
       const item = (run.items || []).find((candidate) => candidate.status === "NEEDS_VERIFICATION");
       const message = item?.error_message || "平台需要人工登录或验证。请在本机 Chrome 中正常完成后，扩展会继续当前任务。";
       challenge.textContent = `${message} 请正常完成后等待扩展继续当前任务。`;
@@ -997,10 +1038,22 @@ document.querySelector("#browser-collection-status")?.addEventListener("click", 
   if (!action) return;
   action.disabled = true;
   try {
-    const run = await jsonRequest(`/api/browser-collection/items/${action.dataset.browserItemId}/retry`, { method: "POST" });
+    const actionType = action.dataset.browserItemAction;
+    const isIdentityDecision = ["identity-confirm", "identity-reject"].includes(actionType);
+    const endpoint = actionType === "identity-confirm" ? "confirm" : "reject";
+    const run = await jsonRequest(
+      isIdentityDecision
+        ? `/api/browser-collection/items/${action.dataset.browserItemId}/identity-review/${endpoint}`
+        : `/api/browser-collection/items/${action.dataset.browserItemId}/retry`,
+      { method: "POST" },
+    );
     updateBrowserCollection(run);
     await refreshBrowserCollectionControl();
-    notify("任务已重新排队；请在队列区点击“开始采集”后运行。");
+    notify(actionType === "identity-confirm"
+      ? "已确认当前店铺身份，采集任务继续运行。"
+      : actionType === "identity-reject"
+        ? "已将当前店铺任务标记为错误，采集队列保持暂停。"
+        : "任务已重新排队；请在队列区点击“开始采集”后运行。");
   } catch (error) {
     notify(error.message, true);
   } finally {

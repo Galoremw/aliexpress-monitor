@@ -1,6 +1,35 @@
 from app.db.models import Product, ProductReview, Store
 
 
+def test_review_task_claim_scopes_postgres_row_lock_to_task_table():
+    from sqlalchemy.dialects import postgresql
+
+    from app.services.reviews import claim_next_task
+
+    class CapturingSession:
+        def __init__(self):
+            self.claim_statement = None
+
+        def scalars(self, _statement):
+            return []
+
+        def scalar(self, statement):
+            self.claim_statement = statement
+            return None
+
+        def flush(self):
+            pass
+
+        def commit(self):
+            pass
+
+    session = CapturingSession()
+    claim_next_task(session)
+    sql = str(session.claim_statement.compile(dialect=postgresql.dialect()))
+
+    assert "FOR UPDATE OF review_collection_tasks SKIP LOCKED" in sql
+
+
 def test_review_task_reuse_claim_and_incremental_result(client, db_session):
     store = Store(name="Review Store", url="https://www.aliexpress.com/store/700001")
     product = Product(
