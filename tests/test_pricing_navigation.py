@@ -11,6 +11,8 @@ from app.dashboard import pricing
 def test_monitor_nav_contains_pricing_entry():
     template = Path("app/templates/base.html").read_text(encoding="utf-8")
     assert '<a href="/pricing">产品定价表</a>' in template
+    nginx = Path("frontend/nginx.conf").read_text(encoding="utf-8")
+    assert "proxy_set_header Host $http_host;" in nginx
 
 
 def test_pricing_page_and_quote_use_authenticated_narrow_proxy(monkeypatch):
