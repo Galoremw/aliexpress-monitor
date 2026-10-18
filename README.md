@@ -1,5 +1,11 @@
 # AliExpress 竞品监控 MVP
 
+## 产品定价表入口
+
+本地监控台顶部导航的“产品定价表”打开店小秘项目 Docker 提供的同一个工作台。监控后端只转发已列出的定价 API，浏览器复用监控台登录会话；店小秘服务的 `API_TOKEN` 仅放在监控后端的 `PRICING_SERVICE_TOKEN` 环境变量中，不写入网页。
+
+同一 Docker 主机上，先启动店小秘定价容器以建立 `dianxiaomi-pricing-bridge` 网络，再在监控项目使用 `docker compose -f compose.yaml -f compose.pricing.yaml up -d --build backend frontend`。两个项目的 token 应一致。未使用覆盖文件时，原有监控服务仍可单独启动，但定价页会显示服务未连接。跨主机部署应使用受保护的私有地址配置 `PRICING_SERVICE_URL`，不能将 token 放进浏览器地址或前端环境变量。
+
 用于选品研究的 AliExpress 公开数据监控系统。商品日销量只采用商品页 IXSPY 图表中用户可见的日增量；不采集累计售出数，也不通过累计值差分估算。店铺汇总只覆盖已添加并保持活跃的监控商品，不代表店铺真实后台订单量或全店销量。
 
 ## MVP 能力

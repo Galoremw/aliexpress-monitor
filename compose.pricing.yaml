@@ -1,0 +1,13 @@
+services:
+  backend:
+    environment:
+      PRICING_SERVICE_URL: http://dianxiaomi-pricing:8000
+      PRICING_SERVICE_TOKEN: "${PRICING_SERVICE_TOKEN:?Set the Dianxiaomi API token in .env}"
+    networks:
+      - default
+      - pricing_bridge
+
+networks:
+  pricing_bridge:
+    external: true
+    name: dianxiaomi-pricing-bridge

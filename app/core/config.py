@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     auth_cookie_samesite: str = Field(default="lax", pattern="^(lax|strict|none)$")
     auth_admin_username: str | None = None
     auth_admin_password: str | None = None
+    pricing_service_url: str | None = None
+    pricing_service_token: str | None = None
 
 
 @lru_cache
