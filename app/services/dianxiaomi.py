@@ -210,12 +210,15 @@ def update_handoff(
     *,
     error_type: str | None = None,
     error_message: str | None = None,
+    detail: dict | None = None,
     worker_id: str | None = None,
 ) -> DianxiaomiHandoff:
     now = _now()
     row.status = status
     row.error_type = error_type
     row.error_message = error_message
+    if detail is not None:
+        row.detail_json = detail
     if worker_id:
         row.worker_id = worker_id
     if status in LEASED_HANDOFF_STATUSES:
@@ -230,6 +233,22 @@ def update_handoff(
         row.opened_at = row.opened_at or now
     if status in {"SUCCEEDED", "FAILED", "CANCELED"}:
         row.completed_at = now
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def retry_handoff(db: Session, row: DianxiaomiHandoff) -> DianxiaomiHandoff:
+    if row.status not in {"NEEDS_CONFIRMATION", "FAILED"}:
+        raise ValueError("该店小秘任务当前不能重新排队")
+    row.status = "QUEUED"
+    row.worker_id = None
+    row.claimed_at = None
+    row.error_type = None
+    row.error_message = None
+    row.detail_json = None
+    row.completed_at = None
+    row.attempt_count += 1
     db.commit()
     db.refresh(row)
     return row
@@ -254,4 +273,6 @@ def serialize_handoff(row: DianxiaomiHandoff) -> dict:
         "worker_id": row.worker_id,
         "error_type": row.error_type,
         "error_message": row.error_message,
+        "attempt_count": row.attempt_count,
+        "detail": row.detail_json,
     }

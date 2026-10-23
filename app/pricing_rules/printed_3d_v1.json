@@ -1,0 +1,51 @@
+{
+  "version": "printed-3d-approved-20261019-v1",
+  "source_filename": "速卖通定价表 简化版.xlsx",
+  "source_sha256": "CA39959A5849291737ECD360187284D15029650F836F5EF5B963AAD08E71A108",
+  "sheet": "3D打印类产品定价表",
+  "formulas": {
+    "material_cost": "filament_grams * material_cost_per_kg / 1000",
+    "electricity_cost": "(print_hours + print_minutes / 60) * electricity_cost_per_hour",
+    "production_cost": "material_cost + electricity_cost",
+    "total_cost": "production_cost + fixed_packaging_shipping",
+    "suggested_price": "total_cost * material_multiplier",
+    "formula_profit": "suggested_price - total_cost"
+  },
+  "materials": {
+    "PLA": {
+      "material_cost_per_kg": 40,
+      "electricity_cost_per_hour": 0.25,
+      "multiplier": 3
+    },
+    "PETG": {
+      "material_cost_per_kg": 28,
+      "electricity_cost_per_hour": 0.3,
+      "multiplier": 3.5
+    }
+  },
+  "fixed_packaging_shipping": 1.4,
+  "source_formulas": {
+    "C3": "=A3*0.04",
+    "D3": "=C3+E5+K4",
+    "G3": "=D3*(F3+E3)+K4",
+    "E5": "=(A5*D5)+((C5/60)*D5)",
+    "C8": "=A8*0.028",
+    "D8": "=C8+E10+K9",
+    "G8": "=D8*(F8+E8)+K9",
+    "E10": "=($A$10*$D$10)+(($C$10/60)*$D$10)",
+    "L4": "=IF(B21>D21,B21,IF(D21>B21,D21,IF(B21=D21,B21)))",
+    "L9": "=IF(B21>D21,B21,IF(D21>B21,D21,IF(B21=D21,B21)))",
+    "F13": "=INDEX(_xlfn._xlws.SORT(_xlfn._xlws.FILTER(仓库现有纸箱数据库!A:F,(仓库现有纸箱数据库!C:C>=A13+D13)*(仓库现有纸箱数据库!D:D>=B13+D13)*(仓库现有纸箱数据库!E:E>=C13+D13)),6,1),1,1)",
+    "G13": "=($E$13+VLOOKUP(F13,仓库现有纸箱数据库!A:H,8,0))/1000",
+    "B20": "=G13",
+    "D20": "=$G$13",
+    "B21": "=IF(B20<=0.5,0.4,IF(B20<=1,0.8,0.8+CEILING((B20-1000)/500,1)*0.4))",
+    "D21": "=IF(D20<=0.5,0.4,IF(D20<=1,0.8,0.8+CEILING((D20-1000)/500,1)*0.4))"
+  },
+  "workbook_profile": {
+    "version": "printed-3d-wps-formula-20261019-v1",
+    "PLA": {"material_cost_per_kg": 40, "electricity_cost_per_hour": 0.25, "vat_rate": 0.15, "multiplier": 3, "fixed_fee_before_multiplier": 1, "fixed_fee_after_multiplier": 1},
+    "PETG": {"material_cost_per_kg": 28, "electricity_cost_per_hour": 0.3, "vat_rate": 0.15, "multiplier": 3.5, "fixed_fee_before_multiplier": 1, "fixed_fee_after_multiplier": 1}
+  },
+  "source_note": "The approved PLA/PETG profile uses CNY 1.40 once and excludes VAT. The WPS sheet adds CNY 1 before the multiplier and again after it, and multiplies by (multiplier + 15% VAT). The formulas are both retained for human review."
+}

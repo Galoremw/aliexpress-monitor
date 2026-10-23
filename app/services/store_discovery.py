@@ -215,6 +215,7 @@ def store_top_products(
             .where(
                 Product.store_id == store_id,
                 Product.status == "active",
+                Product.monitor_scope == "competitor",
                 ProductDailyMetric.metric_date == metric_date,
                 ProductDailyMetric.is_estimable.is_(True),
                 ProductDailyMetric.calculation_method == "ixspy_visible_daily_increment",

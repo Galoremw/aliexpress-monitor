@@ -1,9 +1,10 @@
 (function () {
   if (globalThis.AliExpressMonitorPageCollector) return;
 
-  const PAGE_COLLECTOR_VERSION = "0.6.103";
+  const PAGE_COLLECTOR_VERSION = "0.6.105";
   let verifiedStoreIdentity = null;
   const STORE_MORE_ACTION_WAIT_MS = 5000;
+  const STORE_PRODUCT_HISTORY_TIMEOUT_MS = 75 * 1000;
   const clean = (value) => value?.replace(/\s+/g, " ").trim() || null;
   const cleanProductTitle = (value) => {
     const title = clean(value);
@@ -705,8 +706,7 @@
     const labeledStoreIdsFrom = (text) => [...text.matchAll(/(?:\bStore\s*ID\b|店铺\s*ID)\s*[:：]?\s*(\d{6,})/gi)]
       .map((match) => match[1]);
     const headingStoreId = bodyText.slice(0, 5000)
-      .match(/(?:^|\n)\s*Shop\s*(\d{6,})\s+Store\b/im)?.[1]
-      || String(document.title || "").match(/\bShop\s*(\d{6,})\s+Store\b/i)?.[1];
+      .match(/(?:^|\n)\s*Shop\s*(\d{6,})\s+Store\b/im)?.[1];
     const visibleLabeledIds = labeledStoreIdsFrom(bodyText);
     const labeledStoreIds = visibleLabeledIds.length
       ? visibleLabeledIds
@@ -741,7 +741,7 @@
         && evidence.heading_store_id !== expectedStoreId
         ? evidence.heading_store_id
         : null;
-      const hasMatchingDisplayedId = evidence.labeled_store_ids.includes(expectedStoreId);
+      const hasMatchingDisplayedId = displayedIds.includes(expectedStoreId);
       if (hasMatchingDisplayedId && !explicitMismatch && !headingMismatch) return null;
       const mismatch = explicitMismatch || headingMismatch;
       if (mismatch) {
@@ -924,7 +924,13 @@
       errorType = "store_identity_mismatch";
       identityMethod = "ixspy_store_name_conflict";
       identityError = `已确认的 IXSPY 店铺名称“${savedIxspyName}”与当前页面“${ixspyStoreName}”不一致`;
-    } else if (routeStoreId !== targetStoreId && !evidence.labeled_store_ids.includes(targetStoreId)) {
+    } else if (routeStoreId !== targetStoreId
+      && evidence.heading_store_id === targetStoreId
+      && !evidence.labeled_store_ids.length) {
+      identityMethod = "storefront_heading_id";
+    } else if (routeStoreId !== targetStoreId
+      && evidence.heading_store_id !== targetStoreId
+      && !evidence.labeled_store_ids.includes(targetStoreId)) {
       if (savedAlias) {
         identityMethod = "backend_approved_url_alias";
       } else {
@@ -976,7 +982,9 @@
     const labeledStoreIds = Array.isArray(identity?.labeled_store_ids)
       ? identity.labeled_store_ids.map(String)
       : [];
-    const matchingDisplayedId = labeledStoreIds.includes(targetStoreId);
+    const matchingDisplayedId = labeledStoreIds.includes(targetStoreId)
+      || (identity?.identity_method === "storefront_heading_id"
+        && String(identity?.heading_store_id || "") === targetStoreId);
     if (!routeStoreId || !targetStoreId || identity?.target_store_id !== targetStoreId
       || String(identity.route_store_id) !== routeStoreId
       || identity.page_url !== location.href
@@ -1363,44 +1371,70 @@
   }
 
   async function collectStoreProductHistoryWithRetry(product, targetDate, setupWaitMs = 0) {
-    let history = await collectStoreProductHistory(product, targetDate, setupWaitMs);
-    if (history.challenge || history.login_required || history.daily_capture_complete) {
-      return { history, retryPasses: 0 };
-    }
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    const retry = await collectStoreProductHistory(product, targetDate, 700);
-    if (retry.challenge || retry.login_required) return { history: retry, retryPasses: 1 };
-    const remainingMiniChart = storeMiniChart(product.platform_product_id);
-    const trigger = storeTrendButton(product.platform_product_id);
-    if (remainingMiniChart && visible(remainingMiniChart) && trigger && !isChallengePage()) trigger.click();
+    let timeoutId;
+    let timedOut = false;
+    const timeout = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        resolve(null);
+      }, STORE_PRODUCT_HISTORY_TIMEOUT_MS);
+    });
+    const read = (async () => {
+      let history = await collectStoreProductHistory(product, targetDate, setupWaitMs);
+      if (history.challenge || history.login_required || history.daily_capture_complete) {
+        return { history, retryPasses: 0 };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      const retry = await collectStoreProductHistory(product, targetDate, 700);
+      if (retry.challenge || retry.login_required) return { history: retry, retryPasses: 1 };
+      const remainingMiniChart = storeMiniChart(product.platform_product_id);
+      const trigger = storeTrendButton(product.platform_product_id);
+      if (remainingMiniChart && visible(remainingMiniChart) && trigger && !isChallengePage()) trigger.click();
 
-    const expectedDates = retry.expected_dates || history.expected_dates || expectedDailyDates(targetDate);
-    const pointsByDate = new Map();
-    for (const point of [...(history.points || []), ...(retry.points || [])]) {
-      if (expectedDates.includes(point.date)) pointsByDate.set(point.date, point);
+      const expectedDates = retry.expected_dates || history.expected_dates || expectedDailyDates(targetDate);
+      const pointsByDate = new Map();
+      for (const point of [...(history.points || []), ...(retry.points || [])]) {
+        if (expectedDates.includes(point.date)) pointsByDate.set(point.date, point);
+      }
+      const points = expectedDates.map((metricDate) => pointsByDate.get(metricDate)).filter(Boolean);
+      const missingDates = expectedDates.filter((metricDate) => !pointsByDate.has(metricDate));
+      const observedByDate = new Map();
+      for (const point of [...(history.observed_points || []), ...(retry.observed_points || [])]) {
+        observedByDate.set(point.date, point);
+      }
+      history = {
+        ...history,
+        ...retry,
+        points,
+        expected_dates: expectedDates,
+        missing_dates: missingDates,
+        daily_capture_complete: missingDates.length === 0,
+        source: points.length ? "ixspy_visible_daily_increment" : retry.source || history.source,
+        sampled_positions: (history.sampled_positions || 0) + (retry.sampled_positions || 0),
+        tooltip_hit_count: (history.tooltip_hit_count || 0) + (retry.tooltip_hit_count || 0),
+        attempts: (history.attempts || 0) + (retry.attempts || 0),
+        observed_points: [...observedByDate.values()].sort((left, right) => left.date.localeCompare(right.date)),
+        tooltip_samples: [...new Set([...(history.tooltip_samples || []), ...(retry.tooltip_samples || [])])].slice(0, 4),
+        more_action_wait_ms: (history.more_action_wait_ms || 0) + (retry.more_action_wait_ms || 0),
+      };
+      return { history, retryPasses: 1 };
+    })();
+    try {
+      const result = await Promise.race([read, timeout]);
+      if (timedOut) {
+        return {
+          history: unavailableStoreHistory(targetDate, "ixspy_store_product_chart_read_timeout", {
+            timed_out: true,
+            timeout_ms: STORE_PRODUCT_HISTORY_TIMEOUT_MS,
+          }),
+          retryPasses: 0,
+          timedOut: true,
+        };
+      }
+      return result;
+    } finally {
+      clearTimeout(timeoutId);
     }
-    const points = expectedDates.map((metricDate) => pointsByDate.get(metricDate)).filter(Boolean);
-    const missingDates = expectedDates.filter((metricDate) => !pointsByDate.has(metricDate));
-    const observedByDate = new Map();
-    for (const point of [...(history.observed_points || []), ...(retry.observed_points || [])]) {
-      observedByDate.set(point.date, point);
-    }
-    history = {
-      ...history,
-      ...retry,
-      points,
-      expected_dates: expectedDates,
-      missing_dates: missingDates,
-      daily_capture_complete: missingDates.length === 0,
-      source: points.length ? "ixspy_visible_daily_increment" : retry.source || history.source,
-      sampled_positions: (history.sampled_positions || 0) + (retry.sampled_positions || 0),
-      tooltip_hit_count: (history.tooltip_hit_count || 0) + (retry.tooltip_hit_count || 0),
-      attempts: (history.attempts || 0) + (retry.attempts || 0),
-      observed_points: [...observedByDate.values()].sort((left, right) => left.date.localeCompare(right.date)),
-      tooltip_samples: [...new Set([...(history.tooltip_samples || []), ...(retry.tooltip_samples || [])])].slice(0, 4),
-      more_action_wait_ms: (history.more_action_wait_ms || 0) + (retry.more_action_wait_ms || 0),
-    };
-    return { history, retryPasses: 1 };
   }
 
   async function collectStore(targetDate = localDateString()) {
@@ -1422,9 +1456,10 @@
     const products = latest.products.slice(0, 20);
     if (!products.length) return { state: "failed", message: "当前店铺页未读取到公开商品链接" };
     let historyCompleteCount = 0;
+    let collectionInterrupted = false;
     for (const [index, product] of products.entries()) {
       if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
-      const { history } = await collectStoreProductHistoryWithRetry(product, targetDate, index === 0 ? 6000 : 800);
+      const { history, timedOut } = await collectStoreProductHistoryWithRetry(product, targetDate, index === 0 ? 6000 : 800);
       if (history.challenge) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
       if (history.login_required) {
         return { state: "ixspy_login", message: "IXSPY 登录已过期，请先正常登录后重试" };
@@ -1435,6 +1470,19 @@
       product.history_expected_dates = history.expected_dates || expectedDailyDates(targetDate);
       product.history_missing_dates = history.missing_dates || product.history_expected_dates;
       if (product.history_daily_capture_complete) historyCompleteCount += 1;
+      if (timedOut) {
+        product.history_read_diagnostic = {
+          product_id: product.platform_product_id,
+          outcome: "unavailable",
+          source: history.source,
+          point_count: 0,
+          missing_dates: product.history_missing_dates,
+          timed_out: true,
+          timeout_ms: history.timeout_ms,
+        };
+        collectionInterrupted = true;
+        break;
+      }
     }
     return {
       state: "ready",
@@ -1450,6 +1498,7 @@
           history_target_date: targetDate,
           history_products_attempted: products.length,
           history_products_complete: historyCompleteCount,
+          ...(collectionInterrupted ? { collection_interrupted: true } : {}),
           page_title: clean(document.title),
           visible_link_count: latest.products.length,
           candidate_node_count: latest.candidateNodeCount,
@@ -1596,9 +1645,10 @@
     };
     const chartReads = [];
     const collectedProducts = [];
+    let collectionInterrupted = false;
     for (const [index, match] of products.entries()) {
       const { product, target, method } = match;
-      const { history, retryPasses } = await collectStoreProductHistoryWithRetry(product, targetDate, index === 0 ? 6000 : 800);
+      const { history, retryPasses, timedOut } = await collectStoreProductHistoryWithRetry(product, targetDate, index === 0 ? 6000 : 800);
       const chartRead = {
         product_id: String(target.platform_product_id),
         observed_product_id: product.platform_product_id,
@@ -1608,6 +1658,7 @@
         point_count: history.points?.length || 0,
         missing_dates: history.missing_dates || expectedDailyDates(targetDate),
         retry_passes: retryPasses,
+        ...(timedOut ? { timed_out: true, timeout_ms: history.timeout_ms } : {}),
         ...(history.more_action_wait_ms ? { more_action_wait_ms: history.more_action_wait_ms } : {}),
       };
       chartReads.push(chartRead);
@@ -1632,6 +1683,10 @@
       };
       collectedProducts.push(monitoredProduct);
       await options.on_product_collected?.(monitoredProduct);
+      if (timedOut) {
+        collectionInterrupted = true;
+        break;
+      }
     }
     return {
       state: "ready",
@@ -1642,7 +1697,11 @@
         has_next_page: storeHasNextPage(),
         next_page_url: storeNextPageUrl(storeId),
         store_identity: readiness.storeIdentity,
-        diagnostics: { page_scan: pageScan, chart_reads: chartReads },
+        diagnostics: {
+          page_scan: pageScan,
+          chart_reads: chartReads,
+          ...(collectionInterrupted ? { collection_interrupted: true } : {}),
+        },
       },
     };
   }
@@ -1797,6 +1856,9 @@
     const priorCandidates = new Map((message.priorCandidates || [])
       .filter((candidate) => candidate?.platform_product_id)
       .map((candidate) => [String(candidate.platform_product_id), candidate]));
+    const acceptedCandidates = [];
+    const candidateProgressRejections = [];
+    let scanInterrupted = false;
     for (const [index, product] of candidates.entries()) {
       if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证", diagnostics };
       product.orders_rank = index + 1;
@@ -1817,13 +1879,15 @@
         product.history_read_diagnostic = { ...prior.history_read_diagnostic, resumed: true };
         product.store_identity = pageStoreIdentity;
         diagnostics.chart_reads.push(product.history_read_diagnostic);
+        acceptedCandidates.push(product);
         continue;
       }
       let history;
       let retryPasses = 0;
       let readError = null;
+      let timedOut = false;
       try {
-        ({ history, retryPasses } = await collectStoreProductHistoryWithRetry(
+        ({ history, retryPasses, timedOut } = await collectStoreProductHistoryWithRetry(
           product, message.targetDate, index === 0 ? 6000 : 800,
         ));
       } catch (error) {
@@ -1838,6 +1902,7 @@
         point_count: history.points?.length || 0,
         missing_dates: history.missing_dates || expectedDailyDates(message.targetDate),
         retry_passes: retryPasses,
+        ...(timedOut ? { timed_out: true, timeout_ms: history.timeout_ms } : {}),
         ...(readError ? { error: readError } : {}),
       };
       diagnostics.chart_reads.push(chartRead);
@@ -1852,20 +1917,43 @@
       product.history_missing_dates = history.missing_dates || product.history_expected_dates;
       product.store_identity = pageStoreIdentity;
       product.history_read_diagnostic = chartRead;
-      await options.on_candidate_collected?.(product);
+      try {
+        await options.on_candidate_collected?.(product);
+        acceptedCandidates.push(product);
+      } catch (error) {
+        if (error?.code !== "CANDIDATE_HISTORY_INVALID") throw error;
+        candidateProgressRejections.push({
+          product_id: product.platform_product_id,
+          orders_rank: product.orders_rank,
+          reason: "history_checkpoint_invalid",
+          failed_checks: Array.isArray(error.failed_checks) ? error.failed_checks : [],
+        });
+      }
+      if (timedOut) {
+        scanInterrupted = true;
+        break;
+      }
     }
+    const scanComplete = !scanInterrupted && acceptedCandidates.length > 0;
     return {
       state: "ready",
       page_result: {
         platform_store_id: expectedStoreId,
         url: currentUrl.href,
         store_identity: identity.store_identity,
-        candidates,
+        candidates: acceptedCandidates,
         pagination_known: pageScan.pagination_known,
         has_next_page: pageScan.has_next_page,
         next_page_url: pageScan.next_page_url,
-        scan_complete: true,
-        diagnostics,
+        scan_complete: scanComplete,
+        diagnostics: {
+          ...diagnostics,
+          ...(candidateProgressRejections.length
+            ? { candidate_progress_rejections: candidateProgressRejections } : {}),
+          ...(scanInterrupted
+            ? { outcome: "chart_read_timeout", collection_interrupted: true }
+            : !scanComplete ? { outcome: "all_candidate_history_checkpoints_rejected" } : {}),
+        },
       },
     };
   }
@@ -1893,12 +1981,13 @@
     const candidates = latest.products;
     if (!candidates.length) return { state: "failed", message: "当前店铺页未读取到公开商品链接" };
     const skipProductIds = new Set((options.skip_product_ids || []).map(String));
+    let collectionInterrupted = false;
 
     for (const [index, product] of candidates.entries()) {
       if (isChallengePage()) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
       product.orders_rank = index + 1;
       if (skipProductIds.has(product.platform_product_id)) continue;
-      const { history } = await collectStoreProductHistoryWithRetry(
+      const { history, timedOut } = await collectStoreProductHistoryWithRetry(
         product, targetDate, index === 0 ? 6000 : 800,
       );
       if (history.challenge) return { state: "challenge", message: "AliExpress 要求人工完成验证" };
@@ -1910,6 +1999,19 @@
       product.history_daily_capture_complete = Boolean(history.daily_capture_complete);
       product.history_expected_dates = history.expected_dates || expectedDailyDates(targetDate);
       product.history_missing_dates = history.missing_dates || product.history_expected_dates;
+      if (timedOut) {
+        product.history_read_diagnostic = {
+          product_id: product.platform_product_id,
+          outcome: "unavailable",
+          source: history.source,
+          point_count: 0,
+          missing_dates: product.history_missing_dates,
+          timed_out: true,
+          timeout_ms: history.timeout_ms,
+        };
+        collectionInterrupted = true;
+        break;
+      }
     }
     const pagination = storePaginationStatus(storeId);
     return {
@@ -1921,6 +2023,7 @@
         pagination_known: pagination.known,
         has_next_page: pagination.has_next_page,
         next_page_url: pagination.next_page_url,
+          scan_complete: !collectionInterrupted,
         raw_data: {
           extractor_version: `extension-store-selection-${PAGE_COLLECTOR_VERSION}`,
           history_provider: "IXSPY_VISIBLE_UI",
@@ -1930,6 +2033,7 @@
           visible_link_count: latest.products.length,
           pagination_known: pagination.known,
           next_page_detected: pagination.has_next_page,
+            ...(collectionInterrupted ? { collection_interrupted: true } : {}),
         },
       },
     };

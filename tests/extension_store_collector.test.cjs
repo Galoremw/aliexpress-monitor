@@ -7,7 +7,7 @@ const test = require("node:test");
 const targetDate = "2026-09-29";
 const productId = "1005001234567890";
 
-function loadStoreCollector({ panelProductId = productId, productTitle = "IXSPY Store Product", dailyValues = [5, 0, -1, 2, 7, 1, 3], staleDailyValues = null, staleHoverSamples = 0, extraProductIds = [], lazyExtraProductIds = [], multiProductCharts = false, moreActionDelayByProductId = {}, moreOutsideMiniChart = false, moreOutsideAncestors = false, moreInsideShadow = false, exactMoreMarkup = false, moreActionDelayMs = 0, chartInjectionDelayMs = 0, trendButtonDelayMs = 0, extraTrendInCard = false, missingMoreAction = false, throwOnMoreClick = false, misalignedChart = false, narrowTooltipTargets = false, firstChartPartial = false, ordersSorted = true, challengePage = false, storeReadinessDelayMs = 0, hasNextPage = false, paginationKnown = true, nextPageUrl = null, paginationEntries = null, pageNumber = 1, unrelatedNextControl = false, visibleStoreId = "123456", routeStoreId = "123456", storeInfoId, storeInfoLate = false, storeInfoOnHover = false, storeInfoHidden = false, storeInfoDelayMs = 0, ixspyStoreName = null, documentTitle = "IXSPY Store - AliExpress", fastClockStepMs = 0, productCardsReadyAfterScans = 0 } = {}) {
+function loadStoreCollector({ panelProductId = productId, productTitle = "IXSPY Store Product", dailyValues = [5, 0, -1, 2, 7, 1, 3], staleDailyValues = null, staleHoverSamples = 0, extraProductIds = [], lazyExtraProductIds = [], multiProductCharts = false, moreActionDelayByProductId = {}, moreOutsideMiniChart = false, moreOutsideAncestors = false, moreInsideShadow = false, exactMoreMarkup = false, moreActionDelayMs = 0, chartInjectionDelayMs = 0, trendButtonDelayMs = 0, extraTrendInCard = false, missingMoreAction = false, throwOnMoreClick = false, misalignedChart = false, narrowTooltipTargets = false, firstChartPartial = false, ordersSorted = true, challengePage = false, storeReadinessDelayMs = 0, hasNextPage = false, paginationKnown = true, nextPageUrl = null, paginationEntries = null, pageNumber = 1, unrelatedNextControl = false, visibleStoreId = "123456", routeStoreId = "123456", storeInfoId, storeInfoLate = false, storeInfoOnHover = false, storeInfoHidden = false, storeInfoDelayMs = 0, ixspyStoreName = null, documentTitle = "IXSPY Store - AliExpress", fastClockStepMs = 0, productCardsReadyAfterScans = 0, forceStoreHistoryTimeout = false } = {}) {
   const identityCardStoreId = storeInfoId === undefined ? routeStoreId : storeInfoId;
   let identityPanelVisibleAt = Infinity;
   let miniVisible = false;
@@ -353,7 +353,8 @@ function loadStoreCollector({ panelProductId = productId, productTitle = "IXSPY 
       visibility: "visible",
       opacity: "1",
     }),
-    setTimeout: (callback) => setTimeout(callback, 1),
+    setTimeout: (callback, delay = 0) => setTimeout(callback,
+      delay >= 60_000 ? (forceStoreHistoryTimeout ? 0 : delay) : 1),
     clearTimeout,
     globalThis: null,
   };
@@ -408,6 +409,25 @@ test("monitored store waits for product cards and reports page matching and char
   assert.equal(result.page_result.diagnostics.chart_reads[0].product_id, productId);
   assert.equal(result.page_result.diagnostics.chart_reads[0].outcome, "complete");
   assert.equal(result.page_result.diagnostics.chart_reads[0].point_count, 7);
+});
+
+test("a timed-out monitored chart stops the page and reports an unavailable chart", async () => {
+  const laterProductId = "1005001234567891";
+  const collector = loadStoreCollector({
+    extraProductIds: [laterProductId],
+    multiProductCharts: true,
+    forceStoreHistoryTimeout: true,
+  });
+  const result = await collector.collect("STORE", targetDate, {
+    monitored_product_ids: [productId, laterProductId],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.diagnostics.collection_interrupted, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.page_result.diagnostics.chart_reads.map((read) => read.product_id))), [productId]);
+  assert.equal(result.page_result.diagnostics.chart_reads[0].outcome, "unavailable");
+  assert.equal(result.page_result.diagnostics.chart_reads[0].timed_out, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.page_result.products.map((entry) => entry.platform_product_id))), [productId]);
 });
 
 test("maps a unique exact-title product ID change back to its monitored record", async () => {
@@ -660,7 +680,7 @@ test("store-page diagnostic reads one card without creating a submission payload
   const result = await collector.collect("STORE_TEST", targetDate);
 
   assert.equal(result.state, "ready");
-  assert.equal(result.test_result.collector_version, "0.6.103");
+  assert.equal(result.test_result.collector_version, "0.6.105");
   assert.equal(result.test_result.platform_product_id, productId);
   assert.equal(result.test_result.complete, true);
   assert.equal(result.test_result.points.length, 7);
@@ -806,6 +826,105 @@ test("scheduled candidate scan reads the current Orders page and diagnoses missi
   assert.deepEqual(JSON.parse(JSON.stringify(result.page_result.diagnostics.chart_reads.map((read) => read.product_id))),
     [productId, "1005009999999999"]);
   assert.equal(result.page_result.diagnostics.chart_reads[1].outcome, "unavailable");
+});
+
+test("candidate scan keeps going after one product chart cannot be read", async () => {
+  const secondProductId = "1005009999999999";
+  const collector = loadStoreCollector({
+    extraProductIds: [secondProductId],
+    multiProductCharts: true,
+    throwOnMoreClick: true,
+  });
+  const checkpoints = [];
+  const result = await collector.collectStoreCandidatePage({
+    targetDate,
+    expectedStoreId: "123456",
+    expectedPageUrl: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+  }, {
+    on_candidate_collected: async (candidate) => checkpoints.push(candidate.platform_product_id),
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.scan_complete, true);
+  assert.deepEqual(checkpoints, [productId, secondProductId]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result.page_result.diagnostics.chart_reads.map((read) => read.outcome))),
+    ["unavailable", "unavailable"],
+  );
+  assert.ok(result.page_result.diagnostics.chart_reads.every((read) => read.error));
+});
+
+test("candidate scan skips a rejected history checkpoint without losing Orders rank", async () => {
+  const secondProductId = "1005009999999999";
+  const collector = loadStoreCollector({
+    extraProductIds: [secondProductId],
+    multiProductCharts: true,
+  });
+  const checkpointed = [];
+  const result = await collector.collectStoreCandidatePage({
+    targetDate,
+    expectedStoreId: "123456",
+    expectedPageUrl: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+  }, {
+    on_candidate_collected: async (candidate) => {
+      if (candidate.platform_product_id === productId) {
+        const error = new Error("invalid history checkpoint");
+        error.code = "CANDIDATE_HISTORY_INVALID";
+        error.failed_checks = ["history_dates"];
+        throw error;
+      }
+      checkpointed.push(candidate.platform_product_id);
+    },
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.scan_complete, true);
+  assert.deepEqual(checkpointed, [secondProductId]);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result.page_result.candidates.map((candidate) => candidate.platform_product_id))),
+    [secondProductId],
+  );
+  assert.equal(result.page_result.candidates[0].orders_rank, 2);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result.page_result.diagnostics.candidate_progress_rejections)),
+    [{ product_id: productId, orders_rank: 1, reason: "history_checkpoint_invalid", failed_checks: ["history_dates"] }],
+  );
+});
+
+test("candidate scan stays incomplete when every history checkpoint is rejected", async () => {
+  const result = await loadStoreCollector().collectStoreCandidatePage({
+    targetDate,
+    expectedStoreId: "123456",
+    expectedPageUrl: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+  }, {
+    on_candidate_collected: async () => {
+      const error = new Error("invalid history checkpoint");
+      error.code = "CANDIDATE_HISTORY_INVALID";
+      error.failed_checks = ["history_dates"];
+      throw error;
+    },
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.scan_complete, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.page_result.candidates)), []);
+  assert.equal(result.page_result.diagnostics.outcome, "all_candidate_history_checkpoints_rejected");
+});
+
+test("candidate chart timeout saves its diagnosis and keeps the scan incomplete", async () => {
+  const result = await loadStoreCollector({ forceStoreHistoryTimeout: true }).collectStoreCandidatePage({
+    targetDate,
+    expectedStoreId: "123456",
+    expectedPageUrl: "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc",
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.page_result.scan_complete, false);
+  assert.equal(result.page_result.diagnostics.outcome, "chart_read_timeout");
+  assert.equal(result.page_result.diagnostics.collection_interrupted, true);
+  assert.equal(result.page_result.candidates.length, 1);
+  assert.equal(result.page_result.candidates[0].history_read_diagnostic.outcome, "unavailable");
+  assert.equal(result.page_result.candidates[0].history_read_diagnostic.timed_out, true);
 });
 
 test("candidate scan keeps pagination unknown when the page exposes no pagination controls", async () => {
@@ -993,6 +1112,21 @@ test("an unread Store ID on a redirected route is reported as unverified, not a 
   assert.match(result.message, /网址路由 ID 1105182474/);
   assert.match(result.message, /页面 Store ID 未识别，无法确认是否为同一店铺/);
   assert.doesNotMatch(result.message, /页面显示店铺 ID 未识别 不一致/);
+});
+
+test("a matching storefront heading ID verifies a redirected route when no labeled ID conflicts", async () => {
+  const expectedStoreId = "1105179516";
+  const result = await loadStoreCollector({
+    routeStoreId: "1105182474",
+    visibleStoreId: expectedStoreId,
+    storeInfoId: null,
+    documentTitle: "AliExpress Store",
+  }).collect("STORE_IDENTITY", targetDate, { expected_store_id: expectedStoreId });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.platform_store_id, expectedStoreId);
+  assert.equal(result.store_identity.heading_store_id, expectedStoreId);
+  assert.equal(result.store_identity.identity_method, "storefront_heading_id");
 });
 
 test("store collectors reject a conflicting explicit Store ID before reading product charts", async () => {

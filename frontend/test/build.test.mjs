@@ -13,3 +13,13 @@ test("static demo source includes hash routes and backend-not-configured state",
   assert.match(app, /ensure-browser/);
   assert.match(app, /#\/stores/);
 });
+
+test("selection qualification console exposes rules, seven-day evidence, and handoff state", async () => {
+  const app = await readFile(new URL("../src/app.js", import.meta.url), "utf8");
+  assert.match(app, /#\/selection/);
+  assert.match(app, /api\/selection-qualification\/rule/);
+  assert.match(app, /api\/selection-qualification\/candidates/);
+  assert.match(app, /api\/selection-qualification\/evaluate/);
+  assert.match(app, /daily_values/);
+  assert.match(app, /handoff_status/);
+});

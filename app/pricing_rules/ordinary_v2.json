@@ -1,0 +1,135 @@
+{
+  "version": "ordinary-approved-20261019-v1",
+  "source_filename": "速卖通定价表 简化版.xlsx",
+  "source_sha256": "CA39959A5849291737ECD360187284D15029650F836F5EF5B963AAD08E71A108",
+  "sheet": "全托管普货定价表",
+  "formulas": {
+    "C3": "=A3+K4+L4",
+    "E3": "=C3*D3",
+    "J4": "=E3-A3",
+    "L4": "=IF(B24>D24,B24,IF(D24>B24,D24,IF(B24=D24,B24)))",
+    "M4": "=J4-K4-L4",
+    "F10": "=INDEX(_xlfn._xlws.SORT(_xlfn._xlws.FILTER(仓库现有纸箱数据库!A:F,(仓库现有纸箱数据库!C:C>=A10+D10)*(仓库现有纸箱数据库!D:D>=B10+D10)*(仓库现有纸箱数据库!E:E>=C10+D10)),6,1),1,1)",
+    "G10": "=$E$10+VLOOKUP(F10,仓库现有纸箱数据库!A:H,8,0)",
+    "B23": "=G10",
+    "D23": "=$G$10",
+    "B24": "=IF(B23<=500,0.4,IF(B23<=1000,0.8,0.8+CEILING((B23-1000)/500,1)*0.4))",
+    "D24": "=IF(D23<=500,0.4,IF(D23<=1000,0.8,0.8+CEILING((D23-1000)/500,1)*0.4))"
+  },
+  "source_formulas": {
+    "C3": "=A3+K4+L4",
+    "E3": "=C3*D3",
+    "J4": "=E3-A3",
+    "L4": "=IF(B24>D24,B24,IF(D24>B24,D24,IF(B24=D24,B24)))",
+    "M4": "=J4-K4-L4",
+    "F10": "=INDEX(_xlfn._xlws.SORT(_xlfn._xlws.FILTER(仓库现有纸箱数据库!A:F,(仓库现有纸箱数据库!C:C>=A10+D10)*(仓库现有纸箱数据库!D:D>=B10+D10)*(仓库现有纸箱数据库!E:E>=C10+D10)),6,1),1,1)",
+    "G10": "=$E$10+VLOOKUP(F10,仓库现有纸箱数据库!A:H,8,0)",
+    "B23": "=G10",
+    "D23": "=$G$10",
+    "B24": "=IF(B23<=500,0.4,IF(B23<=1000,0.8,0.8+CEILING((B23-1000)/500,1)*0.4))",
+    "D24": "=IF(D23<=500,0.4,IF(D23<=1000,0.8,0.8+CEILING((D23-1000)/500,1)*0.4))"
+  },
+  "parameters": {
+    "D3": 2.1,
+    "K4": 1,
+    "D10": 0.2
+  },
+  "workbook_profile": {
+    "version": "ordinary-wps-formula-20261019-v1",
+    "purchase_price_cell": "A3",
+    "packaging_fee_cell": "K4",
+    "multiplier_cell": "D3",
+    "shipping_fee_formula_cell": "L4",
+    "weight_formula_cell": "D23",
+    "source_note": "WPS shipping is selected by packaged actual weight. D23 references G10 despite the dimensional-weight label next to it."
+  },
+  "cartons": [
+    {
+      "name": "10号纸箱",
+      "length_cm": 18,
+      "width_cm": 10,
+      "height_cm": 12,
+      "recommended_weight_g": 50
+    },
+    {
+      "name": "12号纸箱",
+      "length_cm": 13,
+      "width_cm": 8,
+      "height_cm": 9,
+      "recommended_weight_g": 35
+    },
+    {
+      "name": "10号半纸箱",
+      "length_cm": 18,
+      "width_cm": 10,
+      "height_cm": 6,
+      "recommended_weight_g": 40
+    },
+    {
+      "name": "12号半纸箱",
+      "length_cm": 13,
+      "width_cm": 8,
+      "height_cm": 5,
+      "recommended_weight_g": 30
+    },
+    {
+      "name": "9号纸箱",
+      "length_cm": 20,
+      "width_cm": 11,
+      "height_cm": 14,
+      "recommended_weight_g": 65
+    },
+    {
+      "name": "7号纸箱",
+      "length_cm": 23,
+      "width_cm": 13,
+      "height_cm": 16,
+      "recommended_weight_g": 95
+    },
+    {
+      "name": "T4飞机盒",
+      "length_cm": 25,
+      "width_cm": 20,
+      "height_cm": 7,
+      "recommended_weight_g": 85
+    },
+    {
+      "name": "11号纸箱",
+      "length_cm": 15,
+      "width_cm": 9,
+      "height_cm": 11,
+      "recommended_weight_g": 50
+    },
+    {
+      "name": "6号纸箱",
+      "length_cm": 26,
+      "width_cm": 15,
+      "height_cm": 18,
+      "recommended_weight_g": 85
+    },
+    {
+      "name": "气泡袋1",
+      "length_cm": 15,
+      "width_cm": 11,
+      "height_cm": 4,
+      "recommended_weight_g": 5
+    },
+    {
+      "name": "气泡袋2",
+      "length_cm": 13,
+      "width_cm": 15,
+      "height_cm": 4,
+      "recommended_weight_g": 10
+    }
+  ],
+  "sample": {
+    "A3": 6,
+    "E10": 4,
+    "F10": "12号半纸箱",
+    "G10": 34,
+    "L4": 0.4,
+    "E3": 15.54,
+    "M4": 8.14
+  },
+  "source_note": "Desktop workbook SHA-256 CA39959A5849291737ECD360187284D15029650F836F5EF5B963AAD08E71A108. WPS L4 selects the higher weight-based fee. D23 points to G10 packaged actual weight even though C23 labels volumetric weight. The separately approved business profile uses fixed CNY 0.40 freight and ignores dimensions/weight. Keep both calculations visible."
+}

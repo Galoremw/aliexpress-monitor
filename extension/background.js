@@ -10,7 +10,7 @@ const DIANXIAOMI_NOTIFICATION_ID = "aliexpress-monitor-dianxiaomi-confirmation";
 const DIANXIAOMI_URL = "https://www.dianxiaomi.com/web/productCrawl/dataAcquisition";
 const COLLECTION_RESPONSE_TIMEOUT_MS = 90 * 1000;
 const STORE_COLLECTION_RESPONSE_TIMEOUT_MS = 18 * 60 * 1000;
-const STORE_PAGE_RESPONSE_TIMEOUT_MS = 4 * 60 * 1000;
+const STORE_PAGE_RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
 const STORE_CANDIDATE_SCAN_RESPONSE_TIMEOUT_MS = 15 * 60 * 1000;
 const STORE_PAGE_NAVIGATION_TIMEOUT_MS = 90 * 1000;
 const STORE_COLLECTION_WORK_MS = 15 * 60 * 1000;
@@ -84,7 +84,7 @@ function isDianxiaomiPage(url) {
 function isLocalMonitorDashboard(url) {
   try {
     const parsed = new URL(url);
-    const isLanCollectorHost = parsed.hostname === "192.168.66.107" && parsed.port === "3000";
+    const isLanCollectorHost = parsed.hostname === "192.168.66.115" && parsed.port === "3000";
     return parsed.protocol === "http:"
       && (isLanCollectorHost
         || ["127.0.0.1", "localhost"].includes(parsed.hostname) && ["3000", "8000"].includes(parsed.port));
@@ -107,7 +107,7 @@ function isLoopbackMonitorDashboard(url) {
 function isIsolatedBrowserCollectorUrl(url) {
   try {
     const parsed = new URL(url);
-    return isLoopbackMonitorDashboard(parsed.href)
+    return isLocalMonitorDashboard(parsed.href)
       && parsed.searchParams.get("browser_collection") === "1"
       && parsed.searchParams.get("browser_collection_profile") === "isolated";
   } catch {
@@ -164,45 +164,57 @@ async function refreshApiTokenFromDashboard(baseUrl, force = false) {
     url: [
       "http://127.0.0.1:3000/*",
       "http://localhost:3000/*",
-      "http://192.168.66.107:3000/*",
+      "http://192.168.66.115:3000/*",
       "http://127.0.0.1:8000/*",
       "http://localhost:8000/*",
       "https://galoremw.github.io/*",
       "https://*.onrender.com/*",
     ],
   });
-  const dashboard = tabs.find((tab) => tab.url?.includes("dianxiaomi_worker=1")) || tabs[0];
-  if (!dashboard?.id) return false;
-  try {
-    const [injected] = await chrome.scripting.executeScript({
-      target: { tabId: dashboard.id },
-      world: "MAIN",
-      args: [baseUrl],
-      func: async (apiBase) => {
-        try {
-          const response = await fetch(`${apiBase}/api/auth/extension-token`, {
-            credentials: "include",
-          });
-          if (!response.ok) return null;
-          return await response.json();
-        } catch {
-          return null;
-        }
-      },
+  const apiHostname = new URL(baseUrl).hostname;
+  const dashboardCandidates = tabs
+    .filter((tab) => Number.isInteger(tab.id))
+    .sort((left, right) => {
+      const hostPriority = Number(new URL(right.url).hostname === apiHostname)
+        - Number(new URL(left.url).hostname === apiHostname);
+      if (hostPriority) return hostPriority;
+      const priority = (tab) => tab.url?.includes("browser_collection=1") ? 0
+        : tab.url?.includes("dianxiaomi_worker=1") ? 1 : 2;
+      return priority(left) - priority(right);
     });
-    const token = injected?.result?.access_token;
-    if (!token) return false;
-    await chrome.storage.local.set({
-      apiAccessToken: token,
-      apiAccessTokens: {
-        ...(stored.apiAccessTokens || {}),
-        [baseUrl]: token,
-      },
-    });
-    return true;
-  } catch {
-    return false;
+  for (const dashboard of dashboardCandidates) {
+    try {
+      const [injected] = await chrome.scripting.executeScript({
+        target: { tabId: dashboard.id },
+        world: "MAIN",
+        args: [baseUrl],
+        func: async (apiBase) => {
+          try {
+            const response = await fetch(`${apiBase}/api/auth/extension-token`, {
+              credentials: "include",
+            });
+            if (!response.ok) return null;
+            return await response.json();
+          } catch {
+            return null;
+          }
+        },
+      });
+      const token = injected?.result?.access_token;
+      if (!token) continue;
+      await chrome.storage.local.set({
+        apiAccessToken: token,
+        apiAccessTokens: {
+          ...(stored.apiAccessTokens || {}),
+          [baseUrl]: token,
+        },
+      });
+      return true;
+    } catch {
+      continue;
+    }
   }
+  return false;
 }
 
 async function injectCollector(tabId) {
@@ -444,7 +456,7 @@ async function syncDedicatedWorkerMode() {
     url: [
       "http://127.0.0.1:3000/*",
       "http://localhost:3000/*",
-      "http://192.168.66.107:3000/*",
+      "http://192.168.66.115:3000/*",
       "http://127.0.0.1:8000/*",
       "http://localhost:8000/*",
       "https://galoremw.github.io/*",
@@ -456,7 +468,8 @@ async function syncDedicatedWorkerMode() {
     try {
       const url = new URL(tab.url);
       return url.searchParams.get("browser_collection") === "1"
-        && !["127.0.0.1", "localhost"].includes(url.hostname);
+        && !["127.0.0.1", "localhost"].includes(url.hostname)
+        && !isIsolatedBrowserCollectorUrl(url.href);
     } catch { return false; }
   });
   const localDianxiaomiWorker = tabs.some((tab) => {
@@ -526,8 +539,9 @@ async function releaseAutomationTab(tabId) {
   const existingIdleTab = state.idleAutomationTabId && state.idleAutomationTabId !== tabId
     ? await chrome.tabs.get(state.idleAutomationTabId).catch(() => null)
     : null;
-  const existingIdleIsReusable = existingIdleTab?.windowId === state.automationWindowId
-    && existingIdleTab.id !== state.automationDashboardTabId;
+  const existingIdleIsReusable = Boolean(existingIdleTab
+    && existingIdleTab.windowId === state.automationWindowId
+    && existingIdleTab.id !== state.automationDashboardTabId);
   if (state.automationTabId === tabId) {
     if (state.prefetchedItem && state.prefetchedTabId) {
       if (existingIdleIsReusable) await chrome.tabs.remove(existingIdleTab.id).catch(() => undefined);
@@ -700,6 +714,28 @@ function storeOrdersUrlIdentity(url) {
   }
 }
 
+function storeIdentityReviewTarget(url) {
+  try {
+    const parsed = new URL(url);
+    const routeStoreId = parsed.pathname.match(/^\/store\/(\d+)(?:\/|$)/)?.[1];
+    if (parsed.protocol !== "https:"
+      || !/(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
+      || parsed.username || parsed.password || (parsed.port && parsed.port !== "443")
+      || !routeStoreId) return null;
+    const isOrdersPage = /^\/store\/\d+\/pages\/all-items\.html$/.test(parsed.pathname);
+    const pageUrl = isOrdersPage
+      ? parsed.href
+      : new URL(`/store/${routeStoreId}/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc`, parsed.origin).href;
+    return {
+      route_store_id: routeStoreId,
+      page_url: pageUrl,
+      normalized_page_identity: `${parsed.hostname.toLowerCase()}/store/${routeStoreId}/pages/all-items.html`,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function approvedStoreUrlIdentity(url, storeId, approvedIdentities = []) {
   const current = storeOrdersUrlIdentity(url);
   if (!current || !Array.isArray(approvedIdentities)) return null;
@@ -849,6 +885,83 @@ function expectedStoreCollectionDates(targetDate) {
     : [];
 }
 
+function candidateHistoryCheckpointFailures(product, expectedDates) {
+  const history = product?.historical_sales;
+  const dates = product?.history_expected_dates;
+  const missingDates = product?.history_missing_dates;
+  const diagnostic = product?.history_read_diagnostic;
+  const failures = new Set();
+  if (!Array.isArray(expectedDates) || expectedDates.length !== 7
+    || !Array.isArray(dates) || dates.length !== 7
+    || dates.some((date, index) => date !== expectedDates[index])) {
+    failures.add("expected_dates");
+  }
+  if (!Array.isArray(history)) failures.add("historical_sales");
+  if (!Array.isArray(missingDates)) failures.add("missing_dates");
+  if (diagnostic?.product_id !== String(product?.platform_product_id || "")) {
+    failures.add("diagnostic_product_id");
+  }
+  if (failures.size) return [...failures];
+
+  const observedDates = new Set();
+  for (const point of history) {
+    if (!point || point.value_type !== "daily_increment"
+      || !expectedDates.includes(point.date) || observedDates.has(point.date)
+      || typeof point.value !== "number" || !Number.isFinite(point.value)
+      || point.value < 0) {
+      failures.add("daily_increment_points");
+      continue;
+    }
+    observedDates.add(point.date);
+  }
+  const expectedMissingDates = expectedDates.filter((date) => !observedDates.has(date));
+  if (missingDates.length !== expectedMissingDates.length
+    || missingDates.some((date, index) => date !== expectedMissingDates[index])
+    || diagnostic.point_count !== history.length
+    || !Array.isArray(diagnostic.missing_dates)
+    || diagnostic.missing_dates.length !== expectedMissingDates.length
+    || diagnostic.missing_dates.some((date, index) => date !== expectedMissingDates[index])) {
+    failures.add("history_diagnostic_counts");
+  }
+
+  if (diagnostic.outcome === "complete") {
+    if (!(product.history_daily_capture_complete === true
+      && history.length === 7
+      && diagnostic.source === "ixspy_visible_daily_increment")) {
+      failures.add("complete_history");
+    }
+  }
+  else if (diagnostic.outcome === "partial") {
+    if (!(product.history_daily_capture_complete === false
+      && history.length > 0 && history.length < 7
+      && diagnostic.source === "ixspy_visible_daily_increment")) {
+      failures.add("partial_history");
+    }
+  }
+  else if (diagnostic.outcome === "unavailable") {
+    const allowedUnavailableSource = /^ixspy_store_(?:card_|product_chart_unavailable|candidate_chart_read_(?:error|timeout)|product_chart_read_timeout)/.test(diagnostic.source || "")
+      || ["ixspy_data_unavailable", "visible_ixspy_daily_increment_unavailable"].includes(diagnostic.source);
+    if (history.length !== 0 || product.history_daily_capture_complete !== false
+      || !allowedUnavailableSource
+      || (diagnostic.error && (typeof diagnostic.error !== "string" || diagnostic.error.length > 300))) {
+      failures.add("unavailable_history");
+    }
+  } else {
+    failures.add("history_outcome");
+  }
+  return [...failures];
+}
+
+function retainCompleteStoreProgress(progress, targetDate) {
+  const expectedDates = expectedStoreCollectionDates(targetDate);
+  progress.products = Object.fromEntries(
+    Object.entries(progress.products || {}).filter(([, product]) =>
+      product?.history_read_diagnostic?.outcome === "complete"
+      && candidateHistoryCheckpointFailures(product, expectedDates).length === 0),
+  );
+  return progress;
+}
+
 function mergeStoreDiagnosticRecord(records, diagnostic, key, limit) {
   if (!diagnostic || !diagnostic[key]) return Array.isArray(records) ? records : [];
   const existing = Array.isArray(records) ? records : [];
@@ -956,38 +1069,51 @@ async function saveStoreCandidateProgress(message, sender, sendResponse) {
       && routePage.page === expectedPage.page
       && routePage.page === taskPage.page
       && message.expected_page_url === pageUrl);
-    const history = product?.historical_sales;
-    const expectedDates = product?.history_expected_dates;
-    const missingDates = product?.history_missing_dates;
-    const chartRead = product?.history_read_diagnostic;
     const requiredDates = expectedStoreCollectionDates(item?.target_date);
-    const completeRead = product?.history_daily_capture_complete === true
-      && Array.isArray(expectedDates) && expectedDates.length === 7
-      && expectedDates.every((date, index) => date === requiredDates[index])
-      && Array.isArray(history) && history.length === 7
-      && expectedDates.every((date) => history.some((point) => point?.date === date));
-    const unavailableRead = chartRead?.outcome === "unavailable"
-      && typeof chartRead.source === "string"
-      && (/^ixspy_store_(?:card_|product_chart_unavailable)/.test(chartRead.source)
-        || chartRead.source === "ixspy_data_unavailable")
-      && !chartRead.error
-      && Array.isArray(expectedDates) && expectedDates.length === 7
-      && expectedDates.every((date, index) => date === requiredDates[index])
-      && Array.isArray(missingDates) && expectedDates.every((date) => missingDates.includes(date))
-      && Array.isArray(history) && history.length === 0;
-    if (!item || item.target_type !== "STORE"
-      || Number(item.id) !== Number(message.item_id)
-      || state.automationTabId !== sender?.tab?.id
-      || state.automationClaimToken !== message.claim_token
-      || message.expected_store_id !== storeId
-      || !pageMatchesTask
-      || !safeStoreOrdersUrl(pageUrl, storeId, routeAliasIsVerified ? routePage.storeId : null)
-      || !identity || identity.target_store_id !== storeId
-      || String(identity.route_store_id) !== routePage?.storeId
-      || identity.page_url !== pageUrl
-      || productIdFromUrl(product?.url) !== productId
-      || (!completeRead && !unavailableRead)) {
-      sendResponse({ ok: false });
+    const contextValid = Boolean(item && item.target_type === "STORE"
+      && Number(item.id) === Number(message.item_id)
+      && state.automationTabId === sender?.tab?.id
+      && state.automationClaimToken === message.claim_token
+      && message.expected_store_id === storeId
+      && pageMatchesTask
+      && safeStoreOrdersUrl(pageUrl, storeId, routeAliasIsVerified ? routePage.storeId : null));
+    if (!contextValid) {
+      sendResponse({
+        ok: false,
+        reason: "candidate_context_invalid",
+        message: "候选商品进度与当前店铺任务页面不匹配",
+      });
+      return;
+    }
+    const identityValid = Boolean(identity
+      && identity.target_store_id === storeId
+      && String(identity.route_store_id) === routePage?.storeId
+      && identity.page_url === pageUrl
+      && (routePage.storeId === storeId || routeAliasIsVerified));
+    if (!identityValid) {
+      sendResponse({
+        ok: false,
+        reason: "candidate_identity_invalid",
+        message: "候选商品店铺身份校验失败",
+      });
+      return;
+    }
+    if (productIdFromUrl(product?.url) !== productId) {
+      sendResponse({
+        ok: false,
+        reason: "candidate_identity_invalid",
+        message: "候选商品链接 ID 与商品 ID 不一致",
+      });
+      return;
+    }
+    const historyFailures = candidateHistoryCheckpointFailures(product, requiredDates);
+    if (historyFailures.length) {
+      sendResponse({
+        ok: false,
+        reason: "candidate_history_invalid",
+        failed_checks: historyFailures,
+        message: `候选商品七日日增量检查点无效：${historyFailures.join(", ")}`,
+      });
       return;
     }
 
@@ -1310,6 +1436,10 @@ async function collectStorePages(tabId, item) {
     progress.products = Object.fromEntries(products);
     progress.visited_page_urls = [...visited];
     await chrome.storage.local.set({ [progressKey]: progress });
+    if (result.diagnostics?.collection_interrupted === true) {
+      collectionInterrupted = true;
+      break;
+    }
     if (products.size === targets.length || !result.has_next_page) break;
     if (!nextUrl || !storeOrdersUrlAllowedForTask(
       nextUrl, storeId, approvedStoreUrlIdentities, storeIdentity,
@@ -1472,7 +1602,8 @@ async function collectStorePages(tabId, item) {
                   has_next_page: Boolean(pageResult.has_next_page),
                   next_page_url: nextPageUrl,
                   scan_complete: scanComplete,
-                  candidates: scanComplete && Array.isArray(pageResult.candidates)
+                  candidates: (scanComplete || pageResult.diagnostics?.outcome === "chart_read_timeout")
+                    && Array.isArray(pageResult.candidates)
                     ? pageResult.candidates.slice(0, 50)
                     : [],
                   diagnostics: pageResult.diagnostics || {},
@@ -1487,10 +1618,47 @@ async function collectStorePages(tabId, item) {
                 }
               }
             } catch (error) {
+              const latest = await loadStoreProgress(item, storeId, targets);
+              const saved = latest.progress.candidate_page_progress;
+              const savedPage = storeOrdersPageIdentity(saved?.page_url);
+              const currentPage = storeOrdersPageIdentity(candidatePageUrl);
+              const samePageCheckpoint = saved
+                && String(saved.run_id) === String(item.run_id)
+                && String(saved.item_id) === String(item.id)
+                && saved.target_date === item.target_date
+                && String(saved.store_id) === storeId
+                && saved.page_url === candidatePageUrl
+                && savedPage?.page === currentPage?.page
+                && String(savedPage?.storeId) === String(currentPage?.storeId);
+              const expectedDates = expectedStoreCollectionDates(item.target_date);
+              const checkpointCandidates = samePageCheckpoint
+                ? Object.values(saved.products || {}).filter((candidate) => {
+                  const productId = String(candidate?.platform_product_id || "");
+                  const identity = candidate?.store_identity;
+                  const routeAliasVerified = currentPage?.storeId !== storeId
+                    && storeRouteAliasIsVerified(
+                      candidatePageUrl, storeId, approvedStoreUrlIdentities, identity,
+                    );
+                  return productId
+                    && productIdFromUrl(candidate?.url) === productId
+                    && identity?.target_store_id === storeId
+                    && String(identity.route_store_id) === String(currentPage?.storeId)
+                    && identity.page_url === candidatePageUrl
+                    && (currentPage?.storeId === storeId || routeAliasVerified)
+                    && candidateHistoryCheckpointFailures(candidate, expectedDates).length === 0;
+                }).slice(0, 50)
+                : [];
               candidatePage = incompleteCandidatePage(
                 error?.code === "COLLECTION_TIMEOUT" ? "page_response_timeout" : "page_scan_error",
                 error?.message,
+                {
+                  checkpoint_candidate_count: checkpointCandidates.length,
+                  checkpoint_candidate_ids: checkpointCandidates.map((candidate) =>
+                    String(candidate.platform_product_id)),
+                },
               );
+              candidatePage.page_url = candidatePageUrl;
+              candidatePage.candidates = checkpointCandidates;
             }
           }
         }
@@ -1771,31 +1939,49 @@ async function pauseForAliExpressChallenge(tabId, message = "AliExpress 要求�
   await presentChallengeTab(tabId);
 }
 
-async function pauseForStoreIdentityReview(tabId, message) {
+async function deferStoreIdentityReview(tabId, message) {
   const state = await automationState();
   if (!state.automationItem || state.automationTaskKind === "REVIEW"
     || state.automationTaskKind === "POOL_RESET"
     || state.automationTabId !== tabId || state.identityReviewPaused) return;
   const item = state.automationItem;
   const tab = await chrome.tabs.get(tabId).catch(() => null);
-  const pageUrl = message?.page_url || tab?.url || "";
-  const routeIdentity = storeOrdersUrlIdentity(pageUrl);
-  const evidence = message?.evidence && typeof message.evidence === "object"
+  const observedPageUrl = message?.observed_page_url || message?.page_url || tab?.url || "";
+  const reviewTarget = storeIdentityReviewTarget(observedPageUrl)
+    || storeIdentityReviewTarget(item.target_url);
+  const pageUrl = reviewTarget?.page_url || "";
+  const evidenceInput = message?.evidence && typeof message.evidence === "object"
     ? message.evidence
     : {
-      route_store_id: routeIdentity?.route_store_id || "",
+      route_store_id: reviewTarget?.route_store_id || "",
       heading_store_id: null,
       labeled_store_ids: [],
       page_title: null,
       ixspy_store_name: null,
       identity_method: "unverified",
     };
+  const reportedRouteStoreId = String(evidenceInput.route_store_id || "");
+  const evidence = {
+    ...evidenceInput,
+    route_store_id: reviewTarget?.route_store_id || reportedRouteStoreId,
+  };
   const identityErrorType = ["store_identity_mismatch", "store_identity_unverified"]
     .includes(message?.error_type) ? message.error_type : "store_identity_unverified";
-  if (!routeIdentity || evidence.route_store_id !== routeIdentity.route_store_id) {
-    await finishAutomationFailure(state, "store_identity_evidence_invalid", "店铺身份证据与当前页面地址不一致");
+  if (!reviewTarget || !evidence.route_store_id) {
+    await finishAutomationFailure(
+      state,
+      "store_identity_evidence_invalid",
+      `无法安全记录店铺身份待核验；当前页面：${String(observedPageUrl || "未识别").slice(0, 240)}`,
+    );
     return;
   }
+  const reviewMessage = [
+    String(message?.message || "店铺页面身份需要人工核实").slice(0, 1500),
+    observedPageUrl && observedPageUrl !== pageUrl
+      ? `实际读取 URL：${String(observedPageUrl).slice(0, 400)}` : "",
+    reportedRouteStoreId && reportedRouteStoreId !== reviewTarget.route_store_id
+      ? `采集器报告路由 ID：${reportedRouteStoreId}；页面 URL 路由 ID：${reviewTarget.route_store_id}` : "",
+  ].filter(Boolean).join("；").slice(0, 2000);
   await api(`/api/browser-collection/items/${item.id}/identity-review`, {
     method: "POST",
     body: JSON.stringify({
@@ -1803,14 +1989,14 @@ async function pauseForStoreIdentityReview(tabId, message) {
       claim_token: state.automationClaimToken,
       page_url: pageUrl,
       identity_error_type: identityErrorType,
-      error_message: String(message?.message || "店铺页面身份需要人工核实").slice(0, 2000),
+      error_message: reviewMessage,
       evidence,
     }),
   });
-  await chrome.storage.local.set({ identityReviewPaused: true, challengePaused: false });
-  await holdPrefetchedItem("店铺身份待人工审核，已退回预加载项");
-  await notifyChallenge(item, { provider: "STORE_IDENTITY", message: message?.message });
-  await presentChallengeTab(tabId);
+  await chrome.storage.local.set({ identityReviewPaused: false, challengePaused: false });
+  await chrome.storage.local.remove("challengeProvider");
+  await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
+  await closeItemTab(tabId);
 }
 
 async function notifyFirstProduct(item) {
@@ -1932,13 +2118,25 @@ async function processAutomationTabInternal(tabId, generation = null) {
   );
   if (generation !== null && generation !== automationGeneration) return;
 
-  if (result?.state === "challenge") {
-    await pauseForAliExpressChallenge(tabId, result.message || "AliExpress 要求人工完成验证");
-    return;
+  const identityError = ["store_identity_mismatch", "store_identity_unverified"]
+    .includes(result?.error_type);
+  const identityReviewState = ["identity_review", "store_identity_unverified"]
+    .includes(result?.state);
+  if (identityReviewState || identityError) {
+    const currentTab = await chrome.tabs.get(tabId).catch(() => null);
+    const identityPageUrl = result?.page_url || currentTab?.url;
+    if (storeIdentityReviewTarget(identityPageUrl) || storeIdentityReviewTarget(item.target_url)) {
+      await deferStoreIdentityReview(tabId, {
+        ...result,
+        page_url: identityPageUrl || item.target_url,
+        observed_page_url: identityPageUrl || currentTab?.url || "",
+      });
+      return;
+    }
   }
 
-  if (result?.state === "identity_review" || result?.state === "store_identity_unverified") {
-    await pauseForStoreIdentityReview(tabId, result);
+  if (result?.state === "challenge") {
+    await pauseForAliExpressChallenge(tabId, result.message || "AliExpress 要求人工完成验证");
     return;
   }
 
@@ -1968,7 +2166,7 @@ async function processAutomationTabInternal(tabId, generation = null) {
     ? `/api/browser-collection/items/${item.id}/store-discovery`
     : `/api/browser-collection/items/${item.id}/snapshot`;
   const identity = await browserCollectionWorkerIdentity();
-  await api(endpoint, {
+  const submittedRun = await api(endpoint, {
     method: "POST",
     body: JSON.stringify({
       ...result.payload,
@@ -1977,7 +2175,18 @@ async function processAutomationTabInternal(tabId, generation = null) {
     }),
   });
   if (item.target_type === "STORE") {
-    await chrome.storage.local.remove(storeProgressKey(item.id));
+    const submittedItem = submittedRun?.items?.find((entry) => Number(entry.id) === Number(item.id));
+    if (submittedItem?.status === "PARTIAL") {
+      const progressKey = storeProgressKey(item.id);
+      const stored = await chrome.storage.local.get(progressKey);
+      if (stored[progressKey]) {
+        await chrome.storage.local.set({
+          [progressKey]: retainCompleteStoreProgress(stored[progressKey], item.target_date),
+        });
+      }
+    } else if (submittedItem?.status === "SUCCEEDED") {
+      await chrome.storage.local.remove(storeProgressKey(item.id));
+    }
   }
   await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
   await chrome.notifications.clear(FIRST_PRODUCT_NOTIFICATION_ID).catch(() => undefined);
@@ -2012,7 +2221,7 @@ async function processAutomationTab(tabId) {
       return;
     }
     if (error?.code === "STORE_IDENTITY_REVIEW") {
-      await pauseForStoreIdentityReview(tabId, {
+      await deferStoreIdentityReview(tabId, {
         error_type: error.error_type,
         message: error.message,
         page_url: error.page_url,
@@ -2858,7 +3067,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const loopbackDashboard = isLoopbackMonitorDashboard(dashboardUrl.href);
         const isolatedLocalEnabled = message.browser_collection_mode === true
           && isIsolatedBrowserCollectorUrl(dashboardUrl.href);
-        const remoteWorkerEnabled = message.browser_collection_mode === true && !loopbackDashboard;
+        const remoteWorkerEnabled = message.browser_collection_mode === true
+          && !loopbackDashboard && !isolatedLocalEnabled;
         const workerEnabled = isolatedLocalEnabled || remoteWorkerEnabled;
         await chrome.storage.local.set({
           browserCollectionWorkerMode: workerEnabled,

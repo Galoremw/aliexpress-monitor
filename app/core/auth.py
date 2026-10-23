@@ -92,6 +92,18 @@ def current_user(request: Request, db: Session) -> User | None:
 def require_authenticated(request: Request, db: Session = Depends(get_db)) -> User | None:
     if not get_settings().auth_required:
         return None
+    settings = get_settings()
+    path = request.url.path
+    authorization = request.headers.get("Authorization", "")
+    scheme, separator, supplied = authorization.partition(" ")
+    if separator and scheme.lower() == "bearer" and supplied.strip():
+        expected = None
+        if path == "/api/integrations/selection/candidates":
+            expected = settings.selection_service_token
+        elif path.startswith("/api/integrations/dianxiaomi/worker/"):
+            expected = settings.dianxiaomi_service_token
+        if expected and hmac.compare_digest(supplied.strip(), expected):
+            return None
     user = current_user(request, db)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录监控台")

@@ -39,6 +39,51 @@ def _diagnostic_records(raw: dict, key: str, limit: int) -> list[dict]:
     return [record for record in records[:limit] if isinstance(record, dict)]
 
 
+class StoreIdentityValidationError(ValueError):
+    def __init__(
+        self,
+        page_url: str,
+        identity_error_type: str,
+        evidence: dict,
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.page_url = page_url
+        self.identity_error_type = identity_error_type
+        self.evidence = evidence
+        self.message = message
+
+
+def _store_identity_evidence(raw: dict, page_url: str) -> dict:
+    route_store_id = extract_store_id(page_url)
+    identities: list[dict] = []
+    identity = raw.get("store_identity")
+    if isinstance(identity, dict):
+        identities.append(identity)
+    for scan in _diagnostic_records(raw, "page_scans", 10):
+        scan_url = scan.get("url")
+        scan_identity = scan.get("store_identity")
+        if (
+            isinstance(scan_identity, dict)
+            and (not scan_url or scan_url == page_url)
+        ):
+            identities.append(scan_identity)
+    observed = next(
+        (
+            identity
+            for identity in identities
+            if identity.get("route_store_id") == route_store_id
+        ),
+        identities[0] if identities else {},
+    )
+    evidence = dict(observed)
+    evidence["route_store_id"] = route_store_id
+    evidence.setdefault("heading_store_id", None)
+    evidence.setdefault("labeled_store_ids", [])
+    evidence.setdefault("identity_method", "orders_page_url")
+    return evidence
+
+
 def _identity_title_key(value: str | None) -> str | None:
     if not value:
         return None
@@ -75,7 +120,12 @@ def _validate_observed_product_identity(
     try:
         observed_url = normalize_aliexpress_url(candidate.observed_url or "", "product")
         observed_page_url = _validated_orders_url(
-            store, candidate.observed_page_url or "", route_alias_ids=route_alias_ids
+            store,
+            candidate.observed_page_url or "",
+            route_alias_ids=route_alias_ids,
+            identity_evidence=_store_identity_evidence(
+                raw, candidate.observed_page_url or ""
+            ),
         )
     except HTTPException as exc:
         raise ValueError("监控商品 ID 不一致，页面商品地址无效") from exc
@@ -110,7 +160,11 @@ def _validate_observed_product_identity(
 
 
 def _validated_orders_url(
-    store: Store, value: str, *, route_alias_ids: set[str] | None = None
+    store: Store,
+    value: str,
+    *,
+    route_alias_ids: set[str] | None = None,
+    identity_evidence: dict | None = None,
 ) -> str:
     try:
         normalized = normalize_aliexpress_url(value, "store")
@@ -120,8 +174,16 @@ def _validated_orders_url(
     route_store_id = extract_store_id(normalized)
     allowed_ids = {store.aliexpress_store_id, *(route_alias_ids or set())}
     if route_store_id not in allowed_ids:
-        raise ValueError(
-            f"店铺 Orders 路由 ID {route_store_id or '未识别'} 未通过本次页面身份核验"
+        evidence = dict(identity_evidence or {})
+        evidence["route_store_id"] = route_store_id or ""
+        evidence.setdefault("heading_store_id", None)
+        evidence.setdefault("labeled_store_ids", [])
+        evidence.setdefault("identity_method", "orders_page_url")
+        raise StoreIdentityValidationError(
+            value,
+            "store_identity_mismatch" if route_store_id else "store_identity_unverified",
+            evidence,
+            f"店铺 Orders 路由 ID {route_store_id or '未识别'} 未通过本次页面身份核验",
         )
     if parsed.path != f"/store/{route_store_id}/pages/all-items.html":
         raise ValueError("访问页面不是店铺 all-items 商品列表页")
@@ -242,6 +304,31 @@ def _verified_route_alias_ids(
             continue
         if route_store_id != expected_store_id:
             aliases.add(route_store_id)
+
+    has_displayed_id_conflict = any(
+        page_identity.get("heading_store_id") not in (None, expected_store_id)
+        or not isinstance(page_identity.get("labeled_store_ids", []), list)
+        or any(
+            str(value) != expected_store_id
+            for value in page_identity.get("labeled_store_ids", [])
+        )
+        for page_identity, _ in evidence
+    )
+    if not has_displayed_id_conflict:
+        visited_urls = raw.get("visited_page_urls")
+        if isinstance(visited_urls, list):
+            for page_url in visited_urls[:11]:
+                try:
+                    route_store_id, page_identity = normalize_store_orders_identity(page_url)
+                except (TypeError, ValueError):
+                    continue
+                approved_alias = approved_aliases.get(route_store_id)
+                if (
+                    route_store_id != expected_store_id
+                    and approved_alias is not None
+                    and approved_alias.normalized_page_identity == page_identity
+                ):
+                    aliases.add(route_store_id)
     return aliases - conflicting_aliases
 
 
@@ -261,7 +348,11 @@ def _process_candidate_page(
     active_products = list(
         db.scalars(
             select(Product)
-            .where(Product.store_id == store.id, Product.status == "active")
+            .where(
+                Product.store_id == store.id,
+                Product.status == "active",
+                Product.monitor_scope == "competitor",
+            )
             .order_by(Product.id)
         )
     )
@@ -307,13 +398,44 @@ def _process_candidate_page(
         product.aliexpress_product_id: product
         for product in db.scalars(
             select(Product).where(
-                Product.store_id == store.id, Product.status == "inactive"
+                Product.store_id == store.id,
+                Product.status == "inactive",
+                Product.monitor_scope == "competitor",
             )
         )
     }
     eligible: list[tuple[BrowserStoreProduct, str, dict, int, int]] = []
     seen_ids: set[str] = set()
-    for orders_rank, candidate in enumerate(page.candidates, start=1):
+    progress_rejections = page.diagnostics.get("candidate_progress_rejections", [])
+    if isinstance(progress_rejections, list):
+        for rejection in progress_rejections[:50]:
+            if not isinstance(rejection, dict):
+                continue
+            product_id = rejection.get("product_id")
+            if not isinstance(product_id, str) or not product_id:
+                continue
+            skipped = {
+                "product_id": product_id[:128],
+                "reason": "history_checkpoint_invalid",
+            }
+            failed_checks = rejection.get("failed_checks")
+            if isinstance(failed_checks, list):
+                skipped["failed_checks"] = [
+                    check[:64]
+                    for check in failed_checks[:12]
+                    if isinstance(check, str)
+                ]
+            orders_rank = rejection.get("orders_rank")
+            if isinstance(orders_rank, int) and 1 <= orders_rank <= 50:
+                skipped["orders_rank"] = orders_rank
+            scan["skipped_ids"].append(product_id[:128])
+            scan["skip_reasons"].append(skipped)
+    candidate_ranks = [candidate.orders_rank for candidate in page.candidates]
+    if any(rank is not None for rank in candidate_ranks):
+        if any(rank is None for rank in candidate_ranks) or candidate_ranks != sorted(set(candidate_ranks)):
+            raise ValueError("候选商品 Orders 排名缺失、重复或顺序无效")
+    for index, candidate in enumerate(page.candidates, start=1):
+        orders_rank = candidate.orders_rank or index
         product_id = candidate.platform_product_id
         reason = None
         if product_id in seen_ids:
@@ -432,7 +554,9 @@ def save_monitored_store_observation(
     if raw.get("collection_mode") != "monitored_store_daily":
         raise ValueError("旧版店铺采集结果缺少固定监控池协议，请重载扩展")
     targets = list(db.scalars(select(Product).where(
-        Product.store_id == store.id, Product.status == "active"
+        Product.store_id == store.id,
+        Product.status == "active",
+        Product.monitor_scope == "competitor",
     ).order_by(Product.aliexpress_product_id)))
     target_ids = [product.aliexpress_product_id for product in targets]
     submitted_targets = raw.get("monitored_product_ids")
@@ -452,12 +576,23 @@ def save_monitored_store_observation(
         and identity.get("route_store_id") != store.aliexpress_store_id
         and identity.get("route_store_id") not in route_alias_ids
     ):
-        raise ValueError("店铺页面路径别名缺少匹配任务目标的页面身份依据")
+        observed_page_url = payload.url
+        raise StoreIdentityValidationError(
+            observed_page_url,
+            "store_identity_mismatch",
+            _store_identity_evidence(raw, observed_page_url),
+            "店铺页面路径别名缺少匹配任务目标的页面身份依据",
+        )
     urls = raw.get("visited_page_urls")
     if not isinstance(urls, list) or not urls:
         raise ValueError("店铺页访问记录缺失")
     normalized_visited = [
-        _validated_orders_url(store, page_url, route_alias_ids=route_alias_ids)
+        _validated_orders_url(
+            store,
+            page_url,
+            route_alias_ids=route_alias_ids,
+            identity_evidence=_store_identity_evidence(raw, page_url),
+        )
         for page_url in [payload.url, *urls]
     ]
     candidate_page_url = None
@@ -465,8 +600,15 @@ def save_monitored_store_observation(
     if candidate_page is not None:
         try:
             candidate_page_url = _validated_orders_url(
-                store, candidate_page.page_url, route_alias_ids=route_alias_ids
+                store,
+                candidate_page.page_url,
+                route_alias_ids=route_alias_ids,
+                identity_evidence=_store_identity_evidence(
+                    raw, candidate_page.page_url
+                ),
             )
+        except StoreIdentityValidationError:
+            raise
         except ValueError as exc:
             candidate_page_url_error = str(exc)
     visited_identities = {

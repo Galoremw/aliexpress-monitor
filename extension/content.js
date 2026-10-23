@@ -22,7 +22,14 @@
               else resolve(value);
             });
           });
-          if (!response?.ok) throw new Error("后台未确认候选商品采集进度");
+          if (!response?.ok) {
+            const error = new Error(response?.message || "后台未确认候选商品采集进度");
+            error.code = response?.reason === "candidate_history_invalid"
+              ? "CANDIDATE_HISTORY_INVALID" : "CANDIDATE_PROGRESS_REJECTED";
+            error.failed_checks = Array.isArray(response?.failed_checks)
+              ? response.failed_checks : [];
+            throw error;
+          }
         };
       }
       Promise.resolve()

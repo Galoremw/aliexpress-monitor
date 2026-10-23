@@ -115,6 +115,10 @@ class Product(Base):
             "business_role IN ('SELF', 'COMPETITOR', 'UNCLASSIFIED')",
             name="ck_products_business_role",
         ),
+        CheckConstraint(
+            "monitor_scope IN ('competitor', 'selection_candidate')",
+            name="ck_products_monitor_scope",
+        ),
         UniqueConstraint("store_id", "aliexpress_product_id", name="uq_product_store_external"),
         Index("ix_products_store_status", "store_id", "status"),
     )
@@ -129,6 +133,9 @@ class Product(Base):
         Boolean, default=False, server_default=text("false"), nullable=False
     )
     business_role: Mapped[str] = mapped_column(String(16), default="UNCLASSIFIED", index=True)
+    monitor_scope: Mapped[str] = mapped_column(
+        String(32), default="competitor", server_default="competitor", nullable=False, index=True
+    )
     discovery_source: Mapped[str] = mapped_column(String(32), default="manual")
     discovery_rank: Mapped[int | None] = mapped_column(Integer)
     discovered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -150,6 +157,9 @@ class Product(Base):
     )
     reviews: Mapped[list[ProductReview]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
+    )
+    selection_candidate: Mapped[SelectionCandidate | None] = relationship(
+        back_populates="product", cascade="all, delete-orphan", uselist=False
     )
     review_collection_tasks: Mapped[list[ReviewCollectionTask]] = relationship(
         back_populates="product", cascade="all, delete-orphan"
@@ -631,12 +641,76 @@ class DianxiaomiHandoff(Base):
     worker_id: Mapped[str | None] = mapped_column(String(128))
     error_type: Mapped[str | None] = mapped_column(String(128))
     error_message: Mapped[str | None] = mapped_column(Text)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    detail_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
 
     product: Mapped[Product] = relationship()
     store: Mapped[Store] = relationship()
+
+
+class SelectionQualificationRule(Base):
+    __tablename__ = "selection_qualification_rules"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_selection_qualification_rules_singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    minimum_7d_increment_total: Mapped[int | None] = mapped_column(Integer)
+    minimum_positive_days: Mapped[int | None] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False
+    )
+
+
+class SelectionCandidate(Base):
+    __tablename__ = "selection_candidates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    product_id: Mapped[int] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), unique=True, nullable=False
+    )
+    qualification_status: Mapped[str] = mapped_column(
+        String(32), default="RULE_UNCONFIGURED", server_default="RULE_UNCONFIGURED", nullable=False
+    )
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    handoff_id: Mapped[int | None] = mapped_column(
+        ForeignKey("dianxiaomi_handoffs.id", ondelete="SET NULL"), unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    product: Mapped[Product] = relationship(back_populates="selection_candidate")
+    handoff: Mapped[DianxiaomiHandoff | None] = relationship()
+    provenance: Mapped[list[SelectionCandidateImport]] = relationship(
+        back_populates="candidate", cascade="all, delete-orphan", order_by="SelectionCandidateImport.imported_at"
+    )
+
+
+class SelectionCandidateImport(Base):
+    __tablename__ = "selection_candidate_imports"
+    __table_args__ = (
+        UniqueConstraint("candidate_id", "batch_id", name="uq_selection_candidate_batch"),
+        Index("ix_selection_candidate_imports_batch", "batch_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("selection_candidates.id", ondelete="CASCADE"), nullable=False
+    )
+    batch_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    source_candidate_id: Mapped[str | None] = mapped_column(String(128))
+    submitted_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    source_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    imported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    candidate: Mapped[SelectionCandidate] = relationship(back_populates="provenance")
 
 
 class ProductDailyMetric(Base):
@@ -690,3 +764,44 @@ class StoreDailyMetric(Base):
     calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     store: Mapped[Store] = relationship(back_populates="daily_metrics")
+
+
+class PricingRuleVersion(Base):
+    __tablename__ = "pricing_rule_versions"
+
+    version: Mapped[str] = mapped_column(String(128), primary_key=True)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_sheet: Mapped[str] = mapped_column(String(255), nullable=False)
+    rule_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    records: Mapped[list[PricingRecord]] = relationship(back_populates="rule")
+
+
+class PricingRecord(Base):
+    __tablename__ = "pricing_records"
+    __table_args__ = (
+        CheckConstraint("status IN ('DRAFT', 'CONFIRMED')", name="ck_pricing_records_status"),
+        Index("ix_pricing_records_created_at", "created_at"),
+        Index("ix_pricing_records_product_id", "product_id"),
+    )
+
+    record_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    product_id: Mapped[str | None] = mapped_column(String(64))
+    product_name: Mapped[str | None] = mapped_column(String(300))
+    sku: Mapped[str | None] = mapped_column(String(120))
+    rule_version: Mapped[str] = mapped_column(
+        ForeignKey("pricing_rule_versions.version", ondelete="RESTRICT"), nullable=False
+    )
+    input_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    final_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    status: Mapped[str] = mapped_column(String(16), default="DRAFT", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    rule: Mapped[PricingRuleVersion] = relationship(back_populates="records")

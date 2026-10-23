@@ -20,7 +20,7 @@ function isLocalDashboard() {
 
 function isLocalCollectorDashboard(url) {
   const localHost = ["127.0.0.1", "localhost"].includes(url.hostname);
-  const lanHost = url.hostname === "192.168.66.107";
+  const lanHost = url.hostname === "192.168.66.115";
   return url.protocol === "http:"
     && (localHost && ["3000", "8000"].includes(url.port)
       || lanHost && url.port === "3000");
@@ -57,7 +57,7 @@ async function notifyDashboardContext() {
         && (!isLoopbackDashboard(current)
           || current.searchParams.get("browser_collection_profile") === "isolated"),
       browser_collection_local_mode: current.searchParams.get("browser_collection") === "1"
-        && isLoopbackDashboard(current)
+        && isLocalCollectorDashboard(current)
         && current.searchParams.get("browser_collection_profile") === "isolated",
       browser_collection_mode_explicit: isLoopbackDashboard(current)
         || current.searchParams.has("browser_collection"),

@@ -14,8 +14,11 @@ function makeWorkerHarness({
   dedicatedProfile = true,
   collectionResult = null,
   collectionResults = null,
+  storeDiscoveryStatus = "SUCCEEDED",
   dianxiaomiQueue = [],
   dashboardUrl = null,
+  dashboardTabs = [],
+  dashboardTokensByTabId = {},
   legacyDianxiaomiHeartbeat = false,
   expiredToken = null,
   refreshedToken = null,
@@ -55,6 +58,7 @@ function makeWorkerHarness({
     status: "complete",
     active: true,
   }]]);
+  for (const tab of dashboardTabs) tabs.set(tab.id, { status: "complete", active: false, ...tab });
   const createdTabs = [];
   const updatedTabs = [];
   const removedTabs = [];
@@ -65,6 +69,7 @@ function makeWorkerHarness({
   const collectionMessages = [];
   const candidateScanMessages = [];
   const notifications = [];
+  const scriptCalls = [];
   const pendingTimers = [];
   let nextTabId = 10;
   let nextItem = 0;
@@ -193,9 +198,13 @@ function makeWorkerHarness({
       onClicked: eventSlot(),
     },
     scripting: {
-      executeScript: async (details) => [{
-        result: details.args?.length ? (refreshedToken ? { access_token: refreshedToken } : null) : null,
-      }],
+      executeScript: async (details) => {
+        scriptCalls.push(details.target?.tabId);
+        const token = Object.hasOwn(dashboardTokensByTabId, details.target?.tabId)
+          ? dashboardTokensByTabId[details.target.tabId]
+          : refreshedToken;
+        return [{ result: details.args?.length && token ? { access_token: token } : null }];
+      },
     },
     webNavigation: { onCommitted: listeners.committed, onHistoryStateUpdated: listeners.history },
   };
@@ -223,7 +232,8 @@ function makeWorkerHarness({
       const pathname = parsedUrl.pathname;
       const token = options.headers?.Authorization?.replace(/^Bearer\s+/i, "") || null;
       requests.push({ origin: parsedUrl.origin, pathname, method: options.method || "GET", body: options.body ? JSON.parse(options.body) : null, token });
-      if (expiredToken && token !== refreshedToken) {
+      const validRefreshedTokens = new Set([refreshedToken, ...Object.values(dashboardTokensByTabId)].filter(Boolean));
+      if (expiredToken && !validRefreshedTokens.has(token)) {
         return { ok: false, status: 401, json: async () => ({ detail: "Unauthorized" }) };
       }
       let body = {};
@@ -272,10 +282,11 @@ function makeWorkerHarness({
       } else if (pathname.includes("/items/") && pathname.endsWith("/identity-review")) {
         const id = Number(pathname.match(/items\/(\d+)\/identity-review/)?.[1]);
         const item = queue.find((candidate) => candidate.id === id);
-        if (item) item.status = "NEEDS_VERIFICATION";
+        if (item) {
+          item.status = "SKIPPED";
+          item.error_type = "store_identity_deferred";
+        }
         challengePaused = false;
-        identityReviewPaused = true;
-        currentRunStatus = "NEEDS_VERIFICATION";
         body = runPayload();
       } else if (pathname.includes("/items/") && pathname.endsWith("/challenge")) {
         const id = Number(pathname.match(/items\/(\d+)\/challenge/)?.[1]);
@@ -287,6 +298,11 @@ function makeWorkerHarness({
         const id = Number(pathname.match(/items\/(\d+)\/snapshot/)?.[1]);
         const item = queue.find((candidate) => candidate.id === id);
         item.status = "SUCCEEDED";
+        body = runPayload();
+      } else if (pathname.endsWith("/store-discovery")) {
+        const id = Number(pathname.match(/items\/(\d+)\/store-discovery/)?.[1]);
+        const item = queue.find((candidate) => candidate.id === id);
+        if (item) item.status = storeDiscoveryStatus;
         body = runPayload();
       } else if (pathname.includes("/items/") && pathname.endsWith("/failure")) {
         const id = Number(pathname.match(/items\/(\d+)\/failure/)?.[1]);
@@ -305,7 +321,7 @@ function makeWorkerHarness({
   return {
     chrome, context, listeners, storage, queue, dianxiaomiQueue: dianxiaomiItems,
     createdTabs, updatedTabs, removedTabs, windowUpdates, windowCreates, windowRemoves,
-    requests, notifications, collectionMessages, candidateScanMessages, pendingTimers, flush,
+    requests, notifications, collectionMessages, candidateScanMessages, scriptCalls, pendingTimers, flush,
     get focusedWindowId() { return focusedWindowId; },
     setCollectionResult(value) { currentCollectionResult = value; },
     setHeartbeatConflict(value) { currentHeartbeatConflict = value; },
@@ -508,7 +524,7 @@ test("stale heartbeat discards local claims but keeps the task page instead of b
 });
 
 test("LAN collector dashboard remains a queue worker", async () => {
-  const dashboardUrl = "http://192.168.66.107:3000/?browser_collection=1";
+  const dashboardUrl = "http://192.168.66.115:3000/?browser_collection=1";
   const worker = makeWorkerHarness({ dashboardUrl });
   worker.listeners.message.callback({
     type: "dashboard-context",
@@ -1144,8 +1160,8 @@ test("store worker returns a partial payload when the first page exceeds its res
     monitored_product_ids: ["1005000000000001"],
   });
   await worker.flush();
-  const timeout = worker.pendingTimers.find((timer) => timer.delay === 4 * 60 * 1000);
-  assert.ok(timeout, "each page must finish within four minutes");
+  const timeout = worker.pendingTimers.find((timer) => timer.delay === 10 * 60 * 1000);
+  assert.ok(timeout, "each page must finish within ten minutes");
   timeout.callback();
   const result = await collecting;
   assert.equal(result.state, "ready");
@@ -1163,16 +1179,54 @@ test("monitored-page timeout does not start a candidate scan on the same IXSPY c
     target_date: "2026-09-29", monitored_product_ids: ["1005000000000001"],
   });
   await worker.flush();
-  worker.pendingTimers.find((timer) => timer.delay === 4 * 60 * 1000).callback();
+  worker.pendingTimers.find((timer) => timer.delay === 10 * 60 * 1000).callback();
   await worker.flush();
   const candidateScanStarted = worker.candidateScanMessages.length > 0;
   if (candidateScanStarted) {
-    worker.pendingTimers.filter((timer) => timer.delay === 4 * 60 * 1000).at(-1)?.callback();
+    worker.pendingTimers.filter((timer) => timer.delay === 10 * 60 * 1000).at(-1)?.callback();
   }
   const result = await collecting;
 
   assert.equal(candidateScanStarted, false);
   assert.equal(result.payload.raw_data.collection_interrupted, true);
+});
+
+test("a chart timeout submits completed page data without opening another page", async () => {
+  const firstUrl = "https://www.aliexpress.com/store/123456/pages/all-items.html?shop_sortType=orders_desc";
+  const secondUrl = `${firstUrl}&page=2`;
+  const worker = makeWorkerHarness({ collectionResult: {
+    state: "ready",
+    page_result: {
+      platform_store_id: "123456",
+      url: firstUrl,
+      products: [{
+        platform_product_id: "1005000000000001",
+        historical_sales: [],
+        history_read_diagnostic: {
+          product_id: "1005000000000001",
+          outcome: "unavailable",
+          source: "ixspy_store_product_chart_read_timeout",
+          timed_out: true,
+          point_count: 0,
+          missing_dates: [],
+        },
+      }],
+      has_next_page: true,
+      next_page_url: secondUrl,
+      diagnostics: { collection_interrupted: true, chart_reads: [] },
+    },
+  } });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: firstUrl, active: true });
+  const result = await worker.context.collectStorePages(tab.id, {
+    id: 413, run_id: 9, target_url: firstUrl, discovery_page_url: firstUrl,
+    target_date: "2026-09-29", monitored_product_ids: ["1005000000000001"],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.payload.raw_data.collection_interrupted, true);
+  assert.equal(worker.collectionMessages.length, 1);
+  assert.equal(worker.candidateScanMessages.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.payload.raw_data.visited_page_urls)), [firstUrl]);
 });
 
 test("candidate page response timeout is bounded by the remaining store work budget", async () => {
@@ -1190,7 +1244,7 @@ test("candidate page response timeout is bounded by the remaining store work bud
   });
   await worker.flush();
   const boundedTimeout = worker.pendingTimers.find((timer) => timer.delay === 60 * 1000);
-  const unboundedTimeout = worker.pendingTimers.find((timer) => timer.delay === 4 * 60 * 1000);
+  const unboundedTimeout = worker.pendingTimers.find((timer) => timer.delay === 10 * 60 * 1000);
   const timeout = boundedTimeout || unboundedTimeout;
   assert.ok(timeout, "candidate scan has a bounded response timeout");
   timeout.callback();
@@ -1198,6 +1252,91 @@ test("candidate page response timeout is bounded by the remaining store work bud
 
   assert.ok(boundedTimeout, "a scan starting at minute fourteen only receives the remaining one-minute budget");
   assert.equal(result.payload.candidate_page.scan_complete, false);
+});
+
+test("candidate page timeout includes only same-task saved checkpoints for diagnosis", async () => {
+  const storeId = "123456";
+  const productId = "1005000000000009";
+  const url = `https://www.aliexpress.com/store/${storeId}/pages/all-items.html?shop_sortType=orders_desc&page=2`;
+  const targetDate = "2026-09-29";
+  const expectedDates = [
+    "2026-09-22", "2026-09-23", "2026-09-24", "2026-09-25",
+    "2026-09-26", "2026-09-27", "2026-09-28",
+  ];
+  const candidate = {
+    platform_product_id: productId,
+    url: `https://www.aliexpress.com/item/${productId}.html`,
+    historical_sales: expectedDates.map((date, index) => ({
+      date, value: index + 1, value_type: "daily_increment",
+    })),
+    history_source: "ixspy_visible_daily_increment",
+    history_daily_capture_complete: true,
+    history_expected_dates: expectedDates,
+    history_missing_dates: [],
+    history_read_diagnostic: {
+      product_id: productId,
+      outcome: "complete",
+      source: "ixspy_visible_daily_increment",
+      point_count: 7,
+      missing_dates: [],
+    },
+    store_identity: {
+      target_store_id: storeId,
+      route_store_id: storeId,
+      page_url: url,
+    },
+  };
+  const worker = makeWorkerHarness({ collectionResult: new Promise(() => {}) });
+  worker.storage[`browserCollectionStoreProgress:412`] = {
+    run_id: 9,
+    item_id: 412,
+    store_id: storeId,
+    target_date: targetDate,
+    target_ids: [],
+    products: {},
+    visited_page_urls: [url],
+    page_scans: [],
+    chart_reads: [],
+    candidate_page_progress: {
+      run_id: 9,
+      item_id: 412,
+      store_id: storeId,
+      target_date: targetDate,
+      page_url: url,
+      products: {
+        [productId]: candidate,
+        "1005000000000010": {
+          ...candidate,
+          platform_product_id: "1005000000000010",
+          url: "https://www.aliexpress.com/item/1005000000000010.html",
+          history_read_diagnostic: {
+            ...candidate.history_read_diagnostic,
+            product_id: "1005000000000010",
+          },
+          store_identity: { ...candidate.store_identity, target_store_id: "999999" },
+        },
+      },
+    },
+  };
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url, active: true });
+  const collecting = worker.context.collectStorePages(tab.id, {
+    id: 412, run_id: 9,
+    target_url: `https://www.aliexpress.com/store/${storeId}/pages/all-items.html?shop_sortType=orders_desc`,
+    discovery_page_url: url, target_date: targetDate, monitored_product_ids: [],
+  });
+  await worker.flush();
+  worker.pendingTimers.find((timer) => timer.delay >= 14 * 60 * 1000).callback();
+  const result = await collecting;
+
+  assert.equal(result.payload.candidate_page.scan_complete, false);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result.payload.candidate_page.candidates.map((entry) => entry.platform_product_id))),
+    [productId],
+    JSON.stringify(result.payload.candidate_page),
+  );
+  assert.equal(result.payload.candidate_page.diagnostics.outcome, "page_response_timeout");
+  assert.equal(result.payload.candidate_page.diagnostics.checkpoint_candidate_count, 1);
+  assert.equal(result.payload.candidate_page.page_url, url);
 });
 
 test("store timeout submits saved product progress instead of restarting the whole store", async () => {
@@ -1210,6 +1349,7 @@ test("store timeout submits saved product progress instead of restarting the who
   };
   const worker = makeWorkerHarness({
     collectionResult: new Promise(() => {}),
+    storeDiscoveryStatus: "PARTIAL",
     queueItems: [{ id: 401, target_type: "STORE", target_key: "store:1", store_id: 1,
       target_url: url, target_date: "2026-10-11", monitored_product_ids: [
         "1005000000000001", "1005000000000002",
@@ -1239,7 +1379,7 @@ test("store timeout submits saved product progress instead of restarting the who
     if (!handled) resolve({ not_handled: true });
   });
   const progressAck = await progressResponse;
-  const pageTimeout = worker.pendingTimers.find((timer) => timer.delay === 4 * 60 * 1000);
+  const pageTimeout = worker.pendingTimers.find((timer) => timer.delay === 10 * 60 * 1000);
   assert.ok(pageTimeout);
   pageTimeout.callback();
   await processing;
@@ -1249,7 +1389,41 @@ test("store timeout submits saved product progress instead of restarting the who
   assert.ok(resultRequest, "the completed product must be submitted with a partial store result");
   assert.deepEqual(resultRequest.body.products.map((entry) => entry.platform_product_id), [product.platform_product_id]);
   assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/401/failure")), false);
-  assert.equal(worker.storage["browserCollectionStoreProgress:401"], undefined);
+  assert.deepEqual(Object.keys(worker.storage["browserCollectionStoreProgress:401"].products), []);
+});
+
+test("partial store retry keeps only complete seven-day product checkpoints", async () => {
+  const worker = makeWorkerHarness();
+  const dates = Array.from({ length: 7 }, (_, index) => `2026-10-${String(index + 4).padStart(2, "0")}`);
+  const completeId = "1005000000000001";
+  const unavailableId = "1005000000000002";
+  const complete = {
+    platform_product_id: completeId,
+    history_expected_dates: dates,
+    history_missing_dates: [],
+    history_daily_capture_complete: true,
+    historical_sales: dates.map((date) => ({ date, value: 1, value_type: "daily_increment" })),
+    history_read_diagnostic: {
+      product_id: completeId, outcome: "complete", source: "ixspy_visible_daily_increment",
+      point_count: 7, missing_dates: [],
+    },
+  };
+  const unavailable = {
+    platform_product_id: unavailableId,
+    history_expected_dates: dates,
+    history_missing_dates: dates,
+    history_daily_capture_complete: false,
+    historical_sales: [],
+    history_read_diagnostic: {
+      product_id: unavailableId, outcome: "unavailable", source: "ixspy_data_unavailable",
+      point_count: 0, missing_dates: dates,
+    },
+  };
+  const progress = { products: { [completeId]: complete, [unavailableId]: unavailable } };
+
+  worker.context.retainCompleteStoreProgress(progress, "2026-10-11");
+
+  assert.deepEqual(Object.keys(progress.products), [completeId]);
 });
 
 test("store worker retains completed pages when a later page stalls", async () => {
@@ -1267,7 +1441,7 @@ test("store worker retains completed pages when a later page stalls", async () =
     monitored_product_ids: ["1005000000000001", "1005000000000002"],
   });
   await worker.flush();
-  const timeouts = worker.pendingTimers.filter((timer) => timer.delay === 4 * 60 * 1000);
+  const timeouts = worker.pendingTimers.filter((timer) => timer.delay === 10 * 60 * 1000);
   assert.equal(timeouts.length, 2);
   timeouts[1].callback();
   const result = await collecting;
@@ -1342,6 +1516,30 @@ test("expired authorization asks for dashboard login when renewal is unavailable
   assert.equal(worker.requests.length, 1, "does not retry with the rejected token");
   assert.equal(worker.notifications.length, 1);
   assert.match(worker.notifications[0].message, /登录本地监控台/);
+});
+
+test("expired authorization tries a dashboard tab on the API host before an unrelated worker tab", async () => {
+  const worker = makeWorkerHarness({
+    expiredToken: "expired-token",
+    dashboardUrl: "http://127.0.0.1:3000/?dianxiaomi_worker=1",
+    dashboardTabs: [{
+      id: 2,
+      windowId: 7,
+      url: "http://192.168.66.115:3000/?browser_collection=1",
+    }],
+    dashboardTokensByTabId: { 1: null, 2: "fresh-token" },
+  });
+
+  const result = await worker.context.api(
+    "/api/browser-collection/runs/today",
+    {},
+    "http://192.168.66.115:3000",
+  );
+
+  assert.deepEqual(result, {});
+  assert.deepEqual(worker.scriptCalls, [2]);
+  assert.deepEqual(worker.requests.map((request) => request.token), ["expired-token", "fresh-token"]);
+  assert.equal(worker.storage.apiAccessTokens["http://192.168.66.115:3000"], "fresh-token");
 });
 
 test("scheduled items reuse one foreground worker tab without blanking the final page", async () => {
@@ -1619,7 +1817,13 @@ test("candidate progress accepts a page identity approved for this store", async
         "2026-10-14", "2026-10-15", "2026-10-16",
       ],
       history_missing_dates: [],
-      history_read_diagnostic: { outcome: "complete", source: "ixspy_visible_daily_increment" },
+      history_read_diagnostic: {
+        product_id: productId,
+        outcome: "complete",
+        source: "ixspy_visible_daily_increment",
+        point_count: 7,
+        missing_dates: [],
+      },
       store_identity: {
         target_store_id: storeId,
         route_store_id: routeStoreId,
@@ -1635,6 +1839,125 @@ test("candidate progress accepts a page identity approved for this store", async
 
   assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: true });
   assert.ok(worker.storage["browserCollectionStoreProgress:504"].candidate_page_progress.products[productId]);
+});
+
+test("candidate progress checkpoints a valid partial IXSPY history without stopping the scan", async () => {
+  const storeId = "990901";
+  const productId = "1005001234567891";
+  const pageUrl = `https://www.aliexpress.com/store/${storeId}/pages/all-items.html?shop_sortType=orders_desc`;
+  const expectedDates = [
+    "2026-10-10", "2026-10-11", "2026-10-12", "2026-10-13",
+    "2026-10-14", "2026-10-15", "2026-10-16",
+  ];
+  const history = expectedDates.slice(0, 6).map((date, index) => ({
+    date, value: index + 1, value_type: "daily_increment",
+  }));
+  const worker = makeWorkerHarness();
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: pageUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 505,
+      run_id: 9,
+      target_type: "STORE",
+      target_url: pageUrl,
+      discovery_page_url: pageUrl,
+      target_date: "2026-10-17",
+      monitored_product_ids: [],
+    },
+    automationTabId: tab.id,
+    automationClaimToken: "claim-505",
+  });
+  let response;
+
+  worker.listeners.message.callback({
+    type: "store-candidate-progress",
+    item_id: 505,
+    claim_token: "claim-505",
+    expected_store_id: storeId,
+    expected_page_url: pageUrl,
+    product: {
+      platform_product_id: productId,
+      url: `https://www.aliexpress.com/item/${productId}.html`,
+      historical_sales: history,
+      history_source: "ixspy_visible_daily_increment",
+      history_daily_capture_complete: false,
+      history_expected_dates: expectedDates,
+      history_missing_dates: ["2026-10-16"],
+      history_read_diagnostic: {
+        product_id: productId,
+        outcome: "partial",
+        source: "ixspy_visible_daily_increment",
+        point_count: 6,
+        missing_dates: ["2026-10-16"],
+      },
+      store_identity: {
+        target_store_id: storeId,
+        route_store_id: storeId,
+        page_url: pageUrl,
+        heading_store_id: null,
+        labeled_store_ids: [storeId],
+        identity_method: "explicit_store_id",
+      },
+    },
+  }, { tab }, (value) => { response = value; });
+  await worker.flush();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: true });
+  const checkpoint = worker.storage["browserCollectionStoreProgress:505"].candidate_page_progress;
+  assert.equal(checkpoint.products[productId].history_daily_capture_complete, false);
+  assert.deepEqual(checkpoint.products[productId].history_missing_dates, ["2026-10-16"]);
+
+  const unreadableProduct = {
+    ...checkpoint.products[productId],
+    historical_sales: [],
+    history_source: "ixspy_store_candidate_chart_read_error",
+    history_daily_capture_complete: false,
+    history_missing_dates: expectedDates,
+    history_read_diagnostic: {
+      product_id: productId,
+      outcome: "unavailable",
+      source: "ixspy_store_candidate_chart_read_error",
+      point_count: 0,
+      missing_dates: expectedDates,
+      error: "IXSPY chart timed out",
+    },
+  };
+  worker.listeners.message.callback({
+    type: "store-candidate-progress",
+    item_id: 505,
+    claim_token: "claim-505",
+    expected_store_id: storeId,
+    expected_page_url: pageUrl,
+    product: unreadableProduct,
+  }, { tab }, (value) => { response = value; });
+  await worker.flush();
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { ok: true });
+
+  const invalidPartialProduct = {
+    ...unreadableProduct,
+    historical_sales: [history[0], history[0]],
+    history_source: "ixspy_visible_daily_increment",
+    history_missing_dates: expectedDates.slice(1),
+    history_read_diagnostic: {
+      product_id: productId,
+      outcome: "partial",
+      source: "ixspy_visible_daily_increment",
+      point_count: 2,
+      missing_dates: expectedDates.slice(1),
+    },
+  };
+  worker.listeners.message.callback({
+    type: "store-candidate-progress",
+    item_id: 505,
+    claim_token: "claim-505",
+    expected_store_id: storeId,
+    expected_page_url: pageUrl,
+    product: invalidPartialProduct,
+  }, { tab }, (value) => { response = value; });
+  await worker.flush();
+  assert.equal(response.ok, false);
+  assert.equal(response.reason, "candidate_history_invalid");
+  assert.deepEqual(JSON.parse(JSON.stringify(response.failed_checks)), ["daily_increment_points"]);
 });
 
 test("candidate chart checkpoints persist under the claimed store page for retry", async () => {
@@ -1778,7 +2101,7 @@ test("waits for manual review when a route alias has no explicit Store ID eviden
   );
 });
 
-test("store identity review reports structured evidence without using the platform challenge endpoint", async () => {
+test("store identity review records evidence without pausing for a manual decision", async () => {
   const targetUrl = "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc";
   const evidence = {
     route_store_id: "1105179516",
@@ -1812,15 +2135,197 @@ test("store identity review reports structured evidence without using the platfo
 
   await worker.context.processAutomationTabInternal(tab.id);
 
-  assert.equal(worker.storage.identityReviewPaused, true);
-  assert.equal(worker.storage.challengePaused, false);
+  assert.notEqual(worker.storage.identityReviewPaused, true);
+  assert.notEqual(worker.storage.challengePaused, true);
   const reviewRequest = worker.requests.find((request) => request.pathname.endsWith("/items/817/identity-review"));
   assert.ok(reviewRequest);
   assert.equal(reviewRequest.body.page_url, targetUrl);
   assert.deepEqual(JSON.parse(JSON.stringify(reviewRequest.body.evidence)), evidence);
   assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/817/challenge")), false);
   assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/817/failure")), false);
-  assert.equal(worker.notifications.at(-1).title, "店铺身份待核验");
+  assert.equal(worker.notifications.some((notice) => notice.title === "店铺身份待核验"), false);
+  assert.equal(worker.storage.automationTabId, undefined);
+  assert.equal(worker.storage.idleAutomationTabId, tab.id);
+});
+
+test("store identity errors are routed to manual review even when the collector state is failed", async () => {
+  const targetUrl = "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc";
+  const evidence = {
+    route_store_id: "1105179516",
+    heading_store_id: null,
+    labeled_store_ids: [],
+    page_title: "AMZSTEM Pop Toys Store - AliExpress",
+    ixspy_store_name: "AMZSTEM Pop Toys Store",
+    identity_method: "unverified",
+  };
+  const worker = makeWorkerHarness({
+    collectionResult: {
+      state: "failed",
+      error_type: "store_identity_unverified",
+      message: "Store ID 未识别，需要人工核实",
+      page_url: targetUrl,
+      evidence,
+    },
+  });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: targetUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 818, run_id: 9, target_type: "STORE", target_url: targetUrl,
+      target_date: "2026-10-19", monitored_product_ids: ["1005001234567890"],
+      title: "Test store",
+    },
+    automationTabId: tab.id,
+    automationWindowId: tab.windowId,
+    automationTaskKind: "STORE",
+    automationClaimToken: "claim-818",
+    browserCollectionWorkerMode: true,
+  });
+
+  await worker.context.processAutomationTabInternal(tab.id);
+
+  assert.notEqual(worker.storage.identityReviewPaused, true);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/818/identity-review")), true);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/818/failure")), false);
+});
+
+test("unverified identity stays in manual review when AliExpress drops the Orders sort query", async () => {
+  const targetUrl = "https://www.aliexpress.com/store/1105272224/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc";
+  const observedUrl = "https://www.aliexpress.com/store/1105272224/pages/all-items.html?sortType=bestmatch_sort";
+  const evidence = {
+    route_store_id: "1105272224",
+    heading_store_id: null,
+    labeled_store_ids: [],
+    page_title: "3D_ZeapoAI 3DPrinted Store - AliExpress",
+    ixspy_store_name: null,
+    identity_method: "unverified",
+  };
+  const worker = makeWorkerHarness({
+    collectionResult: {
+      state: "failed",
+      error_type: "store_identity_unverified",
+      message: "Store ID 未识别，需要人工核实",
+      page_url: observedUrl,
+      evidence,
+    },
+  });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: observedUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 819, run_id: 9, target_type: "STORE", target_url: targetUrl,
+      target_date: "2026-10-20", monitored_product_ids: ["1005001234567890"],
+      title: "AliExpress Store 1105272224",
+    },
+    automationTabId: tab.id,
+    automationWindowId: tab.windowId,
+    automationTaskKind: "STORE",
+    automationClaimToken: "claim-819",
+    browserCollectionWorkerMode: true,
+  });
+
+  await worker.context.processAutomationTabInternal(tab.id);
+
+  assert.notEqual(worker.storage.identityReviewPaused, true);
+  const reviewRequest = worker.requests.find((request) => request.pathname.endsWith("/items/819/identity-review"));
+  assert.ok(reviewRequest);
+  assert.equal(reviewRequest.body.page_url, observedUrl);
+  assert.equal(reviewRequest.body.evidence.route_store_id, "1105272224");
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/819/failure")), false);
+});
+
+test("unverified identity stays in manual review when AliExpress rewrites the store path", async () => {
+  const targetUrl = "https://www.aliexpress.com/store/1105272224/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc";
+  const observedUrl = "https://www.aliexpress.com/store/1105272224/";
+  const evidence = {
+    route_store_id: "1105272224",
+    heading_store_id: null,
+    labeled_store_ids: [],
+    page_title: "3D_ZeapoAI 3DPrinted Store - AliExpress",
+    ixspy_store_name: null,
+    identity_method: "unverified",
+  };
+  const worker = makeWorkerHarness({
+    collectionResult: {
+      state: "identity_review",
+      error_type: "store_identity_unverified",
+      message: "店铺 Store ID 未识别，需要人工核实",
+      page_url: observedUrl,
+      evidence,
+    },
+  });
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: observedUrl, active: true });
+  Object.assign(worker.storage, {
+    automationItem: {
+      id: 820, run_id: 9, target_type: "STORE", target_url: targetUrl,
+      target_date: "2026-10-20", monitored_product_ids: ["1005001234567890"],
+      title: "AliExpress Store 1105272224",
+    },
+    automationTabId: tab.id,
+    automationWindowId: tab.windowId,
+    automationTaskKind: "STORE",
+    automationClaimToken: "claim-820",
+    browserCollectionWorkerMode: true,
+  });
+
+  await worker.context.processAutomationTabInternal(tab.id);
+
+  const reviewRequest = worker.requests.find((request) => request.pathname.endsWith("/items/820/identity-review"));
+  assert.ok(reviewRequest);
+  assert.equal(reviewRequest.body.page_url, targetUrl);
+  assert.ok(reviewRequest.body.error_message.includes(`实际读取 URL：${observedUrl}`));
+  assert.notEqual(worker.storage.identityReviewPaused, true);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/820/failure")), false);
+});
+
+test("identity_review_defers_item_releases_store_tab_and_claims_next", async () => {
+  const targetUrl = "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness({
+    dashboardUrl: "http://127.0.0.1:3000/?browser_collection=1&browser_collection_profile=isolated",
+    collectionResult: {
+      state: "identity_review",
+      error_type: "store_identity_unverified",
+      message: "店铺身份需要人工核实",
+      page_url: targetUrl,
+      evidence: {
+        route_store_id: "1105179516",
+        heading_store_id: null,
+        labeled_store_ids: [],
+        page_title: "AMZSTEM Pop Toys Store - AliExpress",
+        ixspy_store_name: "AMZSTEM Pop Toys Store",
+        identity_method: "unverified",
+      },
+    },
+    queueItems: [
+      { id: 821, target_type: "STORE", target_url: targetUrl, title: "Store A" },
+      { id: 822, target_type: "STORE", target_url: "https://www.aliexpress.com/store/1105272224/pages/all-items.html?shop_sortType=orders_desc", title: "Store B" },
+    ],
+  });
+  worker.storage.browserCollectionIsolatedProfileAuthorized = true;
+  await worker.context.syncDedicatedWorkerMode();
+  worker.queue[0].status = "RUNNING";
+  const tab = await worker.chrome.tabs.create({ windowId: 8, url: targetUrl, active: true });
+  Object.assign(worker.storage, {
+    automationWindowId: 8,
+    automationItem: { id: 821, run_id: 9, target_type: "STORE", target_url: targetUrl, title: "Store A" },
+    automationTabId: tab.id,
+    automationTaskKind: "STORE",
+    automationClaimToken: "claim-821",
+    browserCollectionWorkerMode: true,
+  });
+
+  await worker.context.processAutomationTabInternal(tab.id);
+
+  assert.equal(worker.storage.identityReviewPaused, undefined);
+  assert.notEqual(worker.storage.challengePaused, true);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/821/challenge")), false);
+  assert.equal(worker.queue[0].status, "SKIPPED");
+  assert.equal(worker.storage.automationTabId, undefined);
+  assert.equal(worker.storage.idleAutomationTabId, tab.id);
+  assert.equal(worker.notifications.some((notice) => notice.title === "店铺身份待核验"), false);
+
+  await worker.context.pollAutomation();
+
+  assert.equal(worker.queue[1].status, "RUNNING");
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/items/claim")), true);
 });
 
 test("waitForStorePage accepts an alias only when the backend approved that exact page identity", async () => {
@@ -1886,16 +2391,11 @@ test("waitForStorePage refuses an alias omitted from this store's backend identi
   );
 });
 
-test("confirmed identity refreshes the alias and resumes the same collection tab", async () => {
+test("identity review does not reopen the store when the page is manually confirmed later", async () => {
   const targetStoreId = "1105179516";
   const routeStoreId = "1105182474";
   const targetUrl = `https://www.aliexpress.com/store/${targetStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
   const aliasUrl = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?shop_sortType=orders_desc`;
-  const aliases = [{
-    route_store_id: routeStoreId,
-    normalized_page_identity: `www.aliexpress.com/store/${routeStoreId}/pages/all-items.html`,
-    evidence: { ixspy_store_name: "AMZSTEM Pop Toys Store" },
-  }];
   const worker = makeWorkerHarness({
     dashboardUrl: "http://127.0.0.1:3000/?browser_collection=1&browser_collection_profile=isolated",
     queueItems: [{
@@ -1906,41 +2406,20 @@ test("confirmed identity refreshes the alias and resumes the same collection tab
       title: "AMZSTEM Pop Toys Store",
       monitored_product_ids: ["1005001234567890"],
     }],
-    collectionResults: [
-      {
-        state: "identity_review",
-        error_type: "store_identity_unverified",
-        message: "待人工核实",
-        page_url: aliasUrl,
-        evidence: {
-          route_store_id: routeStoreId,
-          heading_store_id: null,
-          labeled_store_ids: [],
-          page_title: "AMZSTEM Pop Toys Store - AliExpress",
-          ixspy_store_name: "AMZSTEM Pop Toys Store",
-          identity_method: "unverified",
-        },
+    collectionResult: {
+      state: "identity_review",
+      error_type: "store_identity_unverified",
+      message: "待人工核实",
+      page_url: aliasUrl,
+      evidence: {
+        route_store_id: routeStoreId,
+        heading_store_id: null,
+        labeled_store_ids: [],
+        page_title: "AMZSTEM Pop Toys Store - AliExpress",
+        ixspy_store_name: "AMZSTEM Pop Toys Store",
+        identity_method: "unverified",
       },
-      {
-        state: "ready",
-        page_result: {
-          platform_store_id: targetStoreId,
-          url: aliasUrl,
-          store_identity: {
-            target_store_id: targetStoreId,
-            route_store_id: routeStoreId,
-            page_url: aliasUrl,
-            heading_store_id: null,
-            labeled_store_ids: [],
-            ixspy_store_name: "AMZSTEM Pop Toys Store",
-            identity_method: "backend_approved_url_alias",
-          },
-          products: [{ platform_product_id: "1005001234567890", historical_sales: [] }],
-          has_next_page: false,
-          next_page_url: null,
-        },
-      },
-    ],
+    },
   });
   worker.storage.browserCollectionIsolatedProfileAuthorized = true;
   await worker.context.syncDedicatedWorkerMode();
@@ -1962,20 +2441,15 @@ test("confirmed identity refreshes the alias and resumes the same collection tab
   });
 
   await worker.context.processAutomationTabInternal(tab.id);
-  assert.equal(worker.storage.identityReviewPaused, true);
-  worker.confirmIdentityReview(818, aliases);
   await worker.context.pollAutomation();
   await worker.flush();
 
-  assert.notEqual(worker.storage.identityReviewPaused, true);
-  assert.equal(worker.collectionMessages.some((message) => message.target_type === "STORE"
-    && message.approved_store_url_identities?.[0]?.route_store_id === routeStoreId), true);
-  assert.equal(worker.collectionMessages.some((message) => message.tab_id === tab.id
-    && message.target_type === "STORE"
-    && message.approved_store_url_identities?.[0]?.route_store_id === routeStoreId), true);
-  assert.equal(worker.createdTabs.filter((created) => created.url === aliasUrl).length, 1);
-  assert.equal(worker.removedTabs.includes(tab.id), false);
-  assert.ok(worker.requests.some((request) => request.pathname === "/api/browser-collection/items/818/store-discovery"));
+  assert.equal(worker.queue[0].status, "SKIPPED");
+  assert.equal(worker.storage.automationTabId, undefined);
+  assert.equal(worker.storage.idleAutomationTabId, tab.id);
+  assert.equal(worker.collectionMessages.some((message) => message.target_type === "STORE"), false);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/identity-review")), true);
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/store-discovery")), false);
 });
 
 test("store navigation waits for the pending target instead of rejecting the previously committed store", async () => {
@@ -2196,7 +2670,7 @@ test("collection heartbeat renews the active and prefetched task leases", async 
 test("worker identity is stable per extension profile and heartbeat advertises its label", async () => {
   const worker = makeWorkerHarness({
     dedicatedProfile: false,
-    dashboardUrl: "http://192.168.66.107:3000/?browser_collection=1",
+    dashboardUrl: "http://192.168.66.115:3000/?browser_collection=1",
     queueItems: [{ id: 101, target_type: "STORE", target_url: "https://www.aliexpress.com/store/1" }],
     claimsHeld: true,
   });
@@ -2443,6 +2917,33 @@ test("an in-flight task tab left in the dashboard window is migrated before coll
   assert.ok(worker.collectionMessages.length > 0, "resumes collection in the migrated page");
   finishCollection({ state: "partial", payload: {} });
   await worker.flush();
+});
+
+test("NAS LAN collector profile keeps the Galore host identity", async () => {
+  const origin = "http://192.168.66.115:3000";
+  const dashboardUrl = `${origin}/?browser_collection=1&browser_collection_profile=isolated`;
+  const worker = makeWorkerHarness({
+    dashboardUrl,
+    queueItems: [{ id: 101, target_type: "STORE", target_url: "https://www.aliexpress.com/store/1" }],
+    claimsHeld: true,
+  });
+
+  worker.listeners.message.callback({
+    type: "dashboard-context",
+    api_base_url: origin,
+    browser_collection_mode: true,
+    browser_collection_mode_explicit: true,
+    browser_collection_local_mode: true,
+  }, { tab: { id: 1, windowId: 7, url: dashboardUrl } }, () => {});
+  await worker.flush();
+  worker.listeners.message.callback({ type: "browser-collection-run-requested", api_base_url: origin }, {
+    tab: { id: 1, windowId: 7, url: dashboardUrl },
+  }, () => {});
+  await worker.flush();
+
+  const heartbeat = worker.requests.find((request) => request.pathname === "/api/browser-collection/heartbeat");
+  assert.equal(heartbeat?.origin, origin);
+  assert.equal(heartbeat?.body.worker_label, "Galore主机");
 });
 
 test("does not collect an in-flight task from the dashboard window if migration fails", async () => {
@@ -2838,7 +3339,7 @@ test("alarm wake restores persisted worker mode after the MV3 service worker res
 });
 
 test("alarm wake discovers a LAN dashboard and polls its same-origin API", async () => {
-  const origin = "http://192.168.66.107:3000";
+  const origin = "http://192.168.66.115:3000";
   const worker = makeWorkerHarness({
     dedicatedProfile: false,
     dashboardUrl: `${origin}/?browser_collection=1`,

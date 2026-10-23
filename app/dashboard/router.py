@@ -36,6 +36,11 @@ from app.services.browser_collection import (
 )
 from app.services.reviews import get_insights, serialize_task, task_query
 from app.services.product_presentation import clean_product_title, product_image_url
+from app.services.selection_qualification import (
+    get_selection_rule,
+    list_selection_candidates,
+    serialize_selection_candidate,
+)
 
 router = APIRouter(include_in_schema=False, dependencies=[Depends(require_page_auth)])
 templates = Jinja2Templates(directory="app/templates")
@@ -49,7 +54,11 @@ def _collection_status(db: Session) -> dict:
         db.scalars(
             select(Product)
             .join(Store, Store.id == Product.store_id)
-            .where(Product.status == "active", Store.status == "active")
+            .where(
+                Product.status == "active",
+                Product.monitor_scope == "competitor",
+                Store.status == "active",
+            )
         )
     )
     attempts = list(
@@ -237,7 +246,11 @@ def _product_monitor_rows(
 def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     stores = list(db.scalars(select(Store).order_by(Store.status, Store.name)))
     all_products = list(
-        db.scalars(select(Product).order_by(Product.status, Product.id.desc()))
+        db.scalars(
+            select(Product)
+            .where(Product.monitor_scope == "competitor")
+            .order_by(Product.status, Product.id.desc())
+        )
     )
     products = [
         product for product in all_products if product.status == "active"
@@ -274,6 +287,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
                 ProductDailyMetric.is_estimable.is_(True),
                 ProductDailyMetric.calculation_method == "ixspy_visible_daily_increment",
                 Product.status == "active",
+                Product.monitor_scope == "competitor",
             )
             .order_by(
                 ProductDailyMetric.metric_date.desc(),
@@ -362,7 +376,9 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
             select(func.count()).select_from(Store).where(Store.status == "active")
         ),
         "active_product_count": db.scalar(
-            select(func.count()).select_from(Product).where(Product.status == "active")
+            select(func.count())
+            .select_from(Product)
+            .where(Product.status == "active", Product.monitor_scope == "competitor")
         ),
         "failed_snapshot_count": db.scalar(
             select(func.count())
@@ -371,6 +387,42 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
         ),
     }
     return templates.TemplateResponse(request, "dashboard.html", context)
+
+
+@router.get("/selection-qualification", response_class=HTMLResponse)
+def selection_qualification_page(
+    request: Request, db: Session = Depends(get_db)
+) -> HTMLResponse:
+    rule = get_selection_rule(db)
+    candidates = [
+        serialize_selection_candidate(candidate)
+        for candidate in list_selection_candidates(db)
+    ]
+    run = get_today_run(db)
+    collection_status_by_product = {
+        item.product_id: item.status
+        for item in (run.items if run else [])
+        if item.target_type == "PRODUCT" and item.product_id is not None
+    }
+    for candidate in candidates:
+        candidate["collection_status"] = collection_status_by_product.get(
+            candidate["product_id"]
+        )
+    return templates.TemplateResponse(
+        request,
+        "selection_qualification.html",
+        {
+            "request": request,
+            "rule": rule,
+            "candidates": candidates,
+            "configured": bool(
+                rule
+                and rule.minimum_7d_increment_total is not None
+                and rule.minimum_positive_days is not None
+            ),
+            "collection_run": run,
+        },
+    )
 
 
 @router.get("/dashboard/products/{product_id}", response_class=HTMLResponse)
@@ -448,7 +500,7 @@ def reviews_dashboard(
     review_statement = (
         select(ProductReview)
         .join(Product, Product.id == ProductReview.product_id)
-        .where(Product.status == "active")
+        .where(Product.status == "active", Product.monitor_scope == "competitor")
         .order_by(ProductReview.review_date.desc().nullslast(), ProductReview.id.desc())
         .limit(100)
     )
@@ -514,7 +566,11 @@ def store_detail(
     products = list(
         db.scalars(
             select(Product)
-            .where(Product.store_id == store_id, Product.status == "active")
+            .where(
+                Product.store_id == store_id,
+                Product.status == "active",
+                Product.monitor_scope == "competitor",
+            )
             .order_by(Product.id.desc())
         )
     )
@@ -535,7 +591,11 @@ def store_detail(
     candidate_products = list(
         db.scalars(
             select(Product)
-            .where(Product.store_id == store_id, Product.status == "active")
+            .where(
+                Product.store_id == store_id,
+                Product.status == "active",
+                Product.monitor_scope == "competitor",
+            )
             .order_by(Product.discovery_rank.is_(None), Product.discovery_rank, Product.id)
             .limit(20)
         )

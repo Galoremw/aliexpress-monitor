@@ -1,6 +1,6 @@
 # Chrome Extension Browser Collector
 
-这个扩展支持人工补采，以及独立 Chrome 配置中的每日顺序采集。所有渠道都只读取公开可见数据，并写入新的 Snapshot。普通本机监控台不会启用队列 worker；本机 worker 只在带有 `browser_collection=1&browser_collection_profile=isolated` 的 `BrowserCollectorProfile` 中启用。局域网 worker `192.168.66.107:3000/?browser_collection=1` 保持支持。
+这个扩展支持人工补采，以及独立 Chrome 配置中的每日顺序采集。所有渠道都只读取公开可见数据，并写入新的 Snapshot。普通监控台不会启用队列 worker；主机 worker 使用带有 `browser_collection=1&browser_collection_profile=isolated` 的地址，第二台电脑使用 `browser_collection=1`。
 
 1. 打开监控台商品详情页，点击“在 Chrome 打开”。
 2. 在 Chrome 商品页手动完成 AliExpress 验证（如页面要求）。
@@ -34,7 +34,9 @@ POST <BACKEND_URL>/api/collection/browser-extension
 
 ## 第二台电脑采集
 
-将本目录扩展加载到第二台电脑的 Chrome，并在该电脑登录监控台、AliExpress 和 IXSPY。当前扩展允许连接主机 `192.168.66.107:3000`；请在路由器中为主机保留此 DHCP 地址。第二台电脑使用 `http://192.168.66.107:3000/?browser_collection=1` 打开监控台，扩展会把队列 API 指向同一地址。Chrome 保持运行、采集窗口可见且不要最小化；窗口不需要持续获得键盘焦点。需要由第二台电脑执行时，在监控台采集电脑选择器中选中它并点击“开始采集”；未被选中的电脑只报告在线状态，不会领取任务。验证码仍由用户处理。
+将本目录扩展加载到两台电脑的 Chrome，并在各自浏览器中登录监控台、AliExpress 和 IXSPY。NAS 当前地址为 `192.168.66.115`；建议在路由器中为 NAS 保留此地址。监控台只需在 NAS 上向局域网开放前端 `3000`，Backend 与数据库继续保持私有，不要在路由器配置公网端口转发。
+
+主机使用 `http://192.168.66.115:3000/?browser_collection=1&browser_collection_profile=isolated`；第二台电脑使用 `http://192.168.66.115:3000/?browser_collection=1`。前者标记为“Galore主机”，后者标记为“第二台电脑”，两者连接同一个队列 API。Chrome 保持运行，采集窗口可见且不要最小化；窗口不需要持续获得键盘焦点。需要由第二台电脑执行时，在监控台采集电脑选择器中选中它并点击“开始采集”；未被选中的电脑只报告在线状态，不会领取任务。验证码仍由用户处理。
 
 任务所有权由监控台的单机选择控制；不需要为了队列独占而关闭另一台电脑的 worker。调度器和数据库仍运行在主机。若主机 LAN 地址变更，需要同步更新 `manifest.json` 中的 LAN 地址、重新加载两台电脑上的扩展，并重新打开监控台。
 

@@ -79,7 +79,7 @@ html { scroll-behavior: smooth; }
 .browser-run-secondary-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .browser-run-help { margin: 0; padding: 0 16px 12px; color: var(--muted); font-size: 12px; }
 .browser-queue-content { border-top: 1px solid var(--line); }
-.browser-filter-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
+.browser-filter-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
 .browser-filter { min-height: 58px; display: grid; place-content: center; gap: 3px; padding: 7px; border: 0; border-right: 1px solid var(--line); background: #fff; color: var(--ink); cursor: pointer; font: inherit; text-align: center; }
 .browser-filter:last-child { border-right: 0; }
 .browser-filter:hover { background: #f5faf7; }
@@ -283,7 +283,7 @@ tr:last-child td { border-bottom: 0; }
   .browser-progress-grid > *:last-child { border-right: 0; }
   .browser-filter-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .browser-filter:nth-child(3n) { border-right: 0; }
-  .browser-filter:nth-child(-n+3) { border-bottom: 1px solid var(--line); }
+  .browser-filter:nth-child(-n+6) { border-bottom: 1px solid var(--line); }
   .dianxiaomi-filter-grid { grid-template-columns: repeat(3, 1fr); }
   .dianxiaomi-filter:nth-child(3n) { border-right: 0; }
   .dianxiaomi-filter:nth-child(-n+3) { border-bottom: 1px solid var(--line); }
@@ -331,7 +331,7 @@ tr:last-child td { border-bottom: 0; }
   .browser-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .browser-filter:nth-child(3n) { border-right: 1px solid var(--line); }
   .browser-filter:nth-child(2n) { border-right: 0; }
-  .browser-filter:nth-child(-n+4) { border-bottom: 1px solid var(--line); }
+  .browser-filter:nth-child(-n+6) { border-bottom: 1px solid var(--line); }
   .browser-queue-item { grid-template-columns: minmax(0, 1fr); }
   .browser-queue-item-title { white-space: normal; }
   .browser-queue-item-side { justify-content: space-between; }
@@ -370,6 +370,27 @@ tr:last-child td { border-bottom: 0; }
   .insight-columns { grid-template-columns: minmax(0, 1fr); }
   .review-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+.selection-rule-panel { margin-bottom: 28px; }
+.selection-rule-form { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
+.selection-rule-form label { display: grid; gap: 6px; min-width: 210px; color: var(--muted, #63716a); font-size: 13px; font-weight: 700; }
+.selection-rule-form input { padding: 10px 12px; border: 1px solid #cad8cc; font: inherit; }
+.selection-rule-actions { display: flex; gap: 8px; }
+.selection-table-wrap { margin-top: 16px; }
+.selection-table { min-width: 1120px; }
+.selection-table td { vertical-align: top; }
+.selection-table td small { display: block; margin-top: 6px; color: #647269; }
+.selection-table td a { color: #285a43; }
+.selection-daily-values { white-space: nowrap; }
+.selection-daily-values span { display: inline-grid; place-items: center; min-width: 26px; height: 26px; margin-right: 3px; border-radius: 4px; background: #e6f5eb; color: #286343; font-size: 12px; }
+.selection-daily-values span.zero { background: #eef1ef; color: #536159; }
+.selection-daily-values span.missing { background: #fff0d1; color: #875b12; }
+.selection-status { display: inline-block; padding: 4px 7px; border-radius: 4px; background: #eef1ef; color: #536159; font-size: 12px; white-space: nowrap; }
+.selection-status.qualified, .selection-status.succeeded { background: #e6f5eb; color: #286343; }
+.selection-status.waiting_for_data, .selection-status.rule_unconfigured, .selection-status.needs_confirmation { background: #fff4d8; color: #875b12; }
+.selection-status.below_threshold, .selection-status.failed { background: #fde9e7; color: #9b2c22; }
+.selection-batch { display: inline-block; margin: 0 4px 4px 0; padding: 3px 6px; border: 1px solid #e5ece6; color: #647269; font-size: 11px; }
+.selection-retry, .selection-collect { margin-top: 7px; padding: 7px 9px; font-size: 12px; white-space: nowrap; }
 @media (max-width: 560px) {
   .topbar { height: auto; min-height: 58px; padding-top: 8px; padding-bottom: 8px; flex-wrap: wrap; gap: 6px 12px; }
   .topbar nav { flex-wrap: wrap; justify-content: flex-end; gap: 5px 9px; }

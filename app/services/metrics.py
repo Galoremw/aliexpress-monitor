@@ -45,6 +45,7 @@ def calculate_store_daily_metric(
             select(Product.id).where(
                 Product.store_id == store_id,
                 Product.status == "active",
+                Product.monitor_scope == "competitor",
             )
         )
     )

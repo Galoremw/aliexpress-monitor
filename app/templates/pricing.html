@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}产品定价表 · AliExpress 竞品监控{% endblock %}
+{% block styles %}<link rel="stylesheet" href="/static/pricing.css?v=20261020-1">{% endblock %}
+{% block content %}
+<section class="page-heading pricing-heading">
+  <div><p class="eyebrow">PRICING WORKBENCH</p><h1>产品定价表</h1><p>由监控台统一核算。产品重量、尺寸只用于包装预测，不会影响定价和运费公式。</p></div>
+</section>
+
+<section id="pricing-workbench" class="pricing-panel" aria-labelledby="pricing-title">
+  <h2 id="pricing-title" class="visually-hidden">商品核价</h2>
+  <div class="pricing-grid pricing-primary-inputs">
+    <label for="productType">商品类型
+      <select id="productType"><option value="ordinary" selected>普通商品</option><option value="printed_3d">3D 打印商品</option></select>
+    </label>
+    <label id="purchasePriceField" for="purchasePrice">供货成本（元，已含头程运费）
+      <input id="purchasePrice" type="number" min="0" step="0.01" inputmode="decimal" placeholder="输入供货成本">
+    </label>
+  </div>
+
+  <div id="printedInputs" class="pricing-grid printed-inputs" hidden>
+    <label for="material">打印材质<select id="material"><option value="PLA" selected>PLA</option><option value="PETG">PETG</option></select></label>
+    <label for="filamentGrams">耗材克数（g）<input id="filamentGrams" type="number" min="0.01" step="0.01" inputmode="decimal"></label>
+    <label for="printHours">打印时间（小时）<input id="printHours" type="number" min="0" step="1" inputmode="numeric" value="0"></label>
+    <label for="printMinutes">打印时间（分钟）<input id="printMinutes" type="number" min="0" max="59" step="1" inputmode="numeric" value="0"></label>
+  </div>
+
+  <section class="pricing-results" aria-label="核价结果">
+    <div class="pricing-grid">
+      <label>公式定价（元）<output id="formulaPrice" class="pricing-output">—</output></label>
+      <label>公式利润（元）<output id="formulaProfit" class="pricing-output profit">—</output></label>
+      <label for="finalPrice">人工定价（元）<input id="finalPrice" type="number" min="0" step="0.01" inputmode="decimal" placeholder="由运营自行决定"></label>
+      <label>人工定价利润（元）<output id="manualProfit" class="pricing-output profit">—</output></label>
+    </div>
+    <p id="costPriceNote" class="pricing-note" aria-live="polite">3D 打印成本价 = 打印成本 + ¥1.40 包装运费；填写打印数据后显示。</p>
+    <p id="quoteMessage" class="pricing-message" role="status" aria-live="polite">填写对应成本后自动核价。</p>
+  </section>
+
+  <details id="ordinaryAdvanced" class="pricing-details">
+    <summary>高级设置：包装费和定价倍率</summary>
+    <div class="pricing-grid pricing-advanced">
+      <label for="packagingFee">包装费与物流费合计（元，默认 ¥1.40）<input id="packagingFee" type="number" min="0.4" step="0.01" inputmode="decimal" value="1.40" placeholder="默认 ¥1.40（包装 ¥1 + 物流 ¥0.40）"></label>
+      <label for="multiplier">定价倍率（默认按 WPS 规则）<input id="multiplier" type="number" min="0.01" step="0.01" inputmode="decimal" placeholder="默认按规则"></label>
+    </div>
+  </details>
+
+</section>
+
+<section class="pricing-panel carton-panel" aria-labelledby="carton-title">
+  <div class="section-heading"><div><h2 id="carton-title">产品包装预测</h2><span>只预测包装型号、箱体尺寸和合计重量；与核价及运费公式分开。</span></div></div>
+  <div class="pricing-grid carton-inputs">
+    <label for="productWeight">产品重量（g）<input id="productWeight" type="number" min="0.01" step="0.01" inputmode="decimal"></label>
+    <label for="productLength">长（cm）<input id="productLength" type="number" min="0.01" step="0.01" inputmode="decimal"></label>
+    <label for="productWidth">宽（cm）<input id="productWidth" type="number" min="0.01" step="0.01" inputmode="decimal"></label>
+    <label for="productHeight">高（cm）<input id="productHeight" type="number" min="0.01" step="0.01" inputmode="decimal"></label>
+  </div>
+  <div class="carton-results" aria-live="polite">
+    <div><span>预测总重量</span><strong id="predictedWeight">—</strong><small id="weightCalculation"></small></div>
+    <div><span>预测纸箱长 × 宽 × 高</span><strong id="predictedCartonDimensions">—</strong></div>
+    <div><span>适用包装型号</span><strong id="predictedCartonName">填写产品重量及尺寸</strong></div>
+  </div>
+  <details class="pricing-details carton-catalog">
+    <summary>纸箱包装表</summary>
+    <div id="cartonCatalog" class="table-wrap"><p class="pricing-message">正在读取纸箱目录…</p></div>
+  </details>
+</section>
+{% endblock %}
+{% block scripts %}<script src="/static/pricing.js?v=20261020-2" defer></script>{% endblock %}

@@ -74,3 +74,22 @@ th { color: #647269; font-weight: 700; }
 .error-page p:not(.eyebrow) { color: #647269; line-height: 1.7; }
 code { padding: 3px 6px; background: #e7eee8; }
 @media (max-width: 720px) { .topbar, .hero, .page-heading, .section-heading { align-items: flex-start; flex-direction: column; } .metric-grid { grid-template-columns: repeat(2, 1fr); } .browser-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } nav { flex-wrap: wrap; } .dianxiaomi-item { grid-template-columns: 1fr; } .dianxiaomi-item-side { justify-content: flex-start; flex-wrap: wrap; } .dianxiaomi-item-title { white-space: normal; } }
+.selection-rule-panel { padding: 20px; background: #fff; }
+.selection-rule-form { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; margin-bottom: 10px; }
+.selection-rule-form label { display: grid; gap: 6px; min-width: 205px; color: #647269; font-size: 13px; font-weight: 700; }
+.selection-rule-form input { padding: 10px 12px; border: 1px solid #cad8cc; font: inherit; }
+.selection-rule-panel small { color: #647269; }
+.selection-table { min-width: 1120px; }
+.selection-table td { vertical-align: top; }
+.selection-table td small { display: block; margin-top: 6px; color: #647269; }
+.selection-table td a { color: #285a43; }
+.selection-days { white-space: nowrap; }
+.selection-day { display: inline-grid; place-items: center; min-width: 26px; height: 26px; margin-right: 3px; border-radius: 4px; background: #e6f5eb; color: #286343; font-size: 12px; }
+.selection-day.zero { background: #eef1ef; color: #536159; }
+.selection-day.missing { background: #fff4d8; color: #875b12; }
+.selection-status { display: inline-block; padding: 4px 7px; border-radius: 4px; background: #eef1ef; color: #536159; font-size: 12px; white-space: nowrap; }
+.selection-status.qualified, .selection-status.succeeded { background: #e6f5eb; color: #286343; }
+.selection-status.waiting_for_data, .selection-status.rule_unconfigured, .selection-status.needs_confirmation { background: #fff4d8; color: #875b12; }
+.selection-status.below_threshold, .selection-status.failed { background: #fde9e7; color: #9b2c22; }
+.selection-batch { display: inline-block; margin: 0 4px 4px 0; padding: 3px 6px; border: 1px solid #e5ece6; color: #647269; font-size: 11px; }
+.selection-retry, .selection-collect { margin-top: 7px; padding: 7px 9px; font-size: 12px; white-space: nowrap; }

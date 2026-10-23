@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}选品候选资格 · AliExpress 竞品监控{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <p class="eyebrow">SELECTION WORKBENCH</p>
+    <h1>选品候选资格</h1>
+    <p>只使用 IXSPY 直接读取的完整七日增量。候选自动加入当日（若已有）或下一次每日浏览器采集 run；采集仍由当前采集电脑和队列启动/暂停控制。</p>
+  </div>
+  <a class="button" href="/">返回监控台</a>
+</section>
+
+<section class="data-section selection-rule-panel">
+  <div class="section-heading">
+    <h2>七日筛选规则</h2>
+    <span>{% if configured %}自动入队已启用{% else %}观察模式 · 自动入队关闭{% endif %}</span>
+  </div>
+  <form id="selection-rule-form" class="selection-rule-form">
+    <label>七日总增量至少<input name="minimum_7d_increment_total" type="number" min="0" step="1" value="{{ rule.minimum_7d_increment_total if rule and rule.minimum_7d_increment_total is not none else '' }}" placeholder="留空"></label>
+    <label>有增量天数至少<input name="minimum_positive_days" type="number" min="0" max="7" step="1" value="{{ rule.minimum_positive_days if rule and rule.minimum_positive_days is not none else '' }}" placeholder="留空"></label>
+    <div class="selection-rule-actions">
+      <button class="button primary" type="submit">保存规则</button>
+      <button id="selection-evaluate" class="button" type="button">重新评估</button>
+      <button id="selection-queue-all" class="button" type="button">加入今日候选采集队列</button>
+    </div>
+  </form>
+  <p class="muted-value">两个阈值都填写后才会自动创建一次店小秘任务；两个都留空则只观察。日期时区：Asia/Shanghai。</p>
+</section>
+
+<section class="data-section">
+  <div class="section-heading"><h2>选品工作台导入候选</h2><span>{{ candidates|length }} 个商品</span></div>
+  {% if candidates %}
+  <div class="table-wrap selection-table-wrap">
+    <table class="selection-table">
+      <thead><tr><th>商品</th><th>七日累计增量与覆盖</th><th>每日 IXSPY 增量</th><th>资格判定</th><th>店小秘任务</th><th>来源批次</th><th>采集</th></tr></thead>
+      <tbody>
+      {% for candidate in candidates %}
+        {% set evidence = candidate.evidence or {} %}
+        <tr>
+          <td><a href="/dashboard/products/{{ candidate.product_id }}"><strong>{{ candidate.title or candidate.aliexpress_product_id }}</strong></a><small>ID {{ candidate.aliexpress_product_id }}</small></td>
+          <td><span>{{ evidence.window_start or '—' }} → {{ evidence.window_end or '—' }}</span><small>覆盖 {{ evidence.observed_days or 0 }}/7 天 · 合计 {{ evidence.total_increment or 0 }} · 正增量 {{ evidence.positive_days or 0 }} 天</small></td>
+          <td class="selection-daily-values">{% for value in evidence.daily_values or [] %}<span class="{% if value is none %}missing{% elif value == 0 %}zero{% endif %}">{% if value is none %}缺{% else %}{{ value }}{% endif %}</span>{% endfor %}{% if not evidence.daily_values %}<span>等待数据</span>{% endif %}</td>
+          <td><b class="selection-status {{ candidate.qualification_status|lower }}">{{ candidate.qualification_status }}</b><small>{{ evidence.minimum_7d_increment_total if evidence.minimum_7d_increment_total is not none else '未设总量阈值' }} / {{ evidence.minimum_positive_days if evidence.minimum_positive_days is not none else '未设天数阈值' }}</small></td>
+          <td><b class="selection-status {{ (candidate.handoff_status or 'NONE')|lower }}">{{ candidate.handoff_status or '未入队' }}</b>{% if candidate.attempt_count is not none %}<small>尝试 {{ candidate.attempt_count }} 次</small>{% endif %}{% if candidate.handoff_status in ['FAILED', 'NEEDS_CONFIRMATION'] %}<button class="button selection-retry" type="button" data-handoff-id="{{ candidate.handoff_id }}">人工检查后重试</button>{% endif %}</td>
+          <td>{% for source in candidate.provenance %}<span class="selection-batch">{{ source.batch_id }}</span>{% endfor %}</td>
+          <td><b class="selection-status {{ (candidate.collection_status or 'none')|lower }}">{{ candidate.collection_status or '等待每日 run' }}</b></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty-state"><strong>尚无选品候选</strong><span>选品工作台导入 AliExpress 候选后，会在这里持续观察七日 IXSPY 数据。</span></div>{% endif %}
+</section>
+{% endblock %}
+{% block scripts %}<script src="/static/selection_qualification.js?v=1" defer></script>{% endblock %}

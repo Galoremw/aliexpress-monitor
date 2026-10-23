@@ -1,7 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
@@ -33,6 +33,8 @@ from app.api.schemas import (
     DianxiaomiHandoffRead,
     DianxiaomiHandoffStatusRequest,
     DianxiaomiQueueHeartbeatRequest,
+    DianxiaomiWorkerHandoffRead,
+    DianxiaomiWorkerStatusRequest,
     BrowserStoreDiscoveryRead,
     BrowserStoreDiscoveryRequest,
     CollectionAttemptRead,
@@ -55,6 +57,9 @@ from app.api.schemas import (
     StoreTopProductsRead,
     TopProductRead,
     StoreUpdate,
+    SelectionCandidatesBatchImport,
+    SelectionQualificationRuleRead,
+    SelectionQualificationRuleWrite,
 )
 from app.collectors.base import Collector, CollectorResult
 from app.collectors.dependencies import get_collector
@@ -62,6 +67,10 @@ from app.collectors.store_dependencies import get_store_discovery_collector
 from app.collectors.store_discovery import StoreDiscoveryCollector
 from app.core.auth import require_authenticated
 from app.core.config import get_settings
+from app.api.service_auth import (
+    require_dianxiaomi_service_token,
+    require_selection_service_token,
+)
 from app.api.utils import (
     canonical_product_url,
     extract_product_id,
@@ -81,6 +90,8 @@ from app.db.models import (
     Store,
     StoreDailyMetric,
     StoreSnapshot,
+    SelectionCandidate,
+    SelectionQualificationRule,
 )
 from app.db.session import get_db
 from app.services.snapshots import collect_product_snapshot
@@ -91,7 +102,10 @@ from app.services.historical_metrics import (
     import_historical_sales,
     looks_cumulative_like_daily_values,
 )
-from app.services.monitored_store_collection import save_monitored_store_observation
+from app.services.monitored_store_collection import (
+    StoreIdentityValidationError,
+    save_monitored_store_observation,
+)
 from app.services.store_page_discovery import save_store_page_candidates
 from app.services.product_presentation import clean_product_title
 from app.services.store_discovery import discover_store_products, store_top_products
@@ -143,8 +157,17 @@ from app.services.dianxiaomi import (
     pause_dianxiaomi_queue,
     record_dianxiaomi_heartbeat,
     resume_dianxiaomi_queue,
+    retry_handoff,
     serialize_handoff,
     update_handoff,
+)
+from app.services.selection_qualification import (
+    evaluate_all_selection_candidates,
+    evaluate_selection_candidate,
+    import_selection_candidates,
+    list_selection_candidates,
+    serialize_selection_candidate,
+    set_selection_rule,
 )
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_authenticated)])
@@ -288,6 +311,7 @@ def _save_channel_observation(
         calculate_store_daily_metric(
             db, product.store_id, metric_date, commit=False
         )
+    evaluate_selection_candidate(db, product.id)
     if commit:
         db.commit()
         db.refresh(snapshot)
@@ -616,7 +640,9 @@ def start_product_browser_collection(
     if product.status != "active":
         raise HTTPException(status_code=409, detail="该商品监控已停用")
     store = db.get(Store, product.store_id)
-    if store is None or store.status != "active":
+    if store is None or (
+        store.status != "active" and product.monitor_scope != "selection_candidate"
+    ):
         raise HTTPException(status_code=409, detail="所属店铺监控已停用")
     try:
         run, item, queued = queue_single_product_collection(db, product)
@@ -801,6 +827,147 @@ def list_dianxiaomi_handoffs(
     return [serialize_handoff(row) for row in db.scalars(statement)]
 
 
+@router.post(
+    "/integrations/selection/candidates",
+    dependencies=[Depends(require_selection_service_token)],
+    status_code=status.HTTP_201_CREATED,
+)
+def import_workbench_candidates(
+    payload: SelectionCandidatesBatchImport,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        result = import_selection_candidates(db, payload.batch_id, payload.candidates)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result["created_count"] == 0:
+        response.status_code = status.HTTP_200_OK
+    current_run = get_today_run(db)
+    if current_run is not None:
+        ensure_browser_collection_run(db, current_run.target_date, trigger="MANUAL")
+    return result
+
+
+@router.get(
+    "/selection-qualification/rule",
+    response_model=SelectionQualificationRuleRead,
+)
+def get_selection_qualification_rule(db: Session = Depends(get_db)) -> dict:
+    rule = db.get(SelectionQualificationRule, 1)
+    minimum_total = rule.minimum_7d_increment_total if rule else None
+    minimum_positive_days = rule.minimum_positive_days if rule else None
+    return {
+        "minimum_7d_increment_total": minimum_total,
+        "minimum_positive_days": minimum_positive_days,
+        "configured": minimum_total is not None and minimum_positive_days is not None,
+        "timezone": "Asia/Shanghai",
+    }
+
+
+@router.put(
+    "/selection-qualification/rule",
+    response_model=SelectionQualificationRuleRead,
+)
+def update_selection_qualification_rule(
+    payload: SelectionQualificationRuleWrite,
+    db: Session = Depends(get_db),
+) -> dict:
+    rule = set_selection_rule(
+        db,
+        payload.minimum_7d_increment_total,
+        payload.minimum_positive_days,
+    )
+    evaluate_all_selection_candidates(db)
+    db.commit()
+    return {
+        "minimum_7d_increment_total": rule.minimum_7d_increment_total,
+        "minimum_positive_days": rule.minimum_positive_days,
+        "configured": (
+            rule.minimum_7d_increment_total is not None
+            and rule.minimum_positive_days is not None
+        ),
+        "timezone": "Asia/Shanghai",
+    }
+
+
+@router.get("/selection-qualification/candidates")
+def get_selection_candidates(db: Session = Depends(get_db)) -> list[dict]:
+    candidates = [
+        serialize_selection_candidate(candidate)
+        for candidate in list_selection_candidates(db)
+    ]
+    run = get_today_run(db)
+    collection_status_by_product = {
+        item.product_id: item.status
+        for item in (run.items if run else [])
+        if item.target_type == "PRODUCT" and item.product_id is not None
+    }
+    for candidate in candidates:
+        candidate["collection_status"] = collection_status_by_product.get(
+            candidate["product_id"]
+        )
+    return candidates
+
+
+@router.post("/selection-qualification/collect")
+def queue_selection_candidate_collection(db: Session = Depends(get_db)) -> dict:
+    existing_run = get_today_run(db)
+    existing_product_ids = {
+        item.product_id
+        for item in (existing_run.items if existing_run else [])
+        if item.target_type == "PRODUCT" and item.product_id is not None
+    }
+    run = ensure_browser_collection_run(db, trigger="MANUAL")
+    candidate_products = list(
+        db.scalars(
+            select(Product)
+            .join(SelectionCandidate, SelectionCandidate.product_id == Product.id)
+            .where(
+                Product.monitor_scope == "selection_candidate",
+                Product.status == "active",
+            )
+        )
+    )
+    candidate_items = [
+        item
+        for item in run.items
+        if item.target_type == "PRODUCT"
+        and item.product_id in {product.id for product in candidate_products}
+    ]
+    return {
+        "run_id": run.id,
+        "candidate_count": len(candidate_products),
+        "queued_count": sum(item.product_id not in existing_product_ids for item in candidate_items),
+        "items": [
+            {"product_id": item.product_id, "status": item.status, "target_url": item.target_url}
+            for item in candidate_items
+        ],
+    }
+
+
+@router.post("/selection-qualification/evaluate")
+def reevaluate_selection_candidates(db: Session = Depends(get_db)) -> list[dict]:
+    candidates = evaluate_all_selection_candidates(db)
+    db.commit()
+    candidates = [
+        serialize_selection_candidate(candidate)
+        for candidate in list_selection_candidates(db)
+    ]
+    run = get_today_run(db)
+    collection_status_by_product = {
+        item.product_id: item.status
+        for item in (run.items if run else [])
+        if item.target_type == "PRODUCT" and item.product_id is not None
+    }
+    for candidate in candidates:
+        candidate["collection_status"] = collection_status_by_product.get(
+            candidate["product_id"]
+        )
+    return candidates
+
+
 @router.get("/integrations/dianxiaomi/status")
 def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
     control = db.get(DianxiaomiQueueControl, 1)
@@ -932,6 +1099,89 @@ def dianxiaomi_worker_heartbeat(
 
 
 @router.post(
+    "/integrations/dianxiaomi/worker/heartbeat",
+    dependencies=[Depends(require_dianxiaomi_service_token)],
+)
+def dianxiaomi_docker_worker_heartbeat(
+    worker_id: str = Header(alias="X-Dianxiaomi-Worker-ID", min_length=1, max_length=128),
+    db: Session = Depends(get_db),
+) -> dict:
+    control = record_dianxiaomi_heartbeat(db, worker_id)
+    return {
+        "paused": control.is_paused,
+        "paused_reason": control.paused_reason,
+        "last_heartbeat_at": control.last_heartbeat_at,
+        "worker_id": control.worker_id,
+    }
+
+
+@router.post(
+    "/integrations/dianxiaomi/worker/handoffs/claim",
+    response_model=DianxiaomiWorkerHandoffRead | None,
+    dependencies=[Depends(require_dianxiaomi_service_token)],
+)
+def claim_dianxiaomi_docker_handoff(
+    worker_id: str = Header(alias="X-Dianxiaomi-Worker-ID", min_length=1, max_length=128),
+    db: Session = Depends(get_db),
+) -> dict | None:
+    row = claim_next_handoff(db, worker_id)
+    if row is None:
+        return None
+    return {
+        "handoff_id": row.id,
+        "batch_id": row.batch_id,
+        "aliexpress_product_id": row.product.aliexpress_product_id,
+        "url": row.target_url,
+        "attempt_count": row.attempt_count,
+        "status": row.status,
+        "detail": row.detail_json,
+    }
+
+
+@router.post(
+    "/integrations/dianxiaomi/worker/handoffs/{handoff_id}/status",
+    response_model=DianxiaomiWorkerHandoffRead,
+    dependencies=[Depends(require_dianxiaomi_service_token)],
+)
+def update_dianxiaomi_docker_handoff(
+    handoff_id: int,
+    payload: DianxiaomiWorkerStatusRequest,
+    worker_id: str = Header(alias="X-Dianxiaomi-Worker-ID", min_length=1, max_length=128),
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    if row.worker_id != worker_id:
+        raise HTTPException(status_code=409, detail="店小秘任务不属于当前服务实例")
+    if row.status not in ACTIVE_HANDOFF_STATUSES:
+        raise HTTPException(status_code=409, detail="该店小秘任务已结束")
+    detail = payload.detail
+    updated = update_handoff(
+        db,
+        row,
+        payload.status,
+        error_type=(
+            detail.get("error_type") if isinstance(detail.get("error_type"), str) else None
+        ),
+        error_message=(
+            detail.get("error_message")
+            if isinstance(detail.get("error_message"), str)
+            else None
+        ),
+        detail=detail,
+        worker_id=worker_id,
+    )
+    return {
+        "handoff_id": updated.id,
+        "batch_id": updated.batch_id,
+        "aliexpress_product_id": updated.product.aliexpress_product_id,
+        "url": updated.target_url,
+        "attempt_count": updated.attempt_count,
+        "status": updated.status,
+        "detail": updated.detail_json,
+    }
+
+
+@router.post(
     "/integrations/dianxiaomi/handoffs/claim-next",
     response_model=DianxiaomiHandoffRead | None,
 )
@@ -1005,6 +1255,7 @@ def update_dianxiaomi_handoff_status(
             payload.status,
             error_type=payload.error_type,
             error_message=payload.error_message,
+            detail=payload.detail,
             worker_id=payload.worker_id,
         )
     )
@@ -1033,16 +1284,10 @@ def resume_dianxiaomi_handoff(
     db: Session = Depends(get_db),
 ) -> dict:
     row = _handoff_or_404(db, handoff_id)
-    if row.status not in {"NEEDS_CONFIRMATION", "FAILED"}:
-        raise HTTPException(status_code=409, detail="该店小秘任务当前不能重新排队")
-    row.status = "QUEUED"
-    row.worker_id = None
-    row.error_type = None
-    row.error_message = None
-    row.completed_at = None
-    db.commit()
-    db.refresh(row)
-    return serialize_handoff(row)
+    try:
+        return serialize_handoff(retry_handoff(db, row))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/collection/status/today", response_model=CollectionStatusRead)
@@ -1480,6 +1725,26 @@ def browser_collection_store_discovery(
     item = _claimed_browser_collection_item(db, item_id, payload, "STORE")
     try:
         snapshot, complete, diagnostics = save_monitored_store_observation(db, item, payload)
+    except StoreIdentityValidationError as exc:
+        db.rollback()
+        retry_item = db.get(BrowserCollectionItem, item_id)
+        if retry_item is None:
+            raise HTTPException(status_code=409, detail="Browser collection item not found")
+        try:
+            run = record_store_identity_review(
+                db,
+                retry_item,
+                exc.page_url,
+                exc.identity_error_type,
+                exc.message,
+                exc.evidence,
+                worker_id=payload.worker_id or "",
+                claim_token=payload.claim_token or "",
+            )
+        except ValueError as review_error:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=str(review_error)) from review_error
+        return serialize_run(run)
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1811,9 +2076,12 @@ def create_product(payload: ProductCreate, db: Session = Depends(get_db)) -> Pro
 def list_products(
     store_id: int | None = None,
     status_filter: str | None = Query(default=None, alias="status", pattern="^(active|inactive)$"),
+    scope: str = Query(default="competitor", pattern="^(competitor|selection_candidate|all)$"),
     db: Session = Depends(get_db),
 ) -> list[Product]:
     statement = select(Product).order_by(Product.id)
+    if scope != "all":
+        statement = statement.where(Product.monitor_scope == scope)
     if store_id is not None:
         statement = statement.where(Product.store_id == store_id)
     if status_filter:

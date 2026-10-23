@@ -667,6 +667,7 @@ const browserCollectionFilterStatuses = {
   partial: ["PARTIAL"],
   failed: ["FAILED", "SKIPPED"],
   verification: ["NEEDS_VERIFICATION"],
+  identity: [],
 };
 const browserCollectionStatusLabels = {
   PENDING: "待处理",
@@ -683,12 +684,20 @@ function renderBrowserCollectionFilter() {
   const list = section?.querySelector("#browser-collection-items");
   if (!list) return;
   const statuses = browserCollectionFilterStatuses[browserCollectionFilter] || [];
-  const filteredItems = browserCollectionItems.filter((item) => statuses.includes(item.status));
+  const filteredItems = browserCollectionItems.filter((item) => {
+    if (browserCollectionFilter === "identity") return isIdentityDeferred(item);
+    if (browserCollectionFilter === "failed") {
+      return statuses.includes(item.status) && !isIdentityDeferred(item);
+    }
+    return statuses.includes(item.status);
+  });
   const label = section.querySelector(`[data-browser-filter="${browserCollectionFilter}"] small`)?.textContent || "任务";
   const title = section.querySelector("#browser-list-title");
   const caption = section.querySelector("#browser-list-caption");
   if (title) title.textContent = `${label}任务 · ${filteredItems.length}`;
-  if (caption) caption.textContent = browserCollectionFilter === "verification"
+  if (caption) caption.textContent = browserCollectionFilter === "identity"
+    ? "待审核项目不会写入商品、销量或续页游标；确认只记录 URL，仍需手动重新排队。"
+    : browserCollectionFilter === "verification"
     ? browserCollectionRun?.paused_reason === "store_identity_review"
       ? "采集队列已暂停，等待人工确认当前店铺身份"
       : "请在本机 Chrome 中完成正常登录或验证后继续"
@@ -700,8 +709,10 @@ function renderBrowserCollectionFilter() {
     processing: browserCollectionItems.filter((item) => item.status === "RUNNING").length,
     succeeded: browserCollectionItems.filter((item) => item.status === "SUCCEEDED").length,
     partial: browserCollectionItems.filter((item) => item.status === "PARTIAL").length,
-    failed: browserCollectionItems.filter((item) => ["FAILED", "SKIPPED"].includes(item.status)).length,
+    failed: browserCollectionItems.filter((item) => ["FAILED", "SKIPPED"].includes(item.status)
+      && !isIdentityDeferred(item)).length,
     verification: browserCollectionItems.filter((item) => item.status === "NEEDS_VERIFICATION").length,
+    identity: browserCollectionItems.filter((item) => isIdentityDeferred(item)).length,
   };
   Object.entries(counts).forEach(([key, count]) => {
     const target = section.querySelector(`[data-browser-filter-value="${key}"]`);
@@ -709,27 +720,40 @@ function renderBrowserCollectionFilter() {
   });
 }
 
+function isIdentityDeferred(item) {
+  return ["store_identity_deferred", "store_identity_review"].includes(item.error_type);
+}
+
 function renderBrowserCollectionItem(item) {
-  const identityReview = item.status === "NEEDS_VERIFICATION"
-    && item.identity_review_pending === true;
+  const identityDeferred = isIdentityDeferred(item);
+  const identityEvidence = item.identity_review_evidence || {};
+  const identityDecision = item.identity_review_decision
+    || identityEvidence.identity_review_decision
+    || (item.identity_review_pending === true ? "pending" : null);
+  const identityReview = identityDeferred && identityDecision === "pending";
+  const identityConfirmed = identityDeferred && identityDecision === "confirmed";
+  const identityRejected = identityDeferred && identityDecision === "rejected";
   const status = item.status === "SKIPPED" && item.error_type === "queue_cancelled"
-    ? "已取消" : identityReview ? "待确认店铺身份"
+    ? "已取消" : identityReview ? "待身份复核"
+      : identityConfirmed ? "已确认 URL 身份" : identityRejected ? "已拒绝"
       : browserCollectionStatusLabels[item.status] || item.status;
   const statusClass = ["SUCCEEDED"].includes(item.status) ? "success"
-    : ["FAILED", "SKIPPED", "NEEDS_VERIFICATION"].includes(item.status) ? "error" : "";
-  const identityEvidence = item.identity_review_evidence || {};
+    : identityDeferred ? "partial"
+      : ["FAILED", "SKIPPED", "NEEDS_VERIFICATION"].includes(item.status) ? "error" : "";
   const reviewedUrl = escapeDianxiaomiHtml(item.identity_review_url || "");
   const visibleStoreIds = [
     identityEvidence.heading_store_id,
     ...(Array.isArray(identityEvidence.labeled_store_ids) ? identityEvidence.labeled_store_ids : []),
   ].filter((id) => id != null && String(id)).map(String);
-  const reviewDetails = identityReview
-    ? `<div class="browser-identity-evidence"><strong>人工核验店铺身份</strong><span>采集页面：${reviewedUrl
+  const reviewDetails = identityDeferred
+    ? `<div class="browser-identity-evidence"><strong>${identityReview ? "人工核验店铺身份" : "店铺身份审核记录"}</strong><span>采集页面：${reviewedUrl
       ? `<a class="browser-identity-url" href="${reviewedUrl}" target="_blank" rel="noreferrer">${reviewedUrl}</a>`
       : "未记录"}</span><span>页面标题：${escapeDianxiaomiHtml(identityEvidence.page_title || "未识别")}</span><span>IXSPY 店铺名称：${escapeDianxiaomiHtml(identityEvidence.ixspy_store_name || "未识别")}</span><span>页面显示 ID：${escapeDianxiaomiHtml(visibleStoreIds.join("、") || "未识别")}</span></div>`
     : "";
   const action = identityReview
     ? `<div class="browser-identity-actions"><button class="link-button identity-confirm" type="button" data-browser-item-action="identity-confirm" data-browser-item-id="${item.id}">确定无误</button><button class="link-button identity-reject" type="button" data-browser-item-action="identity-reject" data-browser-item-id="${item.id}">错误</button></div>`
+    : identityConfirmed
+      ? `<button class="link-button" type="button" data-browser-item-action="retry" data-browser-item-id="${item.id}">重新排队</button>`
     : ["FAILED", "PARTIAL"].includes(item.status)
       ? `<button class="link-button" type="button" data-browser-item-action="retry" data-browser-item-id="${item.id}">重新排队</button>` : "";
   const kind = item.target_type === "STORE" ? "店铺商品发现" : `商品 #${item.product_id ?? "—"}`;
@@ -763,6 +787,9 @@ function browserWorkerState(run) {
   }
   if (run.status === "PAUSED" && run.paused_reason === "manual_pause") {
     return { label: "采集队列已手动暂停", className: "pending" };
+  }
+  if (run.status === "PAUSED" && run.paused_reason === "collection_partial") {
+    return { label: "店铺采集存在部分数据，队列已暂停，等待检查", className: "partial" };
   }
   if (run.status === "NEEDS_VERIFICATION") {
     if (run.paused_reason === "store_identity_review") {
@@ -1050,10 +1077,10 @@ document.querySelector("#browser-collection-status")?.addEventListener("click", 
     updateBrowserCollection(run);
     await refreshBrowserCollectionControl();
     notify(actionType === "identity-confirm"
-      ? "已确认当前店铺身份，采集任务继续运行。"
+      ? "已确认该店铺的 URL 身份；本轮仍保持跳过，需手动重新排队。"
       : actionType === "identity-reject"
-        ? "已将当前店铺任务标记为错误，采集队列保持暂停。"
-        : "任务已重新排队；请在队列区点击“开始采集”后运行。");
+        ? "已记录人工拒绝；本轮队列不受影响。"
+        : "该店铺已重新排队；任务将由当前所选采集电脑领取。");
   } catch (error) {
     notify(error.message, true);
   } finally {

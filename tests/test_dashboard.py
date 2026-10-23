@@ -39,7 +39,7 @@ def test_dashboard_renders_empty_state(client):
 
 def test_galore_collector_launch_button_is_local_only(client):
     local_dashboard = client.get("/", headers={"host": "127.0.0.1:3000"})
-    lan_dashboard = client.get("/", headers={"host": "192.168.66.107:3000"})
+    lan_dashboard = client.get("/", headers={"host": "192.168.66.115:3000"})
 
     assert local_dashboard.status_code == 200
     assert 'id="launch-galore-collector"' in local_dashboard.text
@@ -779,7 +779,7 @@ def test_identity_review_item_exposes_review_evidence_to_dashboard(client):
         'document.querySelector("#browser-run-pause")', 1
     )[0]
 
-    assert 'item.status === "NEEDS_VERIFICATION"' in renderer
+    assert 'const identityReview = identityDeferred && identityDecision === "pending"' in renderer
     assert "item.identity_review_pending === true" in renderer
     assert "item.identity_review_url" in renderer
     assert "item.identity_review_evidence" in renderer
@@ -789,8 +789,34 @@ def test_identity_review_item_exposes_review_evidence_to_dashboard(client):
     assert "确定无误" in renderer
     assert "错误" in renderer
     assert "/identity-review/${endpoint}" in handler
-    assert "队列保持暂停" in handler
-    assert "当前店铺身份，采集任务继续运行" in handler
+    assert "本轮仍保持跳过，需手动重新排队" in handler
+    assert "本轮队列不受影响" in handler
+
+
+def test_identity_deferred_items_have_separate_filter_and_decision_actions(client):
+    dashboard = client.get("/").text
+    script = client.get("/static/dashboard.js").text
+    renderer = script.split("function renderBrowserCollectionItem(item)", 1)[1].split(
+        "function formatBrowserTime", 1
+    )[0]
+    counts = script.split("function renderBrowserCollectionFilter()", 1)[1].split(
+        "function renderBrowserCollectionItem", 1
+    )[0]
+
+    assert 'data-browser-filter="identity"' in dashboard
+    assert "身份审核" in dashboard
+    identity_helper = script.split("function isIdentityDeferred(item)", 1)[1].split(
+        "function renderBrowserCollectionItem", 1
+    )[0]
+    assert '"store_identity_deferred"' in identity_helper
+    assert 'identityDecision === "confirmed"' in renderer
+    assert 'identityDecision === "rejected"' in renderer
+    assert 'data-browser-item-action="identity-confirm"' in renderer
+    assert 'data-browser-item-action="identity-reject"' in renderer
+    assert 'data-browser-item-action="retry"' in renderer
+    assert 'browserCollectionFilter === "identity"' in counts
+    assert "isIdentityDeferred(item)).length" in counts
+    assert "!isIdentityDeferred(item)" in counts
 
 
 def test_identity_buttons_render_only_for_identity_review_items(client):
@@ -800,12 +826,12 @@ def test_identity_buttons_render_only_for_identity_review_items(client):
     )[0]
     css = client.get("/static/dashboard.css").text
 
-    assert 'item.status === "NEEDS_VERIFICATION"' in renderer
+    assert 'const identityReview = identityDeferred && identityDecision === "pending"' in renderer
     assert "item.identity_review_pending === true" in renderer
     assert '.browser-identity-actions .identity-confirm { background:' in css
     assert '.browser-identity-actions .identity-reject { background:' in css
     assert 'color: #111' in css
-    assert "等待人工确认店铺身份；队列已暂停" in script
+    assert "待身份复核" in renderer
     assert "const platformVerification = needsVerification && !identityReview" in script
     template = Path("app/templates/dashboard.html").read_text(encoding="utf-8")
     assert 'browser_collection_run.paused_reason == "store_identity_review"' in template

@@ -35,6 +35,14 @@ services:
       AUTH_COOKIE_SAMESITE: ${AUTH_COOKIE_SAMESITE:-lax}
       AUTH_ADMIN_USERNAME: ${AUTH_ADMIN_USERNAME:-}
       AUTH_ADMIN_PASSWORD: ${AUTH_ADMIN_PASSWORD:-}
+      PRICING_SERVICE_TOKEN: ${PRICING_SERVICE_TOKEN:-}
+      SELECTION_SERVICE_TOKEN: ${SELECTION_SERVICE_TOKEN:-}
+      DIANXIAOMI_SERVICE_TOKEN: ${DIANXIAOMI_SERVICE_TOKEN:-}
+    networks:
+      default: {}
+      dianxiaomi-pricing-bridge:
+        aliases:
+          - monitor-pricing
     ports:
       - "${BACKEND_BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
     depends_on:
@@ -90,3 +98,7 @@ services:
 
 volumes:
   postgres_data:
+
+networks:
+  dianxiaomi-pricing-bridge:
+    external: true

@@ -19,6 +19,7 @@
   <a href="#browser-collection-status"><span>每日浏览器采集</span></a>
   <a href="#active-stores"><span>监控店铺</span></a>
   <a href="#add-store"><span>添加监控店铺</span></a>
+  <a href="/selection-qualification"><span>选品候选资格</span></a>
 </nav>
 
 <section id="dashboard-overview" class="stats" aria-label="监控概况">
@@ -51,7 +52,7 @@
         <span id="browser-online" class="status {% if browser_collection_run and browser_collection_run.chrome_online %}success{% else %}pending{% endif %}">{% if browser_collection_run and browser_collection_run.chrome_online %}采集扩展在线{% else %}采集扩展离线{% endif %}</span>
         <strong id="browser-run-phase">{% if browser_collection_run %}{{ browser_collection_run.phase }}{% else %}等待启动{% endif %}</strong>
       </div>
-      <p id="browser-worker-state" class="browser-worker-state status pending" role="status" aria-live="polite">{% if not browser_collection_run %}任务尚未启动{% elif browser_collection_run.status == "NEEDS_VERIFICATION" %}等待人工登录或验证{% elif browser_collection_run.status == "PAUSED" and browser_collection_run.paused_reason == "manual_cancel" %}剩余采集队列已取消{% elif browser_collection_run.status == "PAUSED" %}采集队列已手动暂停{% elif browser_collection_run.status == "COMPLETED" %}今日任务已完成{% elif browser_collection_run.status == "PARTIAL" %}任务结束，存在未完成项{% elif browser_collection_run.status == "FAILED" %}任务失败{% elif browser_collection_run.chrome_online %}扩展已连接，等待任务进度{% else %}等待采集扩展连接{% endif %}</p>
+      <p id="browser-worker-state" class="browser-worker-state status pending" role="status" aria-live="polite">{% if not browser_collection_run %}任务尚未启动{% elif browser_collection_run.status == "NEEDS_VERIFICATION" %}等待人工登录或验证{% elif browser_collection_run.status == "PAUSED" and browser_collection_run.paused_reason == "manual_cancel" %}剩余采集队列已取消{% elif browser_collection_run.status == "PAUSED" and browser_collection_run.paused_reason == "collection_partial" %}店铺采集存在部分数据，队列已暂停，等待检查{% elif browser_collection_run.status == "PAUSED" %}采集队列已手动暂停{% elif browser_collection_run.status == "COMPLETED" %}今日任务已完成{% elif browser_collection_run.status == "PARTIAL" %}任务结束，存在未完成项{% elif browser_collection_run.status == "FAILED" %}任务失败{% elif browser_collection_run.chrome_online %}扩展已连接，等待任务进度{% else %}等待采集扩展连接{% endif %}</p>
       <p id="browser-current-item">{% if browser_collection_run and browser_collection_run.current_item %}当前：{{ browser_collection_run.current_item.title or browser_collection_run.current_item.target_url }}{% elif browser_collection_run and browser_collection_run.paused_reason == "manual_cancel" %}剩余任务已取消{% else %}队列空闲{% endif %}</p>
       <p id="browser-challenge-message" class="verification-alert"{% if not browser_collection_run or browser_collection_run.status != "NEEDS_VERIFICATION" or browser_collection_run.paused_reason == "store_identity_review" %} hidden{% endif %}>任务因平台登录或验证暂停。请在本机 Chrome 中正常完成后，扩展会从当前任务继续。</p>
       <small id="browser-last-heartbeat">{% if browser_collection_run and browser_collection_run.last_heartbeat_at %}最近心跳：{{ browser_collection_run.last_heartbeat_at.strftime("%m-%d %H:%M") }}{% else %}尚未收到扩展心跳{% endif %}</small>
@@ -90,6 +91,7 @@
       <button class="browser-filter" type="button" role="tab" aria-selected="false" data-browser-filter="partial"><small>部分数据</small><b data-browser-filter-value="partial">0</b></button>
       <button class="browser-filter" type="button" role="tab" aria-selected="false" data-browser-filter="failed"><small>失败</small><b data-browser-filter-value="failed">0</b></button>
       <button class="browser-filter" type="button" role="tab" aria-selected="false" data-browser-filter="verification"><small>待验证</small><b data-browser-filter-value="verification">0</b></button>
+      <button class="browser-filter" type="button" role="tab" aria-selected="false" data-browser-filter="identity"><small>身份审核</small><b data-browser-filter-value="identity">0</b></button>
     </div>
     <div class="browser-list-heading"><strong id="browser-list-title">待处理任务</strong><span id="browser-list-caption">店铺商品展示页读取已监控商品的 IXSPY 最近 7 日增量；缺失日期标记待补</span></div>
     <div id="browser-collection-items" class="browser-collection-items" role="tabpanel" aria-labelledby="browser-list-title" aria-live="polite"><p class="muted-value">任务列表会在今日任务创建后显示。</p></div>

@@ -92,6 +92,40 @@ test("scheduled candidate scan routes its request to the page collector", async 
   assert.equal(result.page_result.url, expectedPageUrl);
 });
 
+test("candidate history checkpoint rejection is typed so the page scan can skip one candidate", async () => {
+  let callbackError;
+  const listener = makeMessageListener(
+    () => ({ state: "failed" }),
+    async () => ({
+      ok: false,
+      reason: "candidate_history_invalid",
+      failed_checks: ["history_dates"],
+      message: "candidate history invalid",
+    }),
+    async (_message, options) => {
+      try {
+        await options.on_candidate_collected({ platform_product_id: "1005001234567890" });
+      } catch (error) {
+        callbackError = error;
+      }
+      return { state: "ready", page_result: {} };
+    },
+  );
+  const result = await new Promise((resolve) => {
+    listener({
+      type: "STORE_CANDIDATE_SCAN",
+      item_id: 3218,
+      claim_token: "claim-3218",
+      expectedStoreId: "1103864579",
+      expectedPageUrl: "https://www.aliexpress.com/store/1103864579/pages/all-items.html?shop_sortType=orders_desc",
+    }, null, resolve);
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(callbackError.code, "CANDIDATE_HISTORY_INVALID");
+  assert.deepEqual(JSON.parse(JSON.stringify(callbackError.failed_checks)), ["history_dates"]);
+});
+
 test("synchronous collector errors return a failed response", async () => {
   const listener = makeMessageListener(() => { throw new Error("identity failed"); });
   const result = await request(listener, "STORE_IDENTITY");

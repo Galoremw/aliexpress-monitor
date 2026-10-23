@@ -11,6 +11,7 @@
 - 按 `Asia/Shanghai` 自然日保存 IXSPY 直接日增量并汇总店铺监控范围
 - APScheduler 每日采集，以及单商品/全量手动采集
 - FastAPI JSON API、OpenAPI 文档和轻量中文 Dashboard
+- 监控台内置「产品定价表」：普货 WPS 核价、PLA/PETG 3D 打印核价和独立纸箱包装预测
 - AUTO FIRST + BROWSER FALLBACK：HTTP 失败后由专用 Chrome 顺序采集，验证页只允许人工正常通过
 - PostgreSQL + Alembic + Docker Compose 部署
 
@@ -91,8 +92,11 @@ docker compose up -d --build
 本地启动后访问：
 
 - Dashboard: <http://localhost:8000/>
+- 产品定价表: <http://localhost:8000/pricing>（监控台登录后使用，不需要在页面输入 API Token）
 - API 文档: <http://localhost:8000/docs>
 - 健康检查: <http://localhost:8000/health>
+
+产品定价表使用监控台内的固定规则和 WPS 纸箱目录。纸箱预测只根据产品重量、尺寸匹配包装并显示预计总重量，不会改变普货或 3D 打印的定价及运费计算。跨容器调用使用 `PRICING_SERVICE_TOKEN`，仅配置在服务端环境变量中；浏览器页面使用监控台登录会话。
 
 ## Chrome Extension 手动补采
 
@@ -226,3 +230,13 @@ Render 生产环境应设置 `AUTH_COOKIE_SECURE=true`、`AUTH_COOKIE_SAMESITE=n
 2. 每台需要采集的电脑安装并重新加载 `extension/` 扩展。
 3. 扩展的 `extension/config.js` 指向云端 Backend URL，而不是 `127.0.0.1`。
 4. 在扩展弹窗登录同一个账号；AliExpress 和店小秘的登录状态仍属于各自电脑的 Chrome，不会上传到监控系统。
+
+## 选品工作台候选联动
+
+选品工作台通过 `POST /api/integrations/selection/candidates` 导入 AliExpress 候选；同批次重试使用相同 `batch_id` 幂等去重，保留候选来源。Amazon 条目留在选品工作台，不会导入监控台。运行新版本前先应用 Alembic migration。
+
+在选品资格页 `/selection-qualification` 配置“七日总增量”和“有增量天数”两个阈值。默认未配置；两个值都填写后，监控台才会在完整七天 IXSPY 直接日增量满足条件时创建一个店小秘 handoff。完整七天中的 0 会计入；缺失日期、采集失败或非 IXSPY 数据不会按 0 补齐。新候选进入每日浏览器队列的独立商品阶段，不会混入竞品店铺发现任务。要立即补入当日队列，可在该页面点击“加入今日候选采集队列”；随后仍需选择在线采集电脑并点击“开始采集”。
+
+服务端配置 `.env` 中的 `SELECTION_SERVICE_TOKEN` 和 `DIANXIAOMI_SERVICE_TOKEN`。前者只给选品工作台导入使用；后者必须与本机店小秘助手 `.env` 中的值相同，供 Docker 私有网络上的 worker API 验证。不要将令牌放入前端或提交到 Git。候选页面展示每日覆盖、增量、资格状态和店小秘任务；失败任务需人工检查后重试。
+
+本地助手目前还没有完成店小秘真实页面字段映射和单商品验收。启用 handoff 后，如果助手无法确认真实页面，会暂停任务并等待人工处理；模拟流程通过不代表真实采集、编辑或保存到“待发布”已验收。流程终点为“待发布”，不会执行正式发布。

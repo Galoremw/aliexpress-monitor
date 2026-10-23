@@ -32,6 +32,7 @@ async function render() {
       throw error;
     }
     if (route === "/dashboard") return dashboard();
+    if (route === "/selection") return selectionPage();
     if (route === "/stores") return storesPage();
     if (route === "/products") return productsPage();
     if (route === "/manual" || route === "/pending") return pendingPage();
@@ -50,7 +51,7 @@ async function dashboard() {
     api("/api/browser-collection/runs/today").catch(() => null),
     api("/api/integrations/dianxiaomi/status").catch(() => null),
   ]);
-  app.innerHTML = shell("监控台", `<section class="hero"><div><p class="eyebrow">HOSTED BACKEND</p><h1>AliExpress 竞品监控</h1><p class="lead">前端已连接托管 Backend，监控数据不依赖当前电脑上的本地服务。</p></div><span class="status-badge ok">BACKEND_CONNECTED</span></section>${metrics(status)}${browserCollectionPanel(browserRun)}${dianxiaomiPanel(dianxiaomi)}<section class="section"><div class="section-heading"><h2>活跃店铺</h2><a class="button" href="#/stores">查看全部</a></div><div class="list">${stores.map(storeRow).join("") || empty("暂无活跃店铺")}</div></section><section class="section"><div class="section-heading"><h2>快捷操作</h2></div><div class="action-row"><button class="button primary" data-action="collect-all">立即采集全部活跃商品</button><a class="button" href="#/manual">进入人工处理</a></div></section>`);
+  app.innerHTML = shell("监控台", `<section class="hero"><div><p class="eyebrow">HOSTED BACKEND</p><h1>AliExpress 竞品监控</h1><p class="lead">前端已连接托管 Backend，监控数据不依赖当前电脑上的本地服务。</p></div><span class="status-badge ok">BACKEND_CONNECTED</span></section>${metrics(status)}${browserCollectionPanel(browserRun)}${dianxiaomiPanel(dianxiaomi)}<section class="section"><div class="section-heading"><h2>活跃店铺</h2><a class="button" href="#/stores">查看全部</a></div><div class="list">${stores.map(storeRow).join("") || empty("暂无活跃店铺")}</div></section><section class="section"><div class="section-heading"><h2>选品工作台候选</h2><a class="button" href="#/selection">查看资格与七日增量</a></div><p class="lead">查看独立选品范围的 IXSPY 七日数据、筛选阈值和店小秘交接状态。</p></section><section class="section"><div class="section-heading"><h2>快捷操作</h2></div><div class="action-row"><button class="button primary" data-action="collect-all">立即采集全部活跃商品</button><a class="button" href="#/manual">进入人工处理</a></div></section>`);
   bindActions();
   if (!dianxiaomiRefreshTimer) {
     dianxiaomiRefreshTimer = window.setInterval(async () => {
@@ -64,6 +65,52 @@ async function dashboard() {
     }, 5000);
   }
   void products;
+}
+
+async function selectionPage() {
+  const [rule, candidates] = await Promise.all([
+    api("/api/selection-qualification/rule"),
+    api("/api/selection-qualification/candidates"),
+  ]);
+  const candidateRows = candidates.map((candidate) => {
+    const evidence = candidate.evidence || {};
+    const daily = (evidence.daily_values || []).map((value) =>
+      `<span class="selection-day${value === null ? " missing" : value === 0 ? " zero" : ""}">${value === null ? "缺" : escapeHtml(value)}</span>`
+    ).join("");
+    const retry = ["FAILED", "NEEDS_CONFIRMATION"].includes(candidate.handoff_status)
+      ? `<button class="button selection-retry" data-handoff-id="${candidate.handoff_id}">人工检查后重试</button>` : "";
+    const batches = (candidate.provenance || []).map((source) => `<span class="selection-batch">${escapeHtml(source.batch_id)}</span>`).join("");
+    return `<tr><td><a href="#/products/${candidate.product_id}"><strong>${escapeHtml(candidate.title || candidate.aliexpress_product_id)}</strong></a><small>${escapeHtml(candidate.aliexpress_product_id)}</small></td><td>${escapeHtml(evidence.window_start || "—")} → ${escapeHtml(evidence.window_end || "—")}<small>覆盖 ${evidence.observed_days || 0}/7 天 · 合计 ${evidence.total_increment || 0} · 正增量 ${evidence.positive_days || 0} 天</small></td><td class="selection-days">${daily || "等待数据"}</td><td><b class="selection-status ${escapeHtml(String(candidate.qualification_status || "").toLowerCase())}">${escapeHtml(candidate.qualification_status || "—")}</b></td><td><b class="selection-status ${escapeHtml(String(candidate.handoff_status || "none").toLowerCase())}">${escapeHtml(candidate.handoff_status || "未入队")}</b><small>尝试 ${candidate.attempt_count ?? "—"} 次</small>${retry}</td><td>${batches}</td><td><b class="selection-status ${escapeHtml(String(candidate.collection_status || "none").toLowerCase())}">${escapeHtml(candidate.collection_status || "等待每日 run")}</b></td></tr>`;
+  }).join("");
+  app.innerHTML = shell("选品候选资格", `<section class="page-heading"><div><p class="eyebrow">SELECTION WORKBENCH</p><h1>选品候选资格</h1><p>候选会加入每日浏览器 IXSPY 采集 run；采集仍受现有采集电脑和队列启动/暂停控制。缺失日期保持缺失。</p></div><span class="status-badge${rule.configured ? " ok" : ""}">${rule.configured ? "自动入队已启用" : "观察模式 · 自动入队关闭"}</span></section><section class="section selection-rule-panel"><div class="section-heading"><h2>七日筛选规则</h2><span>时区 ${escapeHtml(rule.timezone || "Asia/Shanghai")}</span></div><form id="selection-rule-form" class="selection-rule-form"><label>七日总增量至少<input name="minimum_7d_increment_total" type="number" min="0" step="1" value="${rule.minimum_7d_increment_total ?? ""}" placeholder="留空"></label><label>有增量天数至少<input name="minimum_positive_days" type="number" min="0" max="7" step="1" value="${rule.minimum_positive_days ?? ""}" placeholder="留空"></label><button class="button primary" type="submit">保存规则</button><button class="button" type="button" data-action="selection-evaluate">重新评估</button><button class="button" id="selection-queue-all" type="button">加入今日候选采集队列</button></form><small>两个阈值都填写后才会自动创建一次店小秘任务；两个都留空则只观察。</small></section><section class="section"><div class="section-heading"><h2>工作台导入候选</h2><span>${candidates.length} 个商品</span></div><div class="table-wrap"><table class="selection-table"><thead><tr><th>商品</th><th>七日累计增量与覆盖</th><th>每日 IXSPY 增量</th><th>资格判定</th><th>店小秘任务</th><th>来源批次</th><th>每日采集任务</th></tr></thead><tbody>${candidateRows || `<tr><td colspan="7">尚无选品候选</td></tr>`}</tbody></table></div></section>`);
+  const form = document.querySelector("#selection-rule-form");
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(form);
+    const total = String(data.get("minimum_7d_increment_total") || "").trim();
+    const days = String(data.get("minimum_positive_days") || "").trim();
+    if (Boolean(total) !== Boolean(days)) return alert("请同时填写两个阈值，或同时留空以保持观察模式");
+    await api("/api/selection-qualification/rule", { method: "PUT", body: JSON.stringify({ minimum_7d_increment_total: total ? Number(total) : null, minimum_positive_days: days ? Number(days) : null }) });
+    await selectionPage();
+  });
+  document.querySelector("[data-action='selection-evaluate']").addEventListener("click", async () => {
+    await api("/api/selection-qualification/evaluate", { method: "POST" });
+    await selectionPage();
+  });
+  document.querySelector("#selection-queue-all").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      const result = await api("/api/selection-qualification/collect", { method: "POST" });
+      alert(`已加入今日候选采集队列：${result.queued_count} / ${result.candidate_count}`);
+      await selectionPage();
+    } catch (error) { alert(error.message); button.disabled = false; }
+  });
+  document.querySelectorAll(".selection-retry").forEach((button) => button.addEventListener("click", async () => {
+    if (!confirm("请确认已检查失败原因，是否重新加入店小秘队列？")) return;
+    await api(`/api/integrations/dianxiaomi/handoffs/${button.dataset.handoffId}/resume`, { method: "POST" });
+    await selectionPage();
+  }));
 }
 
 async function storesPage() {
@@ -102,7 +149,7 @@ function isDedicatedWorkerPage() { return new URLSearchParams(location.search).g
 function shell(title, content) {
   const workerMode = isDedicatedWorkerPage();
   document.title = workerMode ? `${title} · 隔离 Chrome 工作模式` : `${title} · AliExpress 竞品监控`;
-  return `<header class="topbar"><a class="brand" href="#/dashboard">AliExpress 竞品监控</a>${workerMode ? '<span class="worker-mode-badge">隔离 Chrome 工作模式</span>' : ''}<nav><a href="#/dashboard">监控台</a><a href="#/stores">店铺</a><a href="#/products">商品</a><a href="#/manual">人工处理</a><button class="nav-logout" data-action="logout">退出登录</button></nav></header><main><div class="page-title">${title}</div>${content}</main>`;
+  return `<header class="topbar"><a class="brand" href="#/dashboard">AliExpress 竞品监控</a>${workerMode ? '<span class="worker-mode-badge">隔离 Chrome 工作模式</span>' : ''}<nav><a href="#/dashboard">监控台</a><a href="#/stores">店铺</a><a href="#/products">商品</a><a href="#/selection">选品候选</a><a href="#/manual">人工处理</a><button class="nav-logout" data-action="logout">退出登录</button></nav></header><main><div class="page-title">${title}</div>${content}</main>`;
 }
 function loginPage() { app.innerHTML = `<main class="auth-page"><section class="auth-panel"><p class="eyebrow">PRIVATE MONITOR</p><h1>登录监控台</h1><p class="auth-hint">登录后访问云端店铺、商品和历史快照。</p><form id="hosted-login"><label>账号<input name="username" autocomplete="username" required></label><label>密码<input name="password" type="password" autocomplete="current-password" required></label><button class="button primary" type="submit">登录</button></form><p id="hosted-login-error" class="warning-text" hidden></p></section></main>`; document.querySelector("#hosted-login").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const error = document.querySelector("#hosted-login-error"); error.hidden = true; try { await api("/api/auth/login", { method: "POST", body: JSON.stringify(Object.fromEntries(new FormData(form))) }); location.hash = "#/dashboard"; await render(); } catch (err) { error.textContent = err.message; error.hidden = false; } }); }
 function metrics(s) { return `<section class="metric-grid">${metric("活跃商品", s.total_products, "今日")}${metric("自动成功", s.auto_success, "今日")}${metric("自动失败", s.auto_failed, "今日")}${metric("手动完成", s.manual_completed, "今日")}${metric("待人工补采", s.pending_manual, "当前")}${metric("成功率", `${s.success_rate}%`, "公开数据采集")}</section>`; }

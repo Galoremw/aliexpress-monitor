@@ -80,9 +80,18 @@ def claim_item(client, worker_id="worker-test"):
 
 
 def request_claim(client, worker_id="worker-test"):
-    return client.post(
+    response = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": worker_id}
     )
+    body = response.json()
+    if body.get("item") and body.get("claim_token"):
+        global _last_claim_credentials
+        _last_claim_credentials = {
+            "item_id": body["item"]["id"],
+            "worker_id": worker_id,
+            "claim_token": body["claim_token"],
+        }
+    return response
 
 
 def test_scheduled_run_is_created_held(client):
@@ -226,7 +235,7 @@ def test_handoff_disables_dispatch_until_old_claims_drain(client, db_session):
     assert next_claim.json()["item"]["id"] != first["id"]
 
 
-def test_concurrent_selected_worker_claims_are_disjoint(client):
+def test_concurrent_store_claim_is_deferred_until_current_store_finishes(client, db_session):
     stores = [create_store(client, store_id) for store_id in ("990206", "990207")]
     for index, store in enumerate(stores):
         create_product(client, store["id"], f"10050099206{index}")
@@ -241,8 +250,16 @@ def test_concurrent_selected_worker_claims_are_disjoint(client):
         "/api/browser-collection/items/claim", json={"worker_id": "worker-galore"}
     ).json()["item"]
 
-    assert first is not None and second is not None
-    assert first["id"] != second["id"]
+    assert first is not None
+    assert second is None
+    first_item = db_session.get(BrowserCollectionItem, first["id"])
+    from app.services.browser_collection import finish_item
+    finish_item(db_session, first_item, "SUCCEEDED")
+    next_claim = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-galore"}
+    ).json()["item"]
+    assert next_claim is not None
+    assert next_claim["id"] != first["id"]
 
 
 def test_collect_all_and_retry_after_completion_leave_run_held(client, db_session):
@@ -356,11 +373,11 @@ def test_store_identity_mismatch_is_not_automatically_retried(client, db_session
     assert response.status_code == 200
     assert db_session.get(BrowserCollectionItem, item_id).status == "FAILED"
     assert response.json()["failed_count"] == 1
-    assert response.json()["status"] == "PAUSED"
-    assert response.json()["paused_reason"] == "store_identity_mismatch"
-    assert response.json()["dispatch_enabled"] is False
+    assert response.json()["status"] == "RUNNING"
+    assert response.json()["paused_reason"] is None
+    assert response.json()["dispatch_enabled"] is True
     assert response.json()["pending_count"] == 1
-    assert request_claim(client).json()["item"] is None
+    assert request_claim(client).json()["item"]["store_id"] != store["id"]
 
 
 def test_store_evidence_rejection_is_not_automatically_retried(client, db_session):
@@ -687,6 +704,76 @@ def test_queued_store_accepts_backend_approved_url_identity(client, db_session):
     assert response.status_code == 200, response.text
 
 
+def test_queued_store_accepts_approved_orders_url_without_fresh_identity_proof(
+    client, db_session
+):
+    store = create_store(client, "990156")
+    product = create_product(client, store["id"], "1005009915601")
+    alias_url = "https://www.aliexpress.com/store/990256/pages/all-items.html?shop_sortType=orders_desc"
+    db_session.add(StoreUrlIdentity(
+        store_id=store["id"],
+        route_store_id="990256",
+        normalized_page_identity="www.aliexpress.com/store/990256/pages/all-items.html",
+        first_observed_url=alias_url,
+        evidence={"page_title": "Reviewed Store", "identity_method": "unverified"},
+    ))
+    db_session.commit()
+    payload = monitored_store_payload(
+        "990156", product["aliexpress_product_id"], date.today(), {}
+    )
+    payload["url"] = alias_url
+    payload["raw_data"]["visited_page_urls"] = [alias_url]
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["items"][0]["status"] == "PARTIAL"
+    assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 1
+
+
+def test_queued_store_defers_approved_alias_with_conflicting_displayed_id(
+    client, db_session
+):
+    store = create_store(client, "990157")
+    product = create_product(client, store["id"], "1005009915701")
+    alias_url = "https://www.aliexpress.com/store/990257/pages/all-items.html?shop_sortType=orders_desc"
+    db_session.add(StoreUrlIdentity(
+        store_id=store["id"],
+        route_store_id="990257",
+        normalized_page_identity="www.aliexpress.com/store/990257/pages/all-items.html",
+        first_observed_url=alias_url,
+        evidence={"ixspy_store_name": "Reviewed Store"},
+    ))
+    db_session.commit()
+    payload = monitored_store_payload(
+        "990157", product["aliexpress_product_id"], date.today(), {}
+    )
+    payload["url"] = alias_url
+    payload["raw_data"]["visited_page_urls"] = [alias_url]
+    payload["raw_data"]["store_identity"] = {
+        "target_store_id": "990157",
+        "route_store_id": "990257",
+        "heading_store_id": "990999",
+        "labeled_store_ids": ["990157"],
+    }
+    client.post("/api/browser-collection/runs/ensure", json={"trigger": "MANUAL"})
+    claim = claim_item(client).json()["item"]
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['id']}/store-discovery",
+        json=add_claim_credentials(payload),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["items"][0]["status"] == "SKIPPED"
+    assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 0
+
+
 def test_queued_store_rejects_backend_approved_url_identity_with_conflicting_name(
     client, db_session
 ):
@@ -722,10 +809,15 @@ def test_queued_store_rejects_backend_approved_url_identity_with_conflicting_nam
         json=add_claim_credentials(payload),
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 200, response.text
+    deferred = db_session.get(BrowserCollectionItem, claim["id"])
+    assert deferred.status == "SKIPPED"
+    assert deferred.error_type == "store_identity_deferred"
+    assert deferred.identity_review_evidence["ixspy_store_name"] == "A Different Store"
+    assert db_session.query(StoreSnapshot).count() == 0
 
 
-def test_queued_store_rejects_alias_with_conflicting_heading_even_if_store_id_label_matches(client):
+def test_queued_store_defers_alias_with_conflicting_heading_even_if_store_id_label_matches(client, db_session):
     store = create_store(client, "990153")
     product = create_product(client, store["id"], "1005009915301")
     target_date = date.today()
@@ -747,7 +839,12 @@ def test_queued_store_rejects_alias_with_conflicting_heading_even_if_store_id_la
         json=add_claim_credentials(payload),
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 200, response.text
+    deferred = db_session.get(BrowserCollectionItem, claim["id"])
+    assert deferred.status == "SKIPPED"
+    assert deferred.error_type == "store_identity_deferred"
+    assert deferred.identity_review_evidence["heading_store_id"] == "990999"
+    assert db_session.query(StoreSnapshot).count() == 0
 
 
 def test_queued_store_accepts_multiple_page_verified_route_aliases(client, db_session):
@@ -847,7 +944,12 @@ def test_queued_store_rejects_route_alias_without_matching_page_identity(client,
         json=add_claim_credentials(payload),
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 200, response.text
+    deferred = db_session.get(BrowserCollectionItem, claim["id"])
+    assert deferred.status == "SKIPPED"
+    assert deferred.error_type == "store_identity_deferred"
+    assert deferred.identity_review_evidence["labeled_store_ids"] == ["990999"]
+    assert db_session.query(StoreSnapshot).count() == 0
 
 
 def test_queued_store_accepts_unique_title_matched_product_id_alias(client, db_session):
@@ -1085,9 +1187,16 @@ def test_retry_store_page_replaces_pending_zero_with_visible_increment(client, d
     partial = client.post(f"/api/browser-collection/items/{first['id']}/store-discovery", json=payload)
     assert partial.status_code == 200
     assert partial.json()["items"][0]["status"] == "PARTIAL"
+    assert partial.json()["status"] == "PARTIAL"
+    assert partial.json()["dispatch_enabled"] is False
 
     retry = client.post(f"/api/browser-collection/items/{first['id']}/retry")
     assert retry.status_code == 200
+    assert retry.json()["status"] == "RUNNING"
+    assert retry.json()["dispatch_enabled"] is False
+    resumed = client.post("/api/browser-collection/runs/start-today")
+    assert resumed.status_code == 200
+    assert resumed.json()["dispatch_enabled"] is True
     second = claim_item(client).json()["item"]
     complete_values = {
         target_date - timedelta(days=offset): offset for offset in range(1, 8)
@@ -1570,7 +1679,11 @@ def test_store_task_rejects_explicit_url_for_another_store(client, db_session):
         json=payload,
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 200, response.text
+    deferred = db_session.get(BrowserCollectionItem, claim["id"])
+    assert deferred.status == "SKIPPED"
+    assert deferred.error_type == "store_identity_deferred"
+    assert deferred.identity_review_evidence["route_store_id"] == "990125"
     assert db_session.query(Product).filter_by(store_id=store["id"]).count() == 1
     assert db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).count() == 0
 
@@ -2153,7 +2266,9 @@ def test_manual_today_rerun_keeps_filter_test_items_skipped(client, db_session):
     assert rerun.json()["pending_count"] == 0
 
 
-def test_challenge_resume_preserves_the_claim_for_the_verified_store_tab(client):
+def test_challenge_resume_preserves_the_claim_for_the_verified_store_tab(
+    client, db_session
+):
     store = create_store(client, "990103")
     create_product(client, store["id"], "100500993001")
     client.post(
@@ -2161,6 +2276,9 @@ def test_challenge_resume_preserves_the_claim_for_the_verified_store_tab(client)
         json={"target_date": date.today().isoformat(), "trigger": "MANUAL"},
     )
     claim = claim_item(client).json()["item"]
+    item = db_session.get(BrowserCollectionItem, claim["id"])
+    item.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=21)
+    db_session.commit()
     paused = client.post(
         f"/api/browser-collection/items/{claim['id']}/challenge",
         json=add_claim_credentials({
@@ -2178,6 +2296,8 @@ def test_challenge_resume_preserves_the_claim_for_the_verified_store_tab(client)
     assert current["id"] == claim["id"]
     assert current["status"] == "RUNNING"
     assert current["attempt_count"] == 1
+    db_session.refresh(item)
+    assert item.claimed_at.replace(tzinfo=timezone.utc) >= datetime.now(timezone.utc) - timedelta(seconds=1)
 
     heartbeat = client.post(
         "/api/browser-collection/heartbeat",
@@ -2466,6 +2586,26 @@ def test_heartbeat_renews_only_reported_running_item_leases(client, db_session):
     assert second_lease == expired_at
 
 
+def test_heartbeat_without_active_claims_renews_worker_owned_store_task(client, db_session):
+    store = create_store(client, "990113")
+    create_product(client, store["id"], "1005009911301")
+    client.post(f"/api/stores/{store['id']}/browser-collection")
+    claimed = claim_item(client).json()["item"]
+    item = db_session.get(BrowserCollectionItem, claimed["id"])
+    item.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+    db_session.commit()
+
+    response = client.post(
+        "/api/browser-collection/heartbeat",
+        json={"worker_id": "worker-test", "extension_version": "0.6.112"},
+    )
+
+    assert response.status_code == 200
+    db_session.refresh(item)
+    assert item.status == "RUNNING"
+    assert item.lease_expires_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) + timedelta(minutes=4)
+
+
 def test_heartbeat_rejects_stale_claim_without_renewing(client, db_session):
     store = create_store(client, "990137")
     create_product(client, store["id"], "1005009913701")
@@ -2681,10 +2821,19 @@ def test_underfilled_daily_store_adds_candidates_and_advances_cursor(client, db_
     page_url = claim["discovery_page_url"]
     low = _history_candidate("1005009931001", target_date, [1, 0, 1, 0, 1, 0, 1])
     high = _history_candidate("1005009931002", target_date, [8, 0, 7, 0, 6, 0, 5])
+    low["orders_rank"] = 2
+    high["orders_rank"] = 3
+    candidate_page = _candidate_page(page_url, "990301", [low, high])
+    candidate_page["diagnostics"]["candidate_progress_rejections"] = [{
+        "product_id": "1005009931000",
+        "orders_rank": 1,
+        "reason": "history_checkpoint_invalid",
+        "failed_checks": ["expected_dates"],
+    }]
     payload = _daily_store_request(
         "990301", page_url, target_date,
         [product["aliexpress_product_id"] for product in tracked],
-        _candidate_page(page_url, "990301", [low, high]),
+        candidate_page,
     )
 
     response = client.post(
@@ -2700,12 +2849,23 @@ def test_underfilled_daily_store_adds_candidates_and_advances_cursor(client, db_
     assert len(active_ids) == 20
     assert high["platform_product_id"] in active_ids
     assert low["platform_product_id"] not in active_ids
+    enrolled = db_session.query(Product).filter_by(
+        store_id=store["id"], aliexpress_product_id=high["platform_product_id"]
+    ).one()
+    assert enrolled.discovery_rank == 3
     state = db_session.get(StorePageDiscoveryState, store["id"])
     assert state.next_page_url.endswith("page=2&sortType=bestmatch_sort&shop_sortType=orders_desc")
     snapshot = db_session.query(StoreSnapshot).filter_by(store_id=store["id"]).one()
     assert snapshot.raw_payload["diagnostics"]["candidate_scan"]["added_ids"] == [
         high["platform_product_id"]
     ]
+    skipped = snapshot.raw_payload["diagnostics"]["candidate_scan"]["skip_reasons"]
+    assert skipped[0] == {
+        "product_id": "1005009931000",
+        "reason": "history_checkpoint_invalid",
+        "failed_checks": ["expected_dates"],
+        "orders_rank": 1,
+    }
 
 
 def test_incomplete_candidate_is_skipped_and_valid_page_advances(client, db_session):
@@ -3034,34 +3194,98 @@ def _report_identity_review(client, claim, payload=None):
     )
 
 
-def test_store_identity_review_pauses_with_structured_evidence(client, db_session):
+def test_store_identity_review_defers_with_structured_evidence(client, db_session):
     store = create_store(client, "990321")
     create_product(client, store["id"], "1005009932101")
+    next_store = create_store(client, "9903211")
+    create_product(client, next_store["id"], "1005009932111")
     claim = claim_item(client).json()
 
     response = _report_identity_review(client, claim)
 
     assert response.status_code == 200, response.text
     item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
-    assert item.status == "NEEDS_VERIFICATION"
-    assert item.error_type == "store_identity_review"
+    assert item.status == "SKIPPED"
+    assert item.error_type == "store_identity_deferred"
     assert item.identity_review_url == _identity_review_payload(claim)["page_url"]
     assert item.identity_review_evidence["identity_error_type"] == "store_identity_mismatch"
     assert item.identity_review_evidence["ixspy_store_name"] == "AMZSTEM Pop Toys Store"
-    assert response.json()["status"] == "NEEDS_VERIFICATION"
-    assert response.json()["paused_reason"] == "store_identity_review"
-    assert response.json()["dispatch_enabled"] is False
-    assert response.json()["current_item"]["identity_review_pending"] is True
+    assert response.json()["status"] == "RUNNING"
+    assert response.json()["paused_reason"] is None
+    assert response.json()["dispatch_enabled"] is True
+    deferred = next(
+        item for item in response.json()["items"] if item["id"] == claim["item"]["id"]
+    )
+    assert deferred["identity_review_pending"] is True
+    assert response.json()["current_item"] is None
 
 
-def test_confirm_store_identity_review_records_alias_and_resumes_current_item(
+def test_legacy_store_identity_review_does_not_block_queue_resume(client, db_session):
+    first_store = create_store(client, "990327")
+    create_product(client, first_store["id"], "1005009932701")
+    next_store = create_store(client, "9903271")
+    create_product(client, next_store["id"], "1005009932711")
+    claim = claim_item(client).json()
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    evidence = _identity_review_payload(claim)
+    item.status = "NEEDS_VERIFICATION"
+    item.error_type = "store_identity_review"
+    item.error_message = "店铺身份待人工审核"
+    item.identity_review_url = evidence["page_url"]
+    item.identity_review_evidence = evidence["evidence"]
+    run = db_session.get(BrowserCollectionRun, item.run_id)
+    run.status = "NEEDS_VERIFICATION"
+    run.paused_reason = "store_identity_review"
+    run.dispatch_enabled = False
+    db_session.commit()
+
+    response = client.post(f"/api/browser-collection/runs/{run.id}/resume")
+
+    assert response.status_code == 200, response.text
+    deferred = db_session.get(BrowserCollectionItem, item.id)
+    assert deferred.status == "SKIPPED"
+    assert deferred.error_type == "store_identity_deferred"
+    assert deferred.identity_review_evidence["identity_review_decision"] == "pending"
+    assert response.json()["status"] == "RUNNING"
+    assert response.json()["dispatch_enabled"] is True
+    assert request_claim(client).json()["item"]["store_id"] == next_store["id"]
+
+
+def test_pending_store_identity_review_does_not_block_queue_resume(client, db_session):
+    store = create_store(client, "990328")
+    create_product(client, store["id"], "1005009932801")
+    next_store = create_store(client, "9903281")
+    create_product(client, next_store["id"], "1005009932811")
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+    paused = client.post(
+        f"/api/browser-collection/runs/{claim['item']['run_id']}/pause"
+    )
+    assert paused.status_code == 200, paused.text
+
+    response = client.post(
+        f"/api/browser-collection/runs/{claim['item']['run_id']}/resume"
+    )
+
+    assert response.status_code == 200
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    assert item.status == "SKIPPED"
+    assert item.error_type == "store_identity_deferred"
+    assert item.identity_review_url is not None
+    run = db_session.get(BrowserCollectionRun, claim["item"]["run_id"])
+    assert run.status == "RUNNING"
+    assert run.dispatch_enabled is True
+
+
+def test_confirm_store_identity_review_records_alias_without_resuming_current_item(
     client, db_session
 ):
     store = create_store(client, "990322")
     create_product(client, store["id"], "1005009932201")
+    next_store = create_store(client, "9903221")
+    create_product(client, next_store["id"], "1005009932211")
     claim = claim_item(client).json()
     assert _report_identity_review(client, claim).status_code == 200
-
     response = client.post(
         f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
     )
@@ -3075,12 +3299,74 @@ def test_confirm_store_identity_review_records_alias_and_resumes_current_item(
     )
     assert alias.source_item_id == claim["item"]["id"]
     assert alias.evidence["ixspy_store_name"] == "AMZSTEM Pop Toys Store"
-    current = response.json()["current_item"]
-    assert current["id"] == claim["item"]["id"]
-    assert current["status"] == "RUNNING"
+    current = next(
+        item for item in response.json()["items"] if item["id"] == claim["item"]["id"]
+    )
+    assert current["status"] == "SKIPPED"
+    assert current["error_type"] == "store_identity_deferred"
+    assert current["identity_review_decision"] == "confirmed"
     assert response.json()["status"] == "RUNNING"
     assert response.json()["paused_reason"] is None
     assert response.json()["dispatch_enabled"] is True
+
+
+def test_identity_confirmation_does_not_resume_a_manually_paused_run(client, db_session):
+    store = create_store(client, "9903222")
+    create_product(client, store["id"], "1005009932221")
+    next_store = create_store(client, "9903223")
+    create_product(client, next_store["id"], "1005009932231")
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+    paused = client.post(
+        f"/api/browser-collection/runs/{claim['item']['run_id']}/pause"
+    )
+    assert paused.status_code == 200, paused.text
+
+    confirmed = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
+    )
+
+    assert confirmed.status_code == 200, confirmed.text
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    run = db_session.get(BrowserCollectionRun, claim["item"]["run_id"])
+    assert item.status == "SKIPPED"
+    assert item.identity_review_evidence["identity_review_decision"] == "confirmed"
+    assert run.status == "PAUSED"
+    assert run.paused_reason == "manual_pause"
+    assert run.dispatch_enabled is False
+
+
+def test_identity_review_evidence_does_not_block_later_platform_challenge_resume(
+    client,
+):
+    store = create_store(client, "990329")
+    create_product(client, store["id"], "1005009932901")
+    next_store = create_store(client, "9903291")
+    create_product(client, next_store["id"], "1005009932911")
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+    confirmed = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
+    )
+    assert confirmed.status_code == 200, confirmed.text
+
+    next_claim = request_claim(client).json()
+    assert next_claim["item"]["store_id"] == next_store["id"]
+    challenge = client.post(
+        f"/api/browser-collection/items/{next_claim['item']['id']}/challenge",
+        json=add_claim_credentials({
+            "error_message": "verification page",
+            "page_url": "https://www.aliexpress.com/punish",
+        }, next_claim["item"]["id"]),
+    )
+    assert challenge.status_code == 200, challenge.text
+    assert challenge.json()["current_item"]["id"] == next_claim["item"]["id"]
+
+    response = client.post(f"/api/browser-collection/runs/{claim['item']['run_id']}/resume")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["current_item"]["status"] == "RUNNING"
+    assert response.json()["current_item"]["id"] == next_claim["item"]["id"]
 
 
 def test_store_collection_items_receive_only_their_store_approved_url_identities(
@@ -3142,7 +3428,7 @@ def test_store_collection_items_receive_only_their_store_approved_url_identities
     }]
 
 
-def test_reject_store_identity_review_fails_item_without_alias_and_keeps_run_paused(
+def test_reject_store_identity_review_records_decision_without_alias_or_pause(
     client, db_session
 ):
     store = create_store(client, "990323")
@@ -3158,13 +3444,23 @@ def test_reject_store_identity_review_fails_item_without_alias_and_keeps_run_pau
 
     assert response.status_code == 200, response.text
     item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
-    assert item.status == "FAILED"
-    assert item.error_type == "store_identity_rejected"
+    assert item.status == "SKIPPED"
+    assert item.error_type == "store_identity_deferred"
+    assert item.identity_review_evidence["identity_review_decision"] == "rejected"
     assert db_session.query(StoreUrlIdentity).count() == 0
-    assert response.json()["status"] == "PAUSED"
-    assert response.json()["paused_reason"] == "store_identity_rejected"
-    assert response.json()["dispatch_enabled"] is False
+    assert response.json()["status"] == "RUNNING"
+    assert response.json()["paused_reason"] is None
+    assert response.json()["dispatch_enabled"] is True
     assert response.json()["pending_count"] == 1
+    repeated = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/reject"
+    )
+    confirm_after_reject = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert confirm_after_reject.status_code == 409
+    assert db_session.query(StoreUrlIdentity).count() == 0
 
 
 def test_identity_confirmation_is_idempotent_and_rejects_cross_store_collision(
@@ -3189,14 +3485,6 @@ def test_identity_confirmation_is_idempotent_and_rejects_cross_store_collision(
     assert repeated_confirm.status_code == 200, repeated_confirm.text
     assert db_session.query(StoreUrlIdentity).count() == 1
 
-    failed = client.post(
-        f"/api/browser-collection/items/{first_claim['item']['id']}/failure",
-        json=add_claim_credentials(
-            {"error_type": "test_terminal", "error_message": "finish first task"},
-            first_claim["item"]["id"],
-        ),
-    )
-    assert failed.status_code == 200, failed.text
     second_claim = request_claim(client).json()
     assert second_claim["item"]["store_id"] == second_store["id"]
     second_review = _report_identity_review(client, second_claim)
@@ -3208,9 +3496,9 @@ def test_identity_confirmation_is_idempotent_and_rejects_cross_store_collision(
 
     assert collision.status_code == 409
     assert db_session.query(StoreUrlIdentity).count() == 1
-    assert db_session.get(BrowserCollectionItem, second_claim["item"]["id"]).status == (
-        "NEEDS_VERIFICATION"
-    )
+    second_item = db_session.get(BrowserCollectionItem, second_claim["item"]["id"])
+    assert second_item.status == "SKIPPED"
+    assert second_item.identity_review_evidence["identity_review_decision"] == "pending"
 
 
 def test_identity_decision_rejects_stale_or_unclaimed_item(client, db_session):
@@ -3245,11 +3533,13 @@ def test_identity_review_rejects_url_evidence_mismatch(client, db_session):
     assert db_session.query(StoreUrlIdentity).count() == 0
 
 
-def test_confirmation_requires_online_selected_worker_without_partial_mutation(
+def test_identity_confirmation_does_not_require_online_selected_worker(
     client, db_session
 ):
     store = create_store(client, "990328")
     create_product(client, store["id"], "1005009932801")
+    next_store = create_store(client, "9903282")
+    create_product(client, next_store["id"], "1005009932821")
     claim = claim_item(client).json()
     assert _report_identity_review(client, claim).status_code == 200
     worker = db_session.get(BrowserCollectionWorker, "worker-test")
@@ -3260,14 +3550,16 @@ def test_confirmation_requires_online_selected_worker_without_partial_mutation(
         f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
     )
 
-    assert response.status_code == 409
-    assert db_session.query(StoreUrlIdentity).count() == 0
+    assert response.status_code == 200, response.text
+    assert db_session.query(StoreUrlIdentity).count() == 1
     item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
     run = db_session.get(BrowserCollectionRun, claim["item"]["run_id"])
-    assert item.status == "NEEDS_VERIFICATION"
-    assert item.error_type == "store_identity_review"
-    assert run.paused_reason == "store_identity_review"
-    assert run.dispatch_enabled is False
+    assert item.status == "SKIPPED"
+    assert item.error_type == "store_identity_deferred"
+    assert item.identity_review_evidence["identity_review_decision"] == "confirmed"
+    assert run.status == "RUNNING"
+    assert run.paused_reason is None
+    assert run.dispatch_enabled is True
 
 
 def test_platform_challenge_cannot_use_identity_decisions(client, db_session):
@@ -3298,3 +3590,359 @@ def test_platform_challenge_cannot_use_identity_decisions(client, db_session):
     assert reject.status_code == 409
     assert challenge.json()["paused_reason"] == "platform_challenge"
     assert db_session.query(StoreUrlIdentity).count() == 0
+
+
+def test_store_identity_review_skips_only_current_store_and_claims_next(
+    client, db_session
+):
+    first_store = create_store(client, "990341")
+    create_product(client, first_store["id"], "1005009934101")
+    second_store = create_store(client, "990342")
+    create_product(client, second_store["id"], "1005009934201")
+    first_claim = claim_item(client).json()
+
+    reviewed = _report_identity_review(client, first_claim)
+    first_item = db_session.get(BrowserCollectionItem, first_claim["item"]["id"])
+    second_claim = request_claim(client).json()
+
+    assert reviewed.status_code == 200, reviewed.text
+    assert first_item.status == "SKIPPED"
+    assert first_item.error_type == "store_identity_deferred"
+    assert second_claim["item"]["store_id"] == second_store["id"]
+    assert reviewed.json()["dispatch_enabled"] is True
+    assert reviewed.json()["status"] == "RUNNING"
+
+
+def test_store_identity_review_preserves_evidence_and_clears_claim(client, db_session):
+    store = create_store(client, "990343")
+    create_product(client, store["id"], "1005009934301")
+    claim = claim_item(client).json()
+    payload = _identity_review_payload(claim)
+
+    response = _report_identity_review(client, claim, payload)
+
+    assert response.status_code == 200, response.text
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    assert item.status == "SKIPPED"
+    assert item.identity_review_url == payload["page_url"]
+    assert item.identity_review_evidence["ixspy_store_name"] == "AMZSTEM Pop Toys Store"
+    assert item.identity_review_evidence["identity_review_decision"] == "pending"
+    assert item.claimed_at is None
+    assert item.lease_expires_at is None
+    assert item.claimed_worker_id is None
+    assert item.claim_token is None
+
+
+def test_store_identity_review_does_not_mutate_another_legacy_claim(client, db_session):
+    first_store = create_store(client, "990344")
+    create_product(client, first_store["id"], "1005009934401")
+    second_store = create_store(client, "990345")
+    create_product(client, second_store["id"], "1005009934501")
+    third_store = create_store(client, "990346")
+    create_product(client, third_store["id"], "1005009934601")
+    first_claim = claim_item(client).json()
+    run_id = first_claim["item"]["run_id"]
+    second = (
+        db_session.query(BrowserCollectionItem)
+        .filter_by(run_id=run_id, target_type="STORE", position=2)
+        .one()
+    )
+    second.status = "RUNNING"
+    second.claimed_worker_id = "worker-test"
+    second.claim_token = "legacy-running-claim"
+    second.claimed_at = datetime.now(timezone.utc)
+    second.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    db_session.commit()
+
+    response = _report_identity_review(client, first_claim)
+
+    assert response.status_code == 200, response.text
+    db_session.refresh(second)
+    assert second.status == "RUNNING"
+    assert second.claim_token == "legacy-running-claim"
+    assert request_claim(client).json()["item"] is None
+
+    second.status = "FAILED"
+    second.completed_at = datetime.now(timezone.utc)
+    second.claimed_at = None
+    second.lease_expires_at = None
+    second.claimed_worker_id = None
+    second.claim_token = None
+    db_session.commit()
+    third_claim = request_claim(client).json()
+    assert third_claim["item"]["store_id"] == third_store["id"]
+
+
+def test_store_discovery_claim_allows_only_one_running_store_per_run(client, db_session):
+    from app.services.browser_collection import finish_item
+
+    first_store = create_store(client, "990347")
+    create_product(client, first_store["id"], "1005009934701")
+    second_store = create_store(client, "990348")
+    create_product(client, second_store["id"], "1005009934801")
+    first_claim = claim_item(client).json()
+
+    concurrent_claim = request_claim(client).json()
+
+    assert concurrent_claim["item"] is None
+    first_item = db_session.get(BrowserCollectionItem, first_claim["item"]["id"])
+    finish_item(db_session, first_item, "SUCCEEDED")
+    next_claim = request_claim(client).json()
+    assert next_claim["item"]["store_id"] == second_store["id"]
+
+
+def test_terminal_store_failure_does_not_pause_dispatch(client, db_session):
+    first_store = create_store(client, "990349")
+    create_product(client, first_store["id"], "1005009934901")
+    second_store = create_store(client, "990350")
+    create_product(client, second_store["id"], "1005009935001")
+    first_claim = claim_item(client).json()
+    first_item_id = first_claim["item"]["id"]
+
+    first_failure = client.post(
+        f"/api/browser-collection/items/{first_item_id}/failure",
+        json=add_claim_credentials({
+            "error_type": "page_not_ready",
+            "error_message": "店铺页未就绪",
+        }, first_item_id),
+    )
+    assert first_failure.json()["status"] == "RUNNING"
+    retry_claim = claim_item(client).json()
+    assert retry_claim["item"]["id"] == first_item_id
+    terminal_failure = client.post(
+        f"/api/browser-collection/items/{first_item_id}/failure",
+        json=add_claim_credentials({
+            "error_type": "page_not_ready",
+            "error_message": "店铺页未就绪",
+        }, first_item_id),
+    )
+
+    assert terminal_failure.status_code == 200
+    assert terminal_failure.json()["status"] == "RUNNING"
+    assert terminal_failure.json()["paused_reason"] is None
+    assert terminal_failure.json()["dispatch_enabled"] is True
+    assert terminal_failure.json()["pending_count"] == 1
+    assert request_claim(client).json()["item"]["store_id"] == second_store["id"]
+
+
+def test_partial_store_result_keeps_dispatching_next_store(client, db_session):
+    first_store = create_store(client, "990351")
+    first_product = create_product(client, first_store["id"], "1005009935101")
+    second_store = create_store(client, "990352")
+    create_product(client, second_store["id"], "1005009935201")
+    claim = claim_item(client).json()
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/store-discovery",
+        json=monitored_store_payload(
+            first_store["aliexpress_store_id"],
+            first_product["aliexpress_product_id"],
+            date.fromisoformat(claim["item"]["target_date"]),
+            {},
+        ),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["items"][0]["status"] == "PARTIAL"
+    assert response.json()["status"] == "RUNNING"
+    assert response.json()["paused_reason"] is None
+    assert response.json()["dispatch_enabled"] is True
+    assert response.json()["pending_count"] == 1
+    assert request_claim(client).json()["item"]["store_id"] == second_store["id"]
+
+
+def test_store_discovery_identity_validation_becomes_deferred_without_snapshot(
+    client, db_session
+):
+    store = create_store(client, "990353")
+    tracked = create_product(client, store["id"], "1005009935301")
+    next_store = create_store(client, "990354")
+    create_product(client, next_store["id"], "1005009935401")
+    target_date = date.today()
+    claim = claim_item(client).json()
+    item_id = claim["item"]["id"]
+    discovery_state = db_session.get(StorePageDiscoveryState, store["id"])
+    original_cursor = discovery_state.next_page_url
+    observed_url = (
+        "https://www.aliexpress.com/store/990999/pages/all-items.html"
+        "?sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
+    payload = monitored_store_payload(
+        "990353", tracked["aliexpress_product_id"], target_date, {}
+    )
+    payload["url"] = observed_url
+    payload["raw_data"]["visited_page_urls"] = [observed_url]
+    payload["raw_data"]["store_identity"] = {
+        "route_store_id": "990999",
+        "heading_store_id": "990999",
+        "labeled_store_ids": ["990999"],
+        "page_title": "Observed page title",
+        "ixspy_store_name": "Observed IXSPY Store",
+        "identity_method": "ixspy_store_name",
+    }
+
+    response = client.post(
+        f"/api/browser-collection/items/{item_id}/store-discovery",
+        json=add_claim_credentials(payload, item_id),
+    )
+
+    assert response.status_code == 200, response.text
+    item = db_session.get(BrowserCollectionItem, item_id)
+    assert item.status == "SKIPPED"
+    assert item.error_type == "store_identity_deferred"
+    assert item.identity_review_url == observed_url
+    assert item.identity_review_evidence["route_store_id"] == "990999"
+    assert item.identity_review_evidence["ixspy_store_name"] == "Observed IXSPY Store"
+    assert db_session.query(StoreSnapshot).count() == 0
+    assert db_session.query(ProductSnapshot).count() == 0
+    assert db_session.query(ProductDailyMetric).count() == 0
+    assert db_session.get(StorePageDiscoveryState, store["id"]).next_page_url == original_cursor
+    assert response.json()["dispatch_enabled"] is True
+    assert response.json()["status"] == "RUNNING"
+
+
+def test_identity_confirm_records_alias_without_resuming_or_requeueing(
+    client, db_session
+):
+    store = create_store(client, "990358")
+    create_product(client, store["id"], "1005009935801")
+    next_store = create_store(client, "990359")
+    create_product(client, next_store["id"], "1005009935901")
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+    item_id = claim["item"]["id"]
+    run_id = claim["item"]["run_id"]
+    run = db_session.get(BrowserCollectionRun, run_id)
+    before = (run.status, run.paused_reason, run.dispatch_enabled)
+
+    response = client.post(
+        f"/api/browser-collection/items/{item_id}/identity-review/confirm"
+    )
+
+    assert response.status_code == 200, response.text
+    item = db_session.get(BrowserCollectionItem, item_id)
+    alias = db_session.query(StoreUrlIdentity).one()
+    assert alias.store_id == store["id"]
+    assert alias.source_item_id == item_id
+    assert item.status == "SKIPPED"
+    assert item.error_type == "store_identity_deferred"
+    assert item.identity_review_evidence["identity_review_decision"] == "confirmed"
+    assert response.json()["items"][0]["identity_review_pending"] is False
+    assert (run.status, run.paused_reason, run.dispatch_enabled) == before
+
+
+def test_identity_reject_records_decision_without_alias_or_pausing_queue(
+    client, db_session
+):
+    store = create_store(client, "990360")
+    create_product(client, store["id"], "1005009936001")
+    next_store = create_store(client, "990361")
+    create_product(client, next_store["id"], "1005009936101")
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+    run = db_session.get(BrowserCollectionRun, claim["item"]["run_id"])
+
+    response = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/reject"
+    )
+
+    assert response.status_code == 200, response.text
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    assert item.status == "SKIPPED"
+    assert item.error_type == "store_identity_deferred"
+    assert item.identity_review_evidence["identity_review_decision"] == "rejected"
+    assert db_session.query(StoreUrlIdentity).count() == 0
+    assert run.status == "RUNNING"
+    assert run.paused_reason is None
+    assert run.dispatch_enabled is True
+
+
+def test_only_confirmed_identity_deferred_item_can_be_requeued(client, db_session):
+    from app.services.browser_collection import finish_item
+
+    stores = []
+    for store_id, product_id in [
+        ("990362", "1005009936201"),
+        ("990363", "1005009936301"),
+        ("990364", "1005009936401"),
+    ]:
+        store = create_store(client, store_id)
+        create_product(client, store["id"], product_id)
+        stores.append(store)
+
+    first_claim = claim_item(client).json()
+    first_id = first_claim["item"]["id"]
+    assert _report_identity_review(
+        client, first_claim, _identity_review_payload(first_claim, route_store_id="1105179517")
+    ).status_code == 200
+    pending_retry = client.post(f"/api/browser-collection/items/{first_id}/retry")
+    assert pending_retry.status_code == 409
+    confirmed = client.post(
+        f"/api/browser-collection/items/{first_id}/identity-review/confirm"
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    before_dispatch = confirmed.json()["dispatch_enabled"]
+    requeued = client.post(f"/api/browser-collection/items/{first_id}/retry")
+    assert requeued.status_code == 200, requeued.text
+    first_item = db_session.get(BrowserCollectionItem, first_id)
+    assert first_item.status == "PENDING"
+    assert first_item.identity_review_evidence["identity_review_decision"] == "confirmed"
+    assert requeued.json()["dispatch_enabled"] == before_dispatch
+
+    finish_item(db_session, first_item, "SUCCEEDED")
+    second_claim = claim_item(client).json()
+    second_id = second_claim["item"]["id"]
+    assert second_claim["item"]["store_id"] == stores[1]["id"]
+    assert _report_identity_review(
+        client, second_claim, _identity_review_payload(second_claim, route_store_id="1105179518")
+    ).status_code == 200
+    assert client.post(
+        f"/api/browser-collection/items/{second_id}/identity-review/reject"
+    ).status_code == 200
+    assert client.post(f"/api/browser-collection/items/{second_id}/retry").status_code == 409
+
+    third_item = (
+        db_session.query(BrowserCollectionItem)
+        .filter_by(run_id=first_claim["item"]["run_id"], store_id=stores[2]["id"])
+        .one()
+    )
+    third_item.status = "SKIPPED"
+    third_item.error_type = "queue_cancelled"
+    third_item.completed_at = datetime.now(timezone.utc)
+    db_session.commit()
+    assert client.post(
+        f"/api/browser-collection/items/{third_item.id}/retry"
+    ).status_code == 409
+
+
+def test_confirmed_deferred_item_can_reuse_an_existing_store_url_identity(
+    client, db_session
+):
+    store = create_store(client, "990365")
+    create_product(client, store["id"], "1005009936501")
+    alias_url = "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc"
+    db_session.add(StoreUrlIdentity(
+        store_id=store["id"],
+        route_store_id="1105179516",
+        normalized_page_identity=(
+            "www.aliexpress.com/store/1105179516/pages/all-items.html"
+        ),
+        first_observed_url=alias_url,
+        evidence={"ixspy_store_name": "AMZSTEM Pop Toys Store"},
+    ))
+    db_session.commit()
+    claim = claim_item(client).json()
+    assert _report_identity_review(client, claim).status_code == 200
+
+    confirmed = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/identity-review/confirm"
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    requeued = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/retry"
+    )
+
+    assert requeued.status_code == 200, requeued.text
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    assert item.status == "PENDING"
+    assert item.identity_review_evidence["identity_review_decision"] == "confirmed"

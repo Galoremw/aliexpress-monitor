@@ -413,7 +413,11 @@ def save_store_page_candidates(
     active_products = list(
         db.scalars(
             select(Product)
-            .where(Product.store_id == store.id, Product.status == "active")
+            .where(
+                Product.store_id == store.id,
+                Product.status == "active",
+                Product.monitor_scope == "competitor",
+            )
             .order_by(Product.id)
         )
     )
@@ -421,7 +425,9 @@ def save_store_page_candidates(
     inactive_ids = set(
         db.scalars(
             select(Product.aliexpress_product_id).where(
-                Product.store_id == store.id, Product.status == "inactive"
+                Product.store_id == store.id,
+                Product.status == "inactive",
+                Product.monitor_scope == "competitor",
             )
         )
     )

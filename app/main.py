@@ -9,11 +9,13 @@ from fastapi.staticfiles import StaticFiles
 from app.api.router import router
 from app.api.reviews import router as reviews_router
 from app.api.auth import router as auth_router
+from app.api.pricing import router as pricing_router
 from app.core.config import get_settings
 from app.db.session import get_session_factory
 from app.core.auth import ensure_bootstrap_admin
 from app.scheduler import create_scheduler
 from app.dashboard.router import router as dashboard_router
+from app.dashboard.pricing import router as pricing_page_router
 
 settings = get_settings()
 # Keep the first-party local and Pages entry points available even when a
@@ -62,6 +64,8 @@ app.include_router(router)
 app.include_router(reviews_router)
 app.include_router(auth_router)
 app.include_router(dashboard_router)
+app.include_router(pricing_router)
+app.include_router(pricing_page_router)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 

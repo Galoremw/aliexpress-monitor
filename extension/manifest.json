@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AliExpress 竞品监控采集助手",
-  "version": "0.6.103",
+  "version": "0.6.114",
   "description": "优先读取 IXSPY 店铺列表卡片的最近 7 日增量，并采集公开商品信息与评论。",
   "permissions": ["activeTab", "scripting", "tabs", "tabGroups", "webNavigation", "alarms", "notifications", "storage"],
   "host_permissions": [
@@ -10,7 +10,7 @@
     "https://aliexpress-monitor-api.onrender.com/*",
     "http://127.0.0.1:3000/*",
     "http://localhost:3000/*",
-    "http://192.168.66.107:3000/*",
+    "http://192.168.66.115:3000/*",
     "http://127.0.0.1:8000/*",
     "http://localhost:8000/*",
     "https://www.dianxiaomi.com/*",
@@ -50,7 +50,7 @@
       "matches": [
         "http://127.0.0.1:3000/*",
         "http://localhost:3000/*",
-        "http://192.168.66.107:3000/*",
+        "http://192.168.66.115:3000/*",
         "http://127.0.0.1:8000/*",
         "https://galoremw.github.io/*",
         "https://*.onrender.com/*"

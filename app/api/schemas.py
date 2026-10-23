@@ -79,6 +79,7 @@ class ProductRead(BaseModel):
     title: str | None
     status: str
     business_role: str
+    monitor_scope: str = "competitor"
     discovery_source: str
     discovery_rank: int | None
     discovered_at: datetime | None
@@ -144,6 +145,7 @@ class BrowserExtensionCollectionRequest(BaseModel):
 
 class BrowserStoreProduct(BaseModel):
     platform_product_id: str = Field(min_length=1, max_length=128)
+    orders_rank: int | None = Field(default=None, ge=1, le=50)
     url: str = Field(min_length=1, max_length=2048)
     title: str | None = Field(default=None, max_length=1024)
     observed_product_id: str | None = Field(default=None, max_length=128)
@@ -367,6 +369,7 @@ class BrowserCollectionItemRead(BaseModel):
     identity_review_url: str | None = None
     identity_review_evidence: dict[str, Any] | None = None
     identity_review_pending: bool = False
+    identity_review_decision: str | None = None
     monitored_product_ids: list[str] = Field(default_factory=list)
     monitored_products: list[BrowserCollectionMonitoredProductRead] = Field(default_factory=list)
     discovery_page_url: str | None = None
@@ -656,6 +659,7 @@ class DianxiaomiHandoffStatusRequest(BaseModel):
     worker_id: str | None = Field(default=None, max_length=128)
     error_type: str | None = Field(default=None, max_length=128)
     error_message: str | None = Field(default=None, max_length=2000)
+    detail: dict[str, Any] | None = None
 
 
 class DianxiaomiHandoffRead(BaseModel):
@@ -675,6 +679,8 @@ class DianxiaomiHandoffRead(BaseModel):
     worker_id: str | None
     error_type: str | None
     error_message: str | None
+    attempt_count: int = 0
+    detail: dict[str, Any] | None = None
 
 
 class DianxiaomiHandoffBatchRead(BaseModel):
@@ -683,3 +689,47 @@ class DianxiaomiHandoffBatchRead(BaseModel):
     queued_count: int
     reused_count: int
     items: list[DianxiaomiHandoffRead]
+
+
+class SelectionCandidateImportItem(BaseModel):
+    platform: Literal["aliexpress"] = "aliexpress"
+    aliexpress_product_id: str = Field(min_length=6, max_length=25, pattern=r"^\d+$")
+    url: str = Field(min_length=1, max_length=2048)
+    title: str | None = Field(default=None, max_length=1024)
+    source_candidate_id: str | None = Field(default=None, max_length=128)
+    source: str | None = Field(default=None, max_length=128)
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SelectionCandidatesBatchImport(BaseModel):
+    batch_id: str = Field(min_length=1, max_length=128)
+    candidates: list[SelectionCandidateImportItem] = Field(min_length=1, max_length=500)
+
+
+class SelectionQualificationRuleWrite(BaseModel):
+    minimum_7d_increment_total: int | None = Field(default=None, ge=0)
+    minimum_positive_days: int | None = Field(default=None, ge=0, le=7)
+
+
+class SelectionQualificationRuleRead(BaseModel):
+    minimum_7d_increment_total: int | None
+    minimum_positive_days: int | None
+    configured: bool
+    timezone: str
+
+
+class DianxiaomiWorkerStatusRequest(BaseModel):
+    status: str = Field(
+        pattern="^(CLAIMED|OPENED|FILLED|COLLECTING|SUCCEEDED|FAILED|NEEDS_CONFIRMATION)$"
+    )
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class DianxiaomiWorkerHandoffRead(BaseModel):
+    handoff_id: int
+    batch_id: str
+    aliexpress_product_id: str
+    url: str
+    attempt_count: int
+    status: str
+    detail: dict[str, Any] | None = None
