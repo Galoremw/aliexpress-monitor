@@ -835,8 +835,6 @@ function storeRouteAliasIsVerified(
   const currentName = proof.ixspy_store_name;
   const namesConflict = Boolean(savedName && currentName
     && normalizedStoreName(savedName) !== normalizedStoreName(currentName));
-  const proofPage = storeOrdersUrlIdentity(proof.page_url);
-  const currentPage = storeOrdersUrlIdentity(url);
   return Boolean(approvedAlias
     && proof.identity_method === "backend_approved_url_alias"
     && proofPage?.route_store_id === currentPage?.route_store_id

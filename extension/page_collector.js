@@ -1,7 +1,7 @@
 (function () {
   if (globalThis.AliExpressMonitorPageCollector) return;
 
-  const PAGE_COLLECTOR_VERSION = "0.6.105";
+  const PAGE_COLLECTOR_VERSION = "0.6.122";
   let verifiedStoreIdentity = null;
   const STORE_MORE_ACTION_WAIT_MS = 5000;
   const STORE_PRODUCT_HISTORY_TIMEOUT_MS = 75 * 1000;
@@ -826,7 +826,7 @@
       .filter((value) => typeof value === "string")
       .map((value) => clean(value))
       .filter((value) => value && value.length <= 255
-        && !/^(?:aliexpress|shop\s*\d+\s+store)$/i.test(value))];
+        && !/^(?:aliexpress|shop\s*\d+\s+store)$/i.test(value)))];
   }
 
   function storeIdentityProductEvidence(options = {}, ixspyStoreName = null) {
