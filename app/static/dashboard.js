@@ -745,10 +745,22 @@ function renderBrowserCollectionItem(item) {
     identityEvidence.heading_store_id,
     ...(Array.isArray(identityEvidence.labeled_store_ids) ? identityEvidence.labeled_store_ids : []),
   ].filter((id) => id != null && String(id)).map(String);
+  const matchedProductIds = Array.isArray(identityEvidence.matched_product_ids)
+    ? identityEvidence.matched_product_ids.map(String)
+    : [];
+  const productMatchCount = Number.isInteger(identityEvidence.catalog_match_count)
+    ? identityEvidence.catalog_match_count
+    : matchedProductIds.length;
+  const observedStoreName = identityEvidence.ixspy_store_name
+    || identityEvidence.matched_store_name
+    || (Array.isArray(identityEvidence.observed_store_names)
+      ? identityEvidence.observed_store_names[0]
+      : null);
+  const expectedStoreName = identityEvidence.expected_store_name || item.title || "未识别";
   const reviewDetails = identityDeferred
     ? `<div class="browser-identity-evidence"><strong>${identityReview ? "人工核验店铺身份" : "店铺身份审核记录"}</strong><span>采集页面：${reviewedUrl
       ? `<a class="browser-identity-url" href="${reviewedUrl}" target="_blank" rel="noreferrer">${reviewedUrl}</a>`
-      : "未记录"}</span><span>页面标题：${escapeDianxiaomiHtml(identityEvidence.page_title || "未识别")}</span><span>IXSPY 店铺名称：${escapeDianxiaomiHtml(identityEvidence.ixspy_store_name || "未识别")}</span><span>页面显示 ID：${escapeDianxiaomiHtml(visibleStoreIds.join("、") || "未识别")}</span></div>`
+      : "未记录"}</span><span>页面标题：${escapeDianxiaomiHtml(identityEvidence.page_title || "未识别")}</span><span>任务店铺名称：${escapeDianxiaomiHtml(expectedStoreName)}</span><span>页面店铺名称：${escapeDianxiaomiHtml(observedStoreName || "未识别")}</span><span>页面显示 ID：${escapeDianxiaomiHtml(visibleStoreIds.join("、") || "未识别")}</span><span>命中监控商品：${escapeDianxiaomiHtml(`${productMatchCount} 个${matchedProductIds.length ? `（${matchedProductIds.join("、")}）` : ""}`)}</span><span>店铺名称匹配：${identityEvidence.store_name_match === true ? "是" : "否"}</span></div>`
     : "";
   const action = identityReview
     ? `<div class="browser-identity-actions"><button class="link-button identity-confirm" type="button" data-browser-item-action="identity-confirm" data-browser-item-id="${item.id}">确定无误</button><button class="link-button identity-reject" type="button" data-browser-item-action="identity-reject" data-browser-item-id="${item.id}">错误</button></div>`

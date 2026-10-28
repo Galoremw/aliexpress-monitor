@@ -50,6 +50,8 @@
       monitored_product_ids: message.monitored_product_ids,
       monitored_products: message.monitored_products,
       expected_store_id: message.expected_store_id,
+      expected_store_name: message.expected_store_name,
+      identity_monitored_product_ids: message.identity_monitored_product_ids,
       verified_store_identity: message.verified_store_identity,
       approved_store_url_identities: message.approved_store_url_identities || [],
     };

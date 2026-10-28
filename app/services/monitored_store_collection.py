@@ -218,6 +218,7 @@ def _verified_route_alias_ids(
     store: Store,
     raw: dict,
     candidate_page: BrowserStoreCandidatePage | None,
+    target_product_ids: set[str],
 ) -> set[str]:
     expected_store_id = store.aliexpress_store_id
     approved_aliases = {
@@ -226,29 +227,97 @@ def _verified_route_alias_ids(
             select(StoreUrlIdentity).where(StoreUrlIdentity.store_id == store.id)
         )
     }
-    evidence: list[tuple[dict, str | None]] = []
+    evidence: list[tuple[dict, str | None, dict | None]] = []
     identity = raw.get("store_identity")
     if isinstance(identity, dict):
-        evidence.append((identity, None))
+        identity_url = identity.get("page_url")
+        matching_scan = next((
+            scan for scan in _diagnostic_records(raw, "page_scans", 10)
+            if isinstance(identity_url, str) and scan.get("url") == identity_url
+        ), None)
+        evidence.append((identity, identity_url if isinstance(identity_url, str) else None, matching_scan))
     for page_scan in _diagnostic_records(raw, "page_scans", 10):
         scan_identity = page_scan.get("store_identity")
         scan_url = page_scan.get("url")
         if isinstance(scan_identity, dict):
-            evidence.append((scan_identity, scan_url if isinstance(scan_url, str) else None))
+            evidence.append((
+                scan_identity,
+                scan_url if isinstance(scan_url, str) else None,
+                page_scan,
+            ))
     if candidate_page is not None:
         page_scan = candidate_page.diagnostics.get("page_scan")
         if isinstance(page_scan, dict) and isinstance(page_scan.get("store_identity"), dict):
             scan_url = page_scan.get("url")
-            evidence.append((page_scan["store_identity"], scan_url if isinstance(scan_url, str) else None))
+            evidence.append((
+                page_scan["store_identity"],
+                scan_url if isinstance(scan_url, str) else None,
+                page_scan,
+            ))
+
+    known_store_names = {_normalized_store_name(store.name)}
+    known_store_names.update(
+        _normalized_store_name(alias.evidence.get("ixspy_store_name"))
+        for alias in approved_aliases.values()
+        if isinstance(alias.evidence, dict)
+        and isinstance(alias.evidence.get("ixspy_store_name"), str)
+        and alias.evidence.get("ixspy_store_name").strip()
+    )
+
+    def product_fingerprint_matches(page_identity: dict, route_store_id: str, page_url: str | None, page_scan: dict | None) -> bool:
+        if page_identity.get("target_store_id") != expected_store_id:
+            return False
+        identity_url = page_identity.get("page_url") or page_url
+        if not isinstance(identity_url, str) or not isinstance(page_scan, dict):
+            return False
+        scan_url = page_scan.get("url")
+        try:
+            identity_route_id, identity_page = normalize_store_orders_identity(identity_url)
+            scan_route_id, scan_page = normalize_store_orders_identity(scan_url)
+        except (TypeError, ValueError):
+            return False
+        if (
+            identity_route_id != route_store_id
+            or scan_route_id != route_store_id
+            or identity_page != scan_page
+            or page_url and page_url != identity_url
+        ):
+            return False
+        visible_ids = page_scan.get("visible_product_ids", page_scan.get("candidate_ids", []))
+        if not isinstance(visible_ids, list):
+            return False
+        matched_ids = {str(value) for value in visible_ids} & target_product_ids
+        if len(matched_ids) >= 2:
+            return True
+        if len(matched_ids) != 1:
+            return False
+        observed_names = [
+            page_identity.get("ixspy_store_name"),
+            page_identity.get("matched_store_name"),
+            *(
+                page_identity.get("observed_store_names", [])
+                if isinstance(page_identity.get("observed_store_names"), list)
+                else []
+            ),
+        ]
+        return any(
+            isinstance(name, str)
+            and name.strip()
+            and _normalized_store_name(name) in known_store_names
+            for name in observed_names
+        )
 
     aliases = set()
     conflicting_aliases = set()
-    for page_identity, page_url in evidence:
+    for page_identity, page_url, page_scan in evidence:
         route_store_id = page_identity.get("route_store_id")
         heading_store_id = page_identity.get("heading_store_id")
         labeled_store_ids = page_identity.get("labeled_store_ids", [])
         if not isinstance(route_store_id, str) or not route_store_id.isdigit():
             continue
+        fingerprint_verified = product_fingerprint_matches(
+            page_identity, route_store_id, page_url, page_scan,
+        )
         approved_alias = approved_aliases.get(route_store_id)
         if approved_alias is not None and route_store_id != expected_store_id:
             has_id_conflict = (
@@ -265,8 +334,10 @@ def _verified_route_alias_ids(
                 and current_name.strip()
                 and _normalized_store_name(saved_name) != _normalized_store_name(current_name)
             )
-            if has_id_conflict or names_conflict:
+            if (has_id_conflict or names_conflict) and not fingerprint_verified:
                 conflicting_aliases.add(route_store_id)
+            elif fingerprint_verified:
+                aliases.add(route_store_id)
             elif page_identity.get("identity_method") == "backend_approved_url_alias":
                 observed_page_url = page_identity.get("page_url") or page_url
                 try:
@@ -284,6 +355,8 @@ def _verified_route_alias_ids(
                         and (not page_url or page_url == observed_page_url)
                     ):
                         aliases.add(route_store_id)
+        if fingerprint_verified and route_store_id != expected_store_id:
+            aliases.add(route_store_id)
         has_matching_identity = (
             heading_store_id == expected_store_id
             or isinstance(labeled_store_ids, list)
@@ -312,7 +385,7 @@ def _verified_route_alias_ids(
             str(value) != expected_store_id
             for value in page_identity.get("labeled_store_ids", [])
         )
-        for page_identity, _ in evidence
+        for page_identity, _, _ in evidence
     )
     if not has_displayed_id_conflict:
         visited_urls = raw.get("visited_page_urls")
@@ -569,7 +642,9 @@ def save_monitored_store_observation(
     if raw.get("history_target_date") != item.run.target_date.isoformat():
         raise ValueError("采集日期与任务日期不一致")
     candidate_page = payload.candidate_page
-    route_alias_ids = _verified_route_alias_ids(db, store, raw, candidate_page)
+    route_alias_ids = _verified_route_alias_ids(
+        db, store, raw, candidate_page, set(target_ids),
+    )
     identity = raw.get("store_identity")
     if (
         isinstance(identity, dict)

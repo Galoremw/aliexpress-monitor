@@ -637,6 +637,8 @@ async function sendCollectMessage(
       claim_token: storeProgressContext.claimToken,
       monitored_products: storeProgressContext.monitoredProducts || [],
       expected_store_id: storeProgressContext.expectedStoreId,
+      expected_store_name: storeProgressContext.expectedStoreName || null,
+      identity_monitored_product_ids: storeProgressContext.identityMonitoredProductIds || [],
       verified_store_identity: storeProgressContext.verifiedStoreIdentity || null,
       approved_store_url_identities: storeProgressContext.approvedStoreUrlIdentities || [],
     } : {}),
@@ -656,6 +658,8 @@ async function sendStoreCandidateScanMessage(tabId, item, storeId, pageUrl, stor
     item_id: item.id,
     claim_token: (await automationState()).automationClaimToken,
     expectedStoreId: storeId,
+    expectedStoreName: item.title,
+    monitoredProductIds: item.monitored_product_ids || [],
     expectedPageUrl: pageUrl,
     verifiedStoreIdentity: storeIdentity || null,
     approvedStoreUrlIdentities: item.approved_store_url_identities || [],
@@ -752,23 +756,79 @@ function normalizedStoreName(value) {
     : "";
 }
 
-function storeIdentityProofHasConflict(proof, storeId) {
+function storeIdentityMatchedProductIds(proof, monitoredProductIds = []) {
+  const targetIds = new Set((Array.isArray(monitoredProductIds) ? monitoredProductIds : []).map(String));
+  const visibleIds = new Set((Array.isArray(proof?.visible_product_ids) ? proof.visible_product_ids : []).map(String));
+  return new Set((Array.isArray(proof?.matched_product_ids) ? proof.matched_product_ids : [])
+    .map(String)
+    .filter((productId) => targetIds.has(productId) && visibleIds.has(productId)));
+}
+
+function storeIdentityFingerprintIsVerified(
+  proof,
+  monitoredProductIds = [],
+  expectedStoreName = null,
+  approvedIdentities = [],
+) {
+  const matchedIds = storeIdentityMatchedProductIds(proof, monitoredProductIds);
+  if (matchedIds.size >= 2) return true;
+  if (matchedIds.size !== 1) return false;
+  const referenceNames = [expectedStoreName,
+    ...(Array.isArray(approvedIdentities)
+      ? approvedIdentities.map((identity) => identity?.evidence?.ixspy_store_name)
+      : [])]
+    .map(normalizedStoreName)
+    .filter(Boolean);
+  const observedNames = [proof?.ixspy_store_name, proof?.matched_store_name,
+    ...(Array.isArray(proof?.observed_store_names) ? proof.observed_store_names : [])]
+    .map(normalizedStoreName)
+    .filter(Boolean);
+  return observedNames.some((name) => referenceNames.includes(name));
+}
+
+function storeIdentityProofHasConflict(
+  proof,
+  storeId,
+  monitoredProductIds = [],
+  expectedStoreName = null,
+  approvedIdentities = [],
+) {
+  if (storeIdentityFingerprintIsVerified(
+    proof, monitoredProductIds, expectedStoreName, approvedIdentities,
+  )) return false;
   const displayedIds = [proof?.heading_store_id, ...(proof?.labeled_store_ids || [])]
     .filter((value) => value != null).map(String);
   return displayedIds.some((id) => id !== String(storeId));
 }
 
-function storeRouteAliasIsVerified(url, storeId, approvedIdentities, proof) {
+function storeRouteAliasIsVerified(
+  url,
+  storeId,
+  approvedIdentities,
+  proof,
+  monitoredProductIds = [],
+  expectedStoreName = null,
+) {
   const page = storeOrdersPageIdentity(url);
   if (!page || page.storeId === String(storeId) || !proof
     || proof.target_store_id !== String(storeId)
     || String(proof.route_store_id) !== page.storeId
-    || storeIdentityProofHasConflict(proof, storeId)) return false;
+    || storeIdentityProofHasConflict(
+      proof, storeId, monitoredProductIds, expectedStoreName, approvedIdentities,
+    )) return false;
+  const proofPage = storeOrdersUrlIdentity(proof.page_url);
+  const currentPage = storeOrdersUrlIdentity(url);
+  const sameRoutePage = proofPage?.route_store_id === currentPage?.route_store_id
+    && proofPage?.normalized_page_identity === currentPage?.normalized_page_identity;
+  const fingerprintVerified = storeIdentityFingerprintIsVerified(
+    proof, monitoredProductIds, expectedStoreName, approvedIdentities,
+  );
+  if (fingerprintVerified && sameRoutePage) return true;
   const matchingDisplayedId = String(proof.heading_store_id || "") === String(storeId)
     || (Array.isArray(proof.labeled_store_ids)
       && proof.labeled_store_ids.map(String).includes(String(storeId)));
   if (matchingDisplayedId) return true;
-  if (proof.page_url !== url) return false;
+  if (!sameRoutePage) return false;
 
   const approvedAlias = approvedStoreUrlIdentity(url, storeId, approvedIdentities);
   const savedName = approvedAlias?.evidence?.ixspy_store_name;
@@ -784,7 +844,14 @@ function storeRouteAliasIsVerified(url, storeId, approvedIdentities, proof) {
     && !namesConflict);
 }
 
-function storeOrdersUrlAllowedForTask(url, storeId, approvedIdentities = [], identityProof = null) {
+function storeOrdersUrlAllowedForTask(
+  url,
+  storeId,
+  approvedIdentities = [],
+  identityProof = null,
+  monitoredProductIds = [],
+  expectedStoreName = null,
+) {
   const page = storeOrdersPageIdentity(url);
   if (!page) return false;
   if (page.storeId === String(storeId)) return true;
@@ -797,8 +864,13 @@ function storeOrdersUrlAllowedForTask(url, storeId, approvedIdentities = [], ide
     && identityProof.target_store_id === String(storeId)
     && proofPage?.route_store_id === currentPage?.route_store_id
     && proofPage?.normalized_page_identity === currentPage?.normalized_page_identity
-    && explicitIds.includes(String(storeId))
-    && !storeIdentityProofHasConflict(identityProof, storeId));
+    && ((explicitIds.includes(String(storeId))
+      && !storeIdentityProofHasConflict(
+        identityProof, storeId, monitoredProductIds, expectedStoreName, approvedIdentities,
+      ))
+      || storeIdentityFingerprintIsVerified(
+        identityProof, monitoredProductIds, expectedStoreName, approvedIdentities,
+      )));
 }
 
 function inferredNextStoreOrdersUrl(url, storeId, routeAliasId = null) {
@@ -1018,7 +1090,9 @@ async function saveStoreProductProgress(message, sender, sendResponse) {
     const routeId = storeOrdersPageIdentity(pageUrl)?.storeId;
     const identity = product?.store_identity;
     const routeAliasIsVerified = routeId !== storeId
-      && storeRouteAliasIsVerified(pageUrl, storeId, item?.approved_store_url_identities, identity);
+      && storeRouteAliasIsVerified(
+        pageUrl, storeId, item?.approved_store_url_identities, identity, targets, item?.title,
+      );
     if (!item || item.target_type !== "STORE"
       || Number(item.id) !== Number(message.item_id)
       || state.automationTabId !== sender?.tab?.id
@@ -1063,7 +1137,7 @@ async function saveStoreCandidateProgress(message, sender, sendResponse) {
     const identity = product?.store_identity;
     const routeAliasIsVerified = routePage?.storeId !== storeId
       && storeRouteAliasIsVerified(
-        pageUrl, storeId, item?.approved_store_url_identities, identity,
+        pageUrl, storeId, item?.approved_store_url_identities, identity, targets, item?.title,
       );
     const pageMatchesTask = Boolean(routePage && expectedPage && taskPage
       && routePage.page === expectedPage.page
@@ -1158,6 +1232,8 @@ async function waitForStorePage(
   timeoutMs = STORE_PAGE_NAVIGATION_TIMEOUT_MS,
   expectedStoreId = null,
   approvedStoreUrlIdentities = [],
+  monitoredProductIds = [],
+  expectedStoreName = null,
 ) {
   const expectedPage = storeOrdersPageIdentity(expectedUrl);
   const deadline = Date.now() + timeoutMs;
@@ -1186,6 +1262,8 @@ async function waitForStorePage(
         }
         const identity = await sendCollectMessage(tabId, "STORE_IDENTITY", null, undefined, {
           expectedStoreId: targetStoreId,
+          expectedStoreName,
+          identityMonitoredProductIds: monitoredProductIds,
           approvedStoreUrlIdentities,
         }).catch(() => null);
         const proof = identity?.store_identity;
@@ -1209,13 +1287,23 @@ async function waitForStorePage(
           && proof?.target_store_id === targetStoreId
           && String(proof.route_store_id) === currentPage.storeId
           && proof.page_url === tab.url
-          && !storeIdentityProofHasConflict(proof, targetStoreId)
+          && !storeIdentityProofHasConflict(
+            proof, targetStoreId, monitoredProductIds, expectedStoreName, approvedStoreUrlIdentities,
+          )
           && !namesConflict);
+        const fingerprintProof = Boolean(identity?.state === "ready"
+          && identity.platform_store_id === targetStoreId
+          && proof?.target_store_id === targetStoreId
+          && String(proof.route_store_id) === currentPage.storeId
+          && proof.page_url === tab.url
+          && storeIdentityFingerprintIsVerified(
+            proof, monitoredProductIds, expectedStoreName, approvedStoreUrlIdentities,
+          ));
         if (identity?.state === "ready" && identity.platform_store_id === targetStoreId
           && proof?.target_store_id === targetStoreId
           && String(proof.route_store_id) === currentPage.storeId
           && proof.page_url === tab.url
-          && matchingDisplayedId && !headingMismatch && !labeledMismatch) {
+          && ((matchingDisplayedId && !headingMismatch && !labeledMismatch) || fingerprintProof)) {
           return { ...currentPage, store_identity: proof };
         }
         if (backendAliasProof) {
@@ -1261,7 +1349,9 @@ async function collectStorePages(tabId, item) {
   let routeStoreId = storeId;
   let storeIdentity = null;
   const visited = new Set(progress.visited_page_urls.filter((pageUrl) =>
-    storeOrdersUrlAllowedForTask(pageUrl, storeId, approvedStoreUrlIdentities)));
+    storeOrdersUrlAllowedForTask(
+      pageUrl, storeId, approvedStoreUrlIdentities, progress.store_identity, targets, item.title,
+    )));
   const visitedThisAttempt = new Set();
   const startedAt = Date.now();
   let collectionInterrupted = false;
@@ -1275,12 +1365,12 @@ async function collectStorePages(tabId, item) {
     const currentPage = storeOrdersPageIdentity(tab.url);
     if (!storeIdentity && currentPage && currentPage.storeId !== storeId
       && storeOrdersUrlAllowedForTask(
-        tab.url, storeId, approvedStoreUrlIdentities, progress.store_identity,
+        tab.url, storeId, approvedStoreUrlIdentities, progress.store_identity, targets, item.title,
       )) {
       storeIdentity = progress.store_identity;
     }
     const isKnownStorePage = storeOrdersUrlAllowedForTask(
-      tab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+      tab.url, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
     );
     const isPotentialAliasPage = currentPage && currentPage.storeId !== storeId;
     if (!isKnownStorePage) {
@@ -1294,7 +1384,7 @@ async function collectStorePages(tabId, item) {
         }
         const recoveryUrl = isPotentialAliasPage ? tab.url : item.target_url;
         const readyPage = await waitForStorePage(
-          tabId, recoveryUrl, recoveryBudgetMs, storeId, approvedStoreUrlIdentities,
+          tabId, recoveryUrl, recoveryBudgetMs, storeId, approvedStoreUrlIdentities, targets, item.title,
         );
         routeStoreId = readyPage.storeId;
         storeIdentity = readyPage.store_identity || storeIdentity;
@@ -1326,7 +1416,7 @@ async function collectStorePages(tabId, item) {
       }
       tab = await chrome.tabs.get(tabId).catch(() => null);
       if (!tab || !storeOrdersUrlAllowedForTask(
-        tab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+        tab.url, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
       )) {
         const currentUrl = String(tab?.url || "标签页已关闭").slice(0, 240);
         return { state: "failed", message: `恢复后仍未到达目标店铺 Orders 页（当前页面：${currentUrl}）` };
@@ -1353,6 +1443,8 @@ async function collectStorePages(tabId, item) {
             claimToken: (await automationState()).automationClaimToken,
             monitoredProducts: item.monitored_products || [],
             expectedStoreId: storeId,
+            expectedStoreName: item.title,
+            identityMonitoredProductIds: targets,
             verifiedStoreIdentity: storeIdentity,
             approvedStoreUrlIdentities,
           }),
@@ -1442,7 +1534,7 @@ async function collectStorePages(tabId, item) {
     }
     if (products.size === targets.length || !result.has_next_page) break;
     if (!nextUrl || !storeOrdersUrlAllowedForTask(
-      nextUrl, storeId, approvedStoreUrlIdentities, storeIdentity,
+      nextUrl, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
     ) || visitedThisAttempt.has(nextUrl)) break;
     const navigationBudgetMs = Math.min(STORE_PAGE_NAVIGATION_TIMEOUT_MS, storeCollectionWorkRemaining(startedAt));
     if (navigationBudgetMs <= 0) {
@@ -1451,7 +1543,7 @@ async function collectStorePages(tabId, item) {
     }
     await chrome.tabs.update(tabId, { url: nextUrl, active: true });
     const readyPage = await waitForStorePage(
-      tabId, nextUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities,
+      tabId, nextUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities, targets, item.title,
     );
     routeStoreId = readyPage.storeId;
     storeIdentity = readyPage.store_identity || storeIdentity;
@@ -1473,7 +1565,7 @@ async function collectStorePages(tabId, item) {
       candidatePage = incompleteCandidatePage("invalid_cursor_url");
     } else {
       const cursorIsVerified = storeOrdersUrlAllowedForTask(
-        discoveryUrl, storeId, approvedStoreUrlIdentities, storeIdentity,
+        discoveryUrl, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
       );
       const cursorIsVisited = visited.has(discoveryUrl);
       if (!cursorIsVisited && visited.size >= 11) {
@@ -1497,7 +1589,7 @@ async function collectStorePages(tabId, item) {
               const navigationBudgetMs = Math.min(STORE_PAGE_NAVIGATION_TIMEOUT_MS, storeCollectionWorkRemaining(startedAt));
               if (navigationBudgetMs <= 0) throw new Error("店铺任务工作时间预算已用完");
               const readyPage = await waitForStorePage(
-                tabId, discoveryUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities,
+                tabId, discoveryUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities, targets, item.title,
               );
               routeStoreId = readyPage.storeId;
               storeIdentity = readyPage.store_identity || storeIdentity;
@@ -1535,7 +1627,7 @@ async function collectStorePages(tabId, item) {
         if (pageReady) {
           const currentTab = await chrome.tabs.get(tabId).catch(() => null);
           if (!currentTab || !storeOrdersUrlAllowedForTask(
-            currentTab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+            currentTab.url, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
           )
             || storeOrdersPageIdentity(currentTab.url)?.page !== storeOrdersPageIdentity(discoveryUrl)?.page) {
             candidatePage = incompleteCandidatePage("cursor_page_mismatch");
@@ -1592,7 +1684,7 @@ async function collectStorePages(tabId, item) {
                 progress.route_store_id = routeStoreId;
                 progress.store_identity = storeIdentity;
               const nextPageUrl = storeOrdersUrlAllowedForTask(
-                pageResult.next_page_url, storeId, approvedStoreUrlIdentities, storeIdentity,
+                pageResult.next_page_url, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
               )
                   ? pageResult.next_page_url
                   : null;
@@ -1637,7 +1729,7 @@ async function collectStorePages(tabId, item) {
                   const identity = candidate?.store_identity;
                   const routeAliasVerified = currentPage?.storeId !== storeId
                     && storeRouteAliasIsVerified(
-                      candidatePageUrl, storeId, approvedStoreUrlIdentities, identity,
+                      candidatePageUrl, storeId, approvedStoreUrlIdentities, identity, targets, item.title,
                     );
                   return productId
                     && productIdFromUrl(candidate?.url) === productId
@@ -2727,7 +2819,12 @@ async function pollAutomation() {
         storeProbe ? "STORE_IDENTITY" : state.automationItem?.target_type,
         state.automationItem?.target_date,
         undefined,
-        storeProbe ? { expectedStoreId: storeId } : null,
+        storeProbe ? {
+          expectedStoreId: storeId,
+          expectedStoreName: state.automationItem?.title,
+          identityMonitoredProductIds: state.automationItem?.monitored_product_ids || [],
+          approvedStoreUrlIdentities: state.automationItem?.approved_store_url_identities || [],
+        } : null,
       );
       if (probe?.state === "challenge") return;
       if (probe?.state === "ixspy_login") return;
