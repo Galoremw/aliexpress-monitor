@@ -226,7 +226,7 @@ def _advance_run(db: Session, run: BrowserCollectionRun) -> None:
 def browser_collection_control_status(db: Session) -> dict:
     control = _browser_control_row(db)
     now = utcnow()
-    workers = list(db.scalars(
+    worker_records = list(db.scalars(
         select(BrowserCollectionWorker).order_by(
             BrowserCollectionWorker.label, BrowserCollectionWorker.worker_id
         )
@@ -240,9 +240,15 @@ def browser_collection_control_status(db: Session) -> dict:
             "last_heartbeat_at": worker.last_heartbeat_at,
             "online": _worker_is_online(worker, now),
         }
-        for worker in workers
+        for worker in worker_records
     }
     selected = worker_rows.get(control.selected_worker_id)
+    if selected is not None and control.selected_worker_label:
+        selected["label"] = control.selected_worker_label
+    workers = sorted(
+        worker_rows.values(),
+        key=lambda worker: (worker["label"], worker["worker_id"]),
+    )
     run = get_today_run(db)
     draining_count = 0
     if run is not None:
@@ -257,7 +263,7 @@ def browser_collection_control_status(db: Session) -> dict:
     )
     return {
         "selected_worker": selected,
-        "workers": list(worker_rows.values()),
+        "workers": workers,
         "dispatch_enabled": bool(run and run.dispatch_enabled),
         "run_status": run.status if run else None,
         "handoff_pending": draining_count > 0,
