@@ -27,7 +27,7 @@ def test_dashboard_renders_empty_state(client):
     assert '<details id="dianxiaomi-status"' in response.text
     assert '<summary class="section-heading dianxiaomi-summary">' in response.text
     assert '<details id="dianxiaomi-status" class="data-section dianxiaomi-band" data-status-endpoint="/api/integrations/dianxiaomi/status" open' not in response.text
-    assert 'dashboard.js?v=monitor-user-roles-store-enrollment-20261029' in response.text
+    assert 'dashboard.js?v=shared-workers-20261031' in response.text
     assert 'id="browser-run-cancel"' in response.text
     script = client.get("/static/dashboard.js").text
     collect_all_handler = script.split('document.querySelector("#collect-all")', 1)[1].split(
@@ -109,6 +109,66 @@ def test_worker_selection_and_refresh_do_not_start_queue(client):
     assert "aliexpress-monitor:browser-run-requested" not in selection_handler
     assert 'jsonRequest("/api/browser-collection/control")' in refresh_handler
     assert 'method: "POST"' not in refresh_handler
+
+
+def test_dashboard_worker_switch_does_not_prompt_for_handoff(client):
+    dashboard = client.get("/").text
+    script = client.get("/static/dashboard.js").text
+    selection_handler = script.split(
+        'document.querySelector("#browser-collector-select")?.addEventListener', 1
+    )[1].split('document.querySelector("#browser-run-start")', 1)[0]
+
+    assert "启动后，所有在线电脑都可以领取今日队列任务" in dashboard
+    assert "等待旧采集任务结束" not in dashboard
+    assert "电脑切换需要等待旧任务结束" not in dashboard
+    assert "window.confirm" not in selection_handler
+    assert "confirm_handoff" not in selection_handler
+    assert 'dashboard.css?v=shared-workers-20261031' in dashboard
+    assert 'dashboard.js?v=shared-workers-20261031' in dashboard
+
+
+def test_dashboard_shows_shared_claim_counts(client):
+    stores = [
+        client.post(
+            "/api/stores",
+            json={"name": "Shared Worker Store", "url": f"https://www.aliexpress.com/store/{store_id}"},
+        ).json()
+        for store_id in ("990374", "990375")
+    ]
+    for index, store in enumerate(stores, start=1):
+        client.post(
+            "/api/products",
+            json={"store_id": store["id"], "aliexpress_product_id": f"10050099374{index}"},
+        )
+    for worker_id in ("worker-alpha-1234", "worker-beta-5678"):
+        response = client.post(
+            "/api/browser-collection/heartbeat",
+            json={"worker_id": worker_id, "worker_label": "采集电脑", "extension_version": "test"},
+        )
+        assert response.status_code == 200
+    assert client.post(
+        "/api/browser-collection/control/worker", json={"worker_id": "worker-alpha-1234"}
+    ).status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-alpha-1234"}
+    ).json()
+    second = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-beta-5678"}
+    ).json()
+    assert first["item"] is not None
+    assert second["item"] is not None
+
+    dashboard = client.get("/").text
+    script = client.get("/static/dashboard.js").text
+
+    assert 'id="browser-worker-loads"' in dashboard
+    assert "采集电脑 · worker-a" in dashboard
+    assert "采集电脑 · worker-b" in dashboard
+    assert 'data-worker-claim-count="1"' in dashboard
+    assert 'worker.display_label' in script
+    assert 'worker.active_claim_count' in script
+    assert "正在处理" in dashboard
 
 
 def test_queue_preparation_does_not_dispatch_or_wake_worker(client):

@@ -329,6 +329,8 @@ class BrowserCollectionWorkerSelectRequest(BaseModel):
 class BrowserCollectionWorkerRead(BaseModel):
     worker_id: str
     label: str
+    display_label: str
+    active_claim_count: int = 0
     extension_version: str | None
     capabilities: list[str] = Field(default_factory=list)
     last_heartbeat_at: datetime

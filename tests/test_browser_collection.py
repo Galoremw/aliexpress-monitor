@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.db.models import (
+    BrowserCollectionControl,
     BrowserCollectionItem,
     BrowserCollectionRun,
     BrowserCollectionWorker,
@@ -143,25 +144,402 @@ def test_start_requires_selected_online_worker(client, monkeypatch):
     assert offline.status_code == 409
 
 
-def test_only_selected_online_worker_can_claim(client):
-    store = create_store(client, "990203")
-    create_product(client, store["id"], "1005009920301")
+def test_any_online_worker_can_claim_shared_queue(client):
+    first_store = create_store(client, "990203")
+    create_product(client, first_store["id"], "1005009920301")
+    second_store = create_store(client, "990202")
+    create_product(client, second_store["id"], "1005009920201")
     register_browser_worker(client, "worker-galore", "Galore主机")
     register_browser_worker(client, "worker-second", "第二台电脑")
     assert select_browser_worker(client, "worker-galore").status_code == 200
     assert client.post("/api/browser-collection/runs/start-today").status_code == 200
 
-    other = client.post(
+    first = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
     )
-    selected = client.post(
+    second = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-galore"}
     )
 
-    assert other.status_code == 200
-    assert other.json()["item"] is None
-    assert selected.status_code == 200
-    assert selected.json()["item"]["target_type"] == "STORE"
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["item"]["target_type"] == "STORE"
+    assert second.json()["item"]["target_type"] == "STORE"
+    assert first.json()["item"]["store_id"] != second.json()["item"]["store_id"]
+
+
+def test_both_online_workers_claim_distinct_store_items(client):
+    first_store = create_store(client, "990351")
+    create_product(client, first_store["id"], "1005009935101")
+    second_store = create_store(client, "990352")
+    create_product(client, second_store["id"], "1005009935201")
+    register_browser_worker(client, "worker-first", "采集电脑")
+    register_browser_worker(client, "worker-second", "采集电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+
+    legacy = client.post("/api/browser-collection/items/claim", json={}).json()
+    unknown = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "unknown-worker"}
+    ).json()
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    second = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
+    ).json()
+
+    assert legacy["item"] is None
+    assert unknown["item"] is None
+    assert first["item"] is not None
+    assert second["item"] is not None
+    assert first["item"]["id"] != second["item"]["id"]
+    assert first["item"]["store_id"] != second["item"]["store_id"]
+    assert first["claim_token"] != second["claim_token"]
+
+
+def test_one_worker_can_claim_multiple_store_items(client):
+    stores = [create_store(client, store_id) for store_id in ("990353", "990354")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099353{index}")
+    register_browser_worker(client, "worker-first", "采集电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    second = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+
+    assert first["item"] is not None
+    assert second["item"] is not None
+    assert first["item"]["id"] != second["item"]["id"]
+
+
+def test_single_online_worker_can_drain_entire_shared_queue(client, db_session):
+    stores = [create_store(client, store_id) for store_id in ("990355", "990356", "990357")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099355{index}")
+    register_browser_worker(client, "worker-only", "唯一在线电脑")
+    assert select_browser_worker(client, "worker-only").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+
+    from app.services.browser_collection import finish_item
+
+    claimed_ids = []
+    for _ in stores:
+        response = client.post(
+            "/api/browser-collection/items/claim", json={"worker_id": "worker-only"}
+        ).json()
+        assert response["item"] is not None
+        claimed_ids.append(response["item"]["id"])
+        finish_item(
+            db_session,
+            db_session.get(BrowserCollectionItem, response["item"]["id"]),
+            "SUCCEEDED",
+        )
+
+    empty = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-only"}
+    ).json()
+
+    assert len(set(claimed_ids)) == len(stores)
+    assert empty["item"] is None
+
+
+def test_selected_worker_offline_after_start_does_not_block_other_online_claims(
+    client, db_session
+):
+    stores = [create_store(client, store_id) for store_id in ("990358", "990359")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099358{index}")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-second", "第二台电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    worker = db_session.get(BrowserCollectionWorker, "worker-first")
+    worker.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    db_session.commit()
+
+    claim = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
+    ).json()
+
+    assert claim["item"] is not None
+
+
+def test_stale_or_missing_worker_cannot_claim_shared_queue(client, db_session):
+    stores = [create_store(client, store_id) for store_id in ("990360", "990361")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099360{index}")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-stale", "离线电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    stale_worker = db_session.get(BrowserCollectionWorker, "worker-stale")
+    stale_worker.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    db_session.commit()
+
+    missing = client.post("/api/browser-collection/items/claim", json={}).json()
+    stale = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-stale"}
+    ).json()
+    current = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+
+    assert missing["item"] is None
+    assert stale["item"] is None
+    assert current["item"] is not None
+
+
+def test_expired_claim_can_be_reclaimed_by_another_online_worker(client, db_session):
+    store = create_store(client, "990362")
+    create_product(client, store["id"], "1005009936201")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-second", "第二台电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    item = db_session.get(BrowserCollectionItem, first["item"]["id"])
+    item.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db_session.commit()
+
+    second = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
+    ).json()
+    stale = client.post(
+        f"/api/browser-collection/items/{item.id}/failure",
+        json={
+            "worker_id": "worker-first",
+            "claim_token": first["claim_token"],
+            "error_type": "test",
+            "error_message": "expired attempt",
+        },
+    )
+
+    assert second["item"]["id"] == item.id
+    assert second["claim_token"] != first["claim_token"]
+    assert stale.status_code == 409
+    db_session.refresh(item)
+    assert item.status == "RUNNING"
+    assert item.claimed_worker_id == "worker-second"
+
+
+def test_selecting_start_worker_does_not_pause_shared_dispatch(client):
+    stores = [create_store(client, store_id) for store_id in ("990363", "990364")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099363{index}")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-second", "第二台电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+
+    switched = select_browser_worker(client, "worker-second")
+    second = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
+    ).json()
+
+    assert switched.status_code == 200
+    assert switched.json()["dispatch_enabled"] is True
+    assert second["item"] is not None
+    assert second["item"]["id"] != first["item"]["id"]
+
+
+def test_start_does_not_wait_for_other_worker_claims(client):
+    stores = [create_store(client, store_id) for store_id in ("990365", "990366")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099365{index}")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-second", "第二台电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    started = client.post("/api/browser-collection/runs/start-today").json()
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    paused = client.post(f"/api/browser-collection/runs/{started['id']}/pause")
+    assert paused.status_code == 200
+    assert select_browser_worker(
+        client, "worker-second", confirm_handoff=True
+    ).status_code == 200
+
+    resumed = client.post("/api/browser-collection/runs/start-today")
+
+    assert first["item"] is not None
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["dispatch_enabled"] is True
+
+
+def test_parallel_store_items_keep_store_phase_until_all_terminal(client, db_session):
+    stores = [create_store(client, store_id) for store_id in ("990367", "990368")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099367{index}")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-second", "第二台电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    second = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
+    ).json()
+
+    from app.services.browser_collection import finish_item
+
+    finish_item(
+        db_session,
+        db_session.get(BrowserCollectionItem, first["item"]["id"]),
+        "SUCCEEDED",
+    )
+    run = db_session.get(BrowserCollectionRun, first["item"]["run_id"])
+    db_session.refresh(run)
+
+    assert second["item"] is not None
+    assert run.phase == "STORE_DISCOVERY"
+    assert run.status == "RUNNING"
+
+
+@pytest.mark.parametrize("owner_online", [True, False])
+def test_verification_resume_keeps_online_owner_or_requeues_offline_owner(
+    client, db_session, owner_online
+):
+    store = create_store(client, "990369")
+    create_product(client, store["id"], "1005009936901")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-second", "第二台电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    run = client.post("/api/browser-collection/runs/start-today").json()
+    claim = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    challenged = client.post(
+        f"/api/browser-collection/items/{claim['item']['id']}/challenge",
+        json={
+            "worker_id": "worker-first",
+            "claim_token": claim["claim_token"],
+            "error_message": "verification page",
+            "page_url": "https://www.aliexpress.com/punish",
+        },
+    )
+    assert challenged.status_code == 200
+    if not owner_online:
+        worker = db_session.get(BrowserCollectionWorker, "worker-first")
+        worker.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+        db_session.commit()
+    assert select_browser_worker(
+        client, "worker-second", confirm_handoff=True
+    ).status_code == 200
+
+    resumed = client.post(f"/api/browser-collection/runs/{run['id']}/resume")
+
+    assert resumed.status_code == 200, resumed.text
+    item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
+    db_session.refresh(item)
+    if owner_online:
+        assert item.status == "RUNNING"
+        assert item.claimed_worker_id == "worker-first"
+        assert item.claim_token == claim["claim_token"]
+    else:
+        assert item.status == "PENDING"
+        assert item.claimed_worker_id is None
+        assert item.claim_token is None
+
+
+def test_control_reports_active_claims_per_worker(client, db_session):
+    stores = [create_store(client, store_id) for store_id in ("990370", "990371")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099370{index}")
+    for worker_id in ("worker-first", "worker-second", "worker-idle"):
+        register_browser_worker(client, worker_id, "采集电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    second = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
+    ).json()
+    challenged = client.post(
+        f"/api/browser-collection/items/{first['item']['id']}/challenge",
+        json={
+            "worker_id": "worker-first",
+            "claim_token": first["claim_token"],
+            "error_message": "verification page",
+            "page_url": "https://www.aliexpress.com/punish",
+        },
+    )
+    assert challenged.status_code == 200
+
+    control = client.get("/api/browser-collection/control").json()
+    workers = {worker["worker_id"]: worker for worker in control["workers"]}
+    assert workers["worker-first"]["active_claim_count"] == 1
+    assert workers["worker-second"]["active_claim_count"] == 1
+    assert workers["worker-idle"]["active_claim_count"] == 0
+
+    second_item = db_session.get(BrowserCollectionItem, second["item"]["id"])
+    second_item.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db_session.commit()
+    control = client.get("/api/browser-collection/control").json()
+    workers = {worker["worker_id"]: worker for worker in control["workers"]}
+    assert workers["worker-second"]["active_claim_count"] == 0
+
+
+def test_control_can_start_while_another_worker_has_a_valid_claim(client):
+    stores = [create_store(client, store_id) for store_id in ("990372", "990373")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099372{index}")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-second", "第二台电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    assert first["item"] is not None
+    assert select_browser_worker(client, "worker-second").status_code == 200
+
+    control = client.get("/api/browser-collection/control").json()
+    started = client.post("/api/browser-collection/runs/start-today")
+
+    assert control["can_start"] is True
+    assert control["handoff_pending"] is False
+    assert control["draining_count"] == 0
+    assert started.status_code == 200, started.text
+
+
+def test_control_disambiguates_duplicate_worker_labels(client, db_session):
+    register_browser_worker(client, "worker-alpha-1234", "采集电脑")
+    register_browser_worker(client, "worker-beta-5678", "采集电脑")
+    assert select_browser_worker(client, "worker-alpha-1234").status_code == 200
+    control_row = db_session.get(BrowserCollectionControl, 1)
+    control_row.selected_worker_label = "Qx的computer"
+    db_session.commit()
+
+    control = client.get("/api/browser-collection/control").json()
+    workers = {worker["worker_id"]: worker for worker in control["workers"]}
+
+    assert control["selected_worker"]["label"] == "Qx的computer"
+    assert workers["worker-alpha-1234"]["display_label"] == "Qx的computer"
+    assert workers["worker-beta-5678"]["display_label"] == "采集电脑"
+    control_row.selected_worker_label = "采集电脑"
+    db_session.commit()
+    workers = {
+        worker["worker_id"]: worker
+        for worker in client.get("/api/browser-collection/control").json()["workers"]
+    }
+    assert workers["worker-alpha-1234"]["display_label"] == "采集电脑 · worker-a"
+    assert workers["worker-beta-5678"]["display_label"] == "采集电脑 · worker-b"
+    assert workers["worker-alpha-1234"]["display_label"] != workers["worker-beta-5678"]["display_label"]
+    assert db_session.get(BrowserCollectionWorker, "worker-alpha-1234").label == "采集电脑"
+    assert db_session.get(BrowserCollectionWorker, "worker-beta-5678").label == "采集电脑"
 
 
 def test_non_selected_heartbeat_cannot_change_owner(client):
@@ -176,29 +554,28 @@ def test_non_selected_heartbeat_cannot_change_owner(client):
     assert control.json()["selected_worker"]["worker_id"] == "worker-galore"
 
 
-def test_selected_worker_offline_does_not_fail_over(client, monkeypatch):
-    from app.services import browser_collection as browser_service
-
+def test_selected_worker_offline_does_not_block_shared_claims(client, db_session):
+    store = create_store(client, "990201")
+    create_product(client, store["id"], "1005009920101")
     register_browser_worker(client, "worker-galore", "Galore主机")
     assert select_browser_worker(client, "worker-galore").status_code == 200
     register_browser_worker(client, "worker-second", "第二台电脑")
-    stale_now = datetime.now(timezone.utc) - timedelta(minutes=3)
-    monkeypatch.setattr(browser_service, "utcnow", lambda: stale_now)
-    register_browser_worker(client, "worker-galore", "Galore主机")
-
-    start = client.post("/api/browser-collection/runs/start-today")
+    started = client.post("/api/browser-collection/runs/start-today")
+    assert started.status_code == 200, started.text
+    selected = db_session.get(BrowserCollectionWorker, "worker-galore")
+    selected.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    db_session.commit()
     claim = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
     )
     control = client.get("/api/browser-collection/control")
 
-    assert start.status_code == 409
     assert claim.status_code == 200
-    assert claim.json()["item"] is None
+    assert claim.json()["item"] is not None
     assert control.json()["selected_worker"]["worker_id"] == "worker-galore"
 
 
-def test_handoff_disables_dispatch_until_old_claims_drain(client, db_session):
+def test_selecting_start_worker_keeps_dispatch_open_with_old_claims(client, db_session):
     stores = [create_store(client, store_id) for store_id in ("990204", "990205")]
     for index, store in enumerate(stores):
         create_product(client, store["id"], f"10050099204{index}")
@@ -211,31 +588,20 @@ def test_handoff_disables_dispatch_until_old_claims_drain(client, db_session):
     ).json()["item"]
 
     switched = select_browser_worker(client, "worker-second", confirm_handoff=True)
-    blocked_start = client.post("/api/browser-collection/runs/start-today")
-    old_claim = client.post(
-        "/api/browser-collection/items/claim", json={"worker_id": "worker-galore"}
-    )
-    assert switched.status_code == 200
-    assert switched.json()["dispatch_enabled"] is False
-    assert blocked_start.status_code == 409
-    assert old_claim.json()["item"] is None
-
-    old_item = db_session.get(BrowserCollectionItem, first["id"])
-    old_item.status = "SUCCEEDED"
-    old_item.completed_at = datetime.now(timezone.utc)
-    old_item.lease_expires_at = None
-    db_session.commit()
     started = client.post("/api/browser-collection/runs/start-today")
     next_claim = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
     )
-
+    assert switched.status_code == 200
+    assert switched.json()["dispatch_enabled"] is True
     assert started.status_code == 200
     assert next_claim.status_code == 200
+    assert next_claim.json()["item"] is not None
     assert next_claim.json()["item"]["id"] != first["id"]
 
 
-def test_concurrent_store_claim_is_deferred_until_current_store_finishes(client, db_session):
+
+def test_concurrent_store_claim_is_allowed_while_current_store_runs(client, db_session):
     stores = [create_store(client, store_id) for store_id in ("990206", "990207")]
     for index, store in enumerate(stores):
         create_product(client, store["id"], f"10050099206{index}")
@@ -251,15 +617,20 @@ def test_concurrent_store_claim_is_deferred_until_current_store_finishes(client,
     ).json()["item"]
 
     assert first is not None
-    assert second is None
+    assert second is not None
+    assert first["id"] != second["id"]
+    assert first["store_id"] != second["store_id"]
     first_item = db_session.get(BrowserCollectionItem, first["id"])
     from app.services.browser_collection import finish_item
     finish_item(db_session, first_item, "SUCCEEDED")
+    current_run = db_session.get(BrowserCollectionRun, first_item.run_id)
+    db_session.refresh(current_run)
+    assert current_run.phase == "STORE_DISCOVERY"
+    assert current_run.status == "RUNNING"
     next_claim = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-galore"}
     ).json()["item"]
-    assert next_claim is not None
-    assert next_claim["id"] != first["id"]
+    assert next_claim is None
 
 
 def test_collect_all_and_retry_after_completion_leave_run_held(client, db_session):
@@ -285,7 +656,7 @@ def test_collect_all_and_retry_after_completion_leave_run_held(client, db_sessio
     assert queued.json()["run"]["dispatch_enabled"] is False
 
 
-def test_handoff_drains_old_claim_and_rejects_stale_result(client, db_session):
+def test_selection_preserves_active_claim_and_rejects_stale_result(client, db_session):
     store = create_store(client, "990209")
     product = create_product(client, store["id"], "1005009920901")
     register_browser_worker(client, "worker-galore", "Galore主机")
@@ -3663,25 +4034,17 @@ def test_store_identity_review_does_not_mutate_another_legacy_claim(client, db_s
     db_session.commit()
 
     response = _report_identity_review(client, first_claim)
+    third_claim = request_claim(client).json()
 
     assert response.status_code == 200, response.text
     db_session.refresh(second)
     assert second.status == "RUNNING"
     assert second.claim_token == "legacy-running-claim"
-    assert request_claim(client).json()["item"] is None
-
-    second.status = "FAILED"
-    second.completed_at = datetime.now(timezone.utc)
-    second.claimed_at = None
-    second.lease_expires_at = None
-    second.claimed_worker_id = None
-    second.claim_token = None
-    db_session.commit()
-    third_claim = request_claim(client).json()
     assert third_claim["item"]["store_id"] == third_store["id"]
+    assert third_claim["item"]["id"] != second.id
 
 
-def test_store_discovery_claim_allows_only_one_running_store_per_run(client, db_session):
+def test_store_discovery_claim_allows_multiple_running_stores_per_run(client, db_session):
     from app.services.browser_collection import finish_item
 
     first_store = create_store(client, "990347")
@@ -3692,11 +4055,17 @@ def test_store_discovery_claim_allows_only_one_running_store_per_run(client, db_
 
     concurrent_claim = request_claim(client).json()
 
-    assert concurrent_claim["item"] is None
+    assert concurrent_claim["item"] is not None
+    assert concurrent_claim["item"]["id"] != first_claim["item"]["id"]
+    assert concurrent_claim["item"]["store_id"] != first_claim["item"]["store_id"]
     first_item = db_session.get(BrowserCollectionItem, first_claim["item"]["id"])
     finish_item(db_session, first_item, "SUCCEEDED")
+    run = db_session.get(BrowserCollectionRun, first_item.run_id)
+    db_session.refresh(run)
+    assert run.phase == "STORE_DISCOVERY"
+    assert run.status == "RUNNING"
     next_claim = request_claim(client).json()
-    assert next_claim["item"]["store_id"] == second_store["id"]
+    assert next_claim["item"] is None
 
 
 def test_terminal_store_failure_does_not_pause_dispatch(client, db_session):

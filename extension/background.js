@@ -1200,7 +1200,9 @@ async function saveStoreProductProgress(message, sender, sendResponse) {
     const routeId = storeOrdersPageIdentity(pageUrl)?.storeId;
     const identity = product?.store_identity;
     const routeAliasIsVerified = routeId !== storeId
-      && storeRouteAliasIsVerified(pageUrl, storeId, item?.approved_store_url_identities, identity);
+      && storeRouteAliasIsVerified(
+        pageUrl, storeId, item?.approved_store_url_identities, identity, targets, item?.title,
+      );
     if (!item || item.target_type !== "STORE"
       || Number(item.id) !== Number(message.item_id)
       || state.automationTabId !== sender?.tab?.id
@@ -1245,7 +1247,7 @@ async function saveStoreCandidateProgress(message, sender, sendResponse) {
     const identity = product?.store_identity;
     const routeAliasIsVerified = routePage?.storeId !== storeId
       && storeRouteAliasIsVerified(
-        pageUrl, storeId, item?.approved_store_url_identities, identity,
+        pageUrl, storeId, item?.approved_store_url_identities, identity, targets, item?.title,
       );
     const pageMatchesTask = Boolean(routePage && expectedPage && taskPage
       && routePage.page === expectedPage.page
@@ -1470,7 +1472,9 @@ async function collectStorePages(tabId, item) {
   let routeStoreId = storeId;
   let storeIdentity = null;
   const visited = new Set(progress.visited_page_urls.filter((pageUrl) =>
-    storeOrdersUrlAllowedForTask(pageUrl, storeId, approvedStoreUrlIdentities)));
+    storeOrdersUrlAllowedForTask(
+      pageUrl, storeId, approvedStoreUrlIdentities, progress.store_identity, targets, item.title,
+    )));
   const visitedThisAttempt = new Set();
   const startedAt = Date.now();
   let collectionInterrupted = false;
@@ -1484,12 +1488,12 @@ async function collectStorePages(tabId, item) {
     const currentPage = storeOrdersPageIdentity(tab.url);
     if (!storeIdentity && currentPage && currentPage.storeId !== storeId
       && storeOrdersUrlAllowedForTask(
-        tab.url, storeId, approvedStoreUrlIdentities, progress.store_identity,
+        tab.url, storeId, approvedStoreUrlIdentities, progress.store_identity, targets, item.title,
       )) {
       storeIdentity = progress.store_identity;
     }
     const isKnownStorePage = storeOrdersUrlAllowedForTask(
-      tab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+      tab.url, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
     );
     const isPotentialAliasPage = currentPage && currentPage.storeId !== storeId;
     if (!isKnownStorePage) {
@@ -1535,7 +1539,7 @@ async function collectStorePages(tabId, item) {
       }
       tab = await chrome.tabs.get(tabId).catch(() => null);
       if (!tab || !storeOrdersUrlAllowedForTask(
-        tab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+        tab.url, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
       )) {
         const currentUrl = String(tab?.url || "标签页已关闭").slice(0, 240);
         return { state: "failed", message: `恢复后仍未到达目标店铺 Orders 页（当前页面：${currentUrl}）` };
@@ -1654,7 +1658,7 @@ async function collectStorePages(tabId, item) {
     }
     if (products.size === targets.length || !result.has_next_page) break;
     if (!nextUrl || !storeOrdersUrlAllowedForTask(
-      nextUrl, storeId, approvedStoreUrlIdentities, storeIdentity,
+      nextUrl, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
     ) || visitedThisAttempt.has(nextUrl)) break;
     const navigationBudgetMs = Math.min(STORE_PAGE_NAVIGATION_TIMEOUT_MS, storeCollectionWorkRemaining(startedAt));
     if (navigationBudgetMs <= 0) {
@@ -1685,7 +1689,7 @@ async function collectStorePages(tabId, item) {
       candidatePage = incompleteCandidatePage("invalid_cursor_url");
     } else {
       const cursorIsVerified = storeOrdersUrlAllowedForTask(
-        discoveryUrl, storeId, approvedStoreUrlIdentities, storeIdentity,
+        discoveryUrl, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
       );
       const cursorIsVisited = visited.has(discoveryUrl);
       if (!cursorIsVisited && visited.size >= 11) {
@@ -1747,7 +1751,7 @@ async function collectStorePages(tabId, item) {
         if (pageReady) {
           const currentTab = await chrome.tabs.get(tabId).catch(() => null);
           if (!currentTab || !storeOrdersUrlAllowedForTask(
-            currentTab.url, storeId, approvedStoreUrlIdentities, storeIdentity,
+            currentTab.url, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
           )
             || storeOrdersPageIdentity(currentTab.url)?.page !== storeOrdersPageIdentity(discoveryUrl)?.page) {
             candidatePage = incompleteCandidatePage("cursor_page_mismatch");
@@ -1804,7 +1808,7 @@ async function collectStorePages(tabId, item) {
                 progress.route_store_id = routeStoreId;
                 progress.store_identity = storeIdentity;
               const nextPageUrl = storeOrdersUrlAllowedForTask(
-                pageResult.next_page_url, storeId, approvedStoreUrlIdentities, storeIdentity,
+                pageResult.next_page_url, storeId, approvedStoreUrlIdentities, storeIdentity, targets, item.title,
               )
                   ? pageResult.next_page_url
                   : null;
@@ -1849,7 +1853,7 @@ async function collectStorePages(tabId, item) {
                   const identity = candidate?.store_identity;
                   const routeAliasVerified = currentPage?.storeId !== storeId
                     && storeRouteAliasIsVerified(
-                      candidatePageUrl, storeId, approvedStoreUrlIdentities, identity,
+                      candidatePageUrl, storeId, approvedStoreUrlIdentities, identity, targets, item.title,
                     );
                   return productId
                     && productIdFromUrl(candidate?.url) === productId

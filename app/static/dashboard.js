@@ -839,10 +839,22 @@ function renderBrowserCollectionItem(item) {
     identityEvidence.heading_store_id,
     ...(Array.isArray(identityEvidence.labeled_store_ids) ? identityEvidence.labeled_store_ids : []),
   ].filter((id) => id != null && String(id)).map(String);
+  const matchedProductIds = Array.isArray(identityEvidence.matched_product_ids)
+    ? identityEvidence.matched_product_ids.map(String)
+    : [];
+  const productMatchCount = Number.isInteger(identityEvidence.catalog_match_count)
+    ? identityEvidence.catalog_match_count
+    : matchedProductIds.length;
+  const observedStoreName = identityEvidence.ixspy_store_name
+    || identityEvidence.matched_store_name
+    || (Array.isArray(identityEvidence.observed_store_names)
+      ? identityEvidence.observed_store_names[0]
+      : null);
+  const expectedStoreName = identityEvidence.expected_store_name || item.title || "未识别";
   const reviewDetails = identityDeferred
     ? `<div class="browser-identity-evidence"><strong>${identityReview ? "人工核验店铺身份" : "店铺身份审核记录"}</strong><span>采集页面：${reviewedUrl
       ? `<a class="browser-identity-url" href="${reviewedUrl}" target="_blank" rel="noreferrer">${reviewedUrl}</a>`
-      : "未记录"}</span><span>页面标题：${escapeDianxiaomiHtml(identityEvidence.page_title || "未识别")}</span><span>IXSPY 店铺名称：${escapeDianxiaomiHtml(identityEvidence.ixspy_store_name || "未识别")}</span><span>页面显示 ID：${escapeDianxiaomiHtml(visibleStoreIds.join("、") || "未识别")}</span></div>`
+      : "未记录"}</span><span>页面标题：${escapeDianxiaomiHtml(identityEvidence.page_title || "未识别")}</span><span>任务店铺名称：${escapeDianxiaomiHtml(expectedStoreName)}</span><span>页面店铺名称：${escapeDianxiaomiHtml(observedStoreName || "未识别")}</span><span>页面显示 ID：${escapeDianxiaomiHtml(visibleStoreIds.join("、") || "未识别")}</span><span>命中监控商品：${escapeDianxiaomiHtml(`${productMatchCount} 个${matchedProductIds.length ? `（${matchedProductIds.join("、")}）` : ""}`)}</span><span>店铺名称匹配：${identityEvidence.store_name_match === true ? "是" : "否"}</span></div>`
     : "";
   const action = identityReview
     ? `<div class="browser-identity-actions"><button class="link-button identity-confirm" type="button" data-browser-item-action="identity-confirm" data-browser-item-id="${item.id}">确定无误</button><button class="link-button identity-reject" type="button" data-browser-item-action="identity-reject" data-browser-item-id="${item.id}">错误</button></div>`
@@ -1013,25 +1025,47 @@ function updateBrowserCollectionControl(control) {
   browserCollectionControl = control;
   const selector = document.querySelector("#browser-collector-select");
   const selectedState = document.querySelector("#browser-selected-worker-state");
+  const workerLoads = document.querySelector("#browser-worker-loads");
   const start = document.querySelector("#browser-run-start");
   if (!selector || !start || !control) return;
 
   const selected = control.selected_worker;
   selector.replaceChildren(new Option("请选择在线采集电脑", ""));
   for (const worker of control.workers || []) {
-    const option = new Option(`${worker.label} · ${worker.online ? "在线" : "离线"}`, worker.worker_id);
+    const option = new Option(`${worker.display_label || worker.label} · ${worker.online ? "在线" : "离线"}`, worker.worker_id);
     selector.add(option);
   }
   selector.value = selected?.worker_id || "";
   selector.disabled = !(control.workers || []).length;
 
   if (selectedState) {
-    if (control.handoff_pending) {
-      selectedState.textContent = `等待旧采集任务结束（${control.draining_count}）`;
-    } else if (!selected) {
-      selectedState.textContent = "尚未选择采集电脑";
-    } else {
-      selectedState.textContent = `当前采集电脑：${selected.label} · ${selected.online ? "在线" : "离线"}`;
+    selectedState.textContent = selected
+      ? `手动启动授权电脑：${selected.display_label || selected.label} · ${selected.online ? "在线" : "离线"}`
+      : "尚未选择手动启动电脑";
+  }
+  if (workerLoads) {
+    workerLoads.replaceChildren();
+    const workers = control.workers || [];
+    if (!workers.length) {
+      const empty = document.createElement("p");
+      empty.className = "muted-value";
+      empty.textContent = "尚无采集电脑心跳";
+      workerLoads.append(empty);
+    }
+    for (const worker of workers) {
+      const row = document.createElement("div");
+      row.className = "browser-worker-load";
+      row.dataset.workerId = worker.worker_id;
+      row.dataset.workerClaimCount = String(Number(worker.active_claim_count) || 0);
+      row.setAttribute("aria-label", `${worker.display_label || worker.label}，${worker.online ? "在线" : "离线"}，领取 ${Number(worker.active_claim_count) || 0} 项`);
+      const name = document.createElement("span");
+      name.className = "browser-worker-load-name";
+      name.textContent = worker.display_label || worker.label;
+      const state = document.createElement("span");
+      state.className = "browser-worker-load-state";
+      state.textContent = `${worker.online ? "在线" : "离线"} · 领取 ${Number(worker.active_claim_count) || 0} 项`;
+      row.append(name, state);
+      workerLoads.append(row);
     }
   }
 
@@ -1073,23 +1107,15 @@ document.querySelector("#browser-collector-select")?.addEventListener("change", 
     selector.value = currentWorkerId;
     return;
   }
-  const activeRun = ["PENDING", "RUNNING", "NEEDS_VERIFICATION", "PAUSED"]
-    .includes(browserCollectionControl?.run_status);
-  const switchingActiveOwner = Boolean(currentWorkerId && currentWorkerId !== workerId && activeRun);
-  if (switchingActiveOwner && !window.confirm("切换采集电脑会暂停领取新任务，并等待旧电脑正在处理的任务结束。继续切换？")) {
-    selector.value = currentWorkerId;
-    return;
-  }
-
   selector.disabled = true;
   try {
     const control = await jsonRequest("/api/browser-collection/control/worker", {
       method: "POST",
-      body: JSON.stringify({ worker_id: workerId, confirm_handoff: switchingActiveOwner }),
+      body: JSON.stringify({ worker_id: workerId }),
     });
     updateBrowserCollectionControl(control);
     await refreshBrowserCollection();
-    notify("采集电脑已选择；队列仍待启动，请单独点击“开始采集”。");
+    notify("已选择手动启动电脑；开始后所有在线电脑都可以领取队列任务。");
   } catch (error) {
     selector.value = currentWorkerId;
     notify(error.message, true);
@@ -1112,9 +1138,9 @@ document.querySelector("#browser-run-start")?.addEventListener("click", async (e
     await refreshBrowserCollectionControl();
     if (run.dispatch_enabled) {
       window.dispatchEvent(new Event("aliexpress-monitor:browser-run-requested"));
-      notify(resuming ? "队列已恢复，将从暂停位置继续" : "采集已开始，由所选电脑处理队列");
+      notify(resuming ? "队列已恢复，在线电脑可继续领取任务" : "采集已开始，所有在线电脑都可领取队列任务");
     } else {
-      notify("队列仍未启动，请确认所选电脑在线且旧任务已结束。", true);
+      notify("队列仍未启动，请确认所选电脑在线并重试。", true);
     }
   } catch (error) {
     notify(error.message, true);
@@ -1174,7 +1200,7 @@ document.querySelector("#browser-collection-status")?.addEventListener("click", 
       ? "已确认该店铺的 URL 身份；本轮仍保持跳过，需手动重新排队。"
       : actionType === "identity-reject"
         ? "已记录人工拒绝；本轮队列不受影响。"
-        : "该店铺已重新排队；任务将由当前所选采集电脑领取。");
+        : "该店铺已重新排队；任务将由在线采集电脑领取。");
   } catch (error) {
     notify(error.message, true);
   } finally {

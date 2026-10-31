@@ -79,11 +79,21 @@
         <select id="browser-collector-select" aria-label="选择采集电脑">
           <option value="">请选择在线采集电脑</option>
           {% for worker in browser_collection_control.workers %}
-          <option value="{{ worker.worker_id }}"{% if browser_collection_control.selected_worker and browser_collection_control.selected_worker.worker_id == worker.worker_id %} selected{% endif %}>{{ worker.label }} · {{ "在线" if worker.online else "离线" }}</option>
+          <option value="{{ worker.worker_id }}"{% if browser_collection_control.selected_worker and browser_collection_control.selected_worker.worker_id == worker.worker_id %} selected{% endif %}>{{ worker.display_label }} · {{ "在线" if worker.online else "离线" }}</option>
           {% endfor %}
         </select>
       </label>
-      <p id="browser-selected-worker-state" class="browser-selected-worker-state" role="status" aria-live="polite">{% if browser_collection_control.handoff_pending %}等待旧采集任务结束（{{ browser_collection_control.draining_count }}）{% elif browser_collection_control.selected_worker %}当前采集电脑：{{ browser_collection_control.selected_worker.label }} · {{ "在线" if browser_collection_control.selected_worker.online else "离线" }}{% else %}尚未选择采集电脑{% endif %}</p>
+      <p id="browser-selected-worker-state" class="browser-selected-worker-state" role="status" aria-live="polite">{% if browser_collection_control.selected_worker %}手动启动授权电脑：{{ browser_collection_control.selected_worker.display_label }} · {{ "在线" if browser_collection_control.selected_worker.online else "离线" }}{% else %}尚未选择手动启动电脑{% endif %}</p>
+      <div id="browser-worker-loads" class="browser-worker-loads" aria-label="在线采集电脑任务状态" aria-live="polite">
+        {% for worker in browser_collection_control.workers %}
+        <div class="browser-worker-load" data-worker-id="{{ worker.worker_id }}" data-worker-claim-count="{{ worker.active_claim_count }}">
+          <span class="browser-worker-load-name">{{ worker.display_label }}</span>
+          <span class="browser-worker-load-state">{{ "在线" if worker.online else "离线" }} · 领取 {{ worker.active_claim_count }} 项</span>
+        </div>
+        {% else %}
+        <p class="muted-value">尚无采集电脑心跳</p>
+        {% endfor %}
+      </div>
       <button id="browser-run-start" class="button primary" type="button"{% if not browser_collection_control.can_start or browser_collection_control.dispatch_enabled %} disabled{% endif %}>{% if browser_collection_control.dispatch_enabled %}采集中{% elif browser_collection_control.run_status in ["NEEDS_VERIFICATION", "PAUSED"] %}继续采集{% elif browser_collection_run and browser_collection_run.status in ["COMPLETED", "PARTIAL", "FAILED"] and not browser_collection_control.can_start %}今日已完成{% else %}开始采集{% endif %}</button>
       <button id="browser-run-now" class="button" type="button"{% if browser_collection_run and browser_collection_run.paused_reason == "manual_cancel" %} hidden{% endif %}>重新检查今日任务</button>
       <div class="browser-run-secondary-actions">
@@ -92,7 +102,7 @@
       </div>
     </div>
   </div>
-  <p class="browser-run-help">任务会先排队并保持待启动；选择在线电脑后，再点击“开始采集”。电脑切换需要等待旧任务结束。心跳仅表示扩展已连接，平台登录或验证仍需由你本人完成。</p>
+  <p class="browser-run-help">任务会先排队并保持待启动；选择在线电脑后，再手动点击“开始采集”或“继续采集”。选择电脑仅授权手动启动；启动后，所有在线电脑都可以领取今日队列任务。平台登录或验证仍需由你本人完成。</p>
   <div class="browser-queue-content">
     <div class="browser-filter-grid" role="tablist" aria-label="按状态查看浏览器采集任务">
       <button class="browser-filter active" type="button" role="tab" aria-selected="true" data-browser-filter="pending"><small>待处理</small><b data-browser-filter-value="pending">0</b></button>
