@@ -177,11 +177,11 @@ git commit -m "feat: show shared browser worker status"
 - Deploy the app version produced by Tasks 1, 2, and 3; no database migration and no extension protocol change are expected.
 - Read current NAS image, service, database revision, today's run, queue dispatch state, active claims, and worker heartbeats before changing the service.
 
-- [ ] **Step 1: Record read-only NAS preflight evidence**
+- [x] **Step 1: Record read-only NAS preflight evidence**
 
 Confirm the target app and branch/digest, current database head, current run status, pending/running item IDs, dispatch flag, and collector worker IDs/heartbeat ages. Do not deploy while dispatch is enabled, the run status is `RUNNING` or `NEEDS_VERIFICATION`, or any item is `RUNNING` or `NEEDS_VERIFICATION`; do not pause a live queue to make deployment possible.
 
-- [ ] **Step 2: Deploy only the backend service**
+- [x] **Step 2: Deploy only the backend service**
 
 Use the existing approved `monitor-nas` workflow to build and deploy Compose service `backend` only. Leave `frontend`, `scheduler`, `postgres`, dependencies, and persistent volumes untouched. Do not migrate, reset the queue, change monitored-store membership, or start/resume collection. Verify the deployed app revision and `/api/browser-collection/control` response.
 
@@ -193,9 +193,11 @@ Verify two distinct worker IDs have fresh heartbeats and the supported existing 
 
 After the user explicitly starts the held queue from the dashboard, observe at least two store tasks with status `RUNNING` at the same time, assigned to distinct worker IDs and distinct item IDs. Confirm each computer shows its current claimed-task count and the run remains in store discovery. After the concurrent tasks finish, confirm one online computer can claim another pending task by itself. Do not force an in-flight page to fail just to test lease recovery; the backend test suite covers expired-lease reassignment. Report this real-page evidence separately from automated test results.
 
-- [ ] **Step 5: Preserve or pause the queue at the user-directed boundary**
+- [x] **Step 5: Preserve or pause the queue at the user-directed boundary**
 
 Do not cancel, reset, or force-complete work. Leave normal dispatch behavior as configured by the user and report any platform challenge or login requirement for the user to handle in the browser.
+
+Deployment record (2026-10-31): the backend-only image sha256:fc71b916cebc76ee1612a86275c0144d069c4f77060164bfed9fa3a1e99006db is healthy. The NAS migration head stayed at 20261028_0017; run 41 remains PENDING / STORE_DISCOVERY, 27 items pending, dispatch disabled, and zero active claims. The selected worker's dashboard label is Qx的computer; two other registered workers are offline. Steps 3 and 4 remain open until another worker is online and the user manually starts the queue for live acceptance.
 
 ## Implementation Method
 
