@@ -48,6 +48,8 @@ def discover_store_products(
     store: Store,
     collector: StoreDiscoveryCollector,
     limit: int = 20,
+    *,
+    allow_deactivation: bool = True,
 ) -> StoreDiscoverySummary:
     try:
         result = collector.discover(store.url)
@@ -115,7 +117,7 @@ def discover_store_products(
         existing_ids.add(candidate.product_id)
         added_count += 1
         observed_products.append((product, candidate, rank))
-    if result.parse_status == "success" and candidates:
+    if allow_deactivation and result.parse_status == "success" and candidates:
         current_ids = {candidate.product_id for candidate in candidates}
         pool_products = list(
             db.scalars(

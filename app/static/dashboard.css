@@ -18,8 +18,9 @@ a:hover { text-decoration: underline; }
 .topbar { height: 58px; padding: 0 max(24px, calc((100vw - 1440px) / 2)); display: flex; align-items: center; justify-content: space-between; background: #17201d; color: white; }
 .brand { color: white; font-size: 16px; font-weight: 700; }
 .worker-mode-badge { padding: 4px 8px; border: 1px solid #9bc7ad; color: #d9f1df; background: #226247; font-size: 12px; white-space: nowrap; }
-.topbar nav { display: flex; gap: 22px; }
+.topbar nav { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px 16px; }
 .topbar nav a { color: #dce5e1; font-size: 13px; }
+.nav-user { color: #b6c8bf; font-size: 12px; white-space: nowrap; }
 .nav-logout { padding: 4px 8px; border: 1px solid #718077; color: #dce5e1; background: transparent; cursor: pointer; }
 .auth-page { display: grid; place-items: center; min-height: 70vh; }
 .auth-panel { width: min(420px, 100%); padding: 32px; background: #fff; box-shadow: 0 12px 36px #17221d14; }
@@ -28,9 +29,30 @@ a:hover { text-decoration: underline; }
 .auth-panel form { display: grid; gap: 14px; }
 .auth-panel label { display: grid; gap: 6px; color: #647269; font-size: 13px; font-weight: 700; }
 .auth-panel input { width: 100%; padding: 11px; border: 1px solid #cad8cc; font: inherit; }
+.account-layout { display: grid; grid-template-columns: minmax(260px, .8fr) minmax(0, 1.8fr); align-items: start; gap: 18px; }
+.account-panel { min-width: 0; padding: 20px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.account-panel h2 { margin: 0 0 16px; font-size: 18px; }
+.account-create-form { display: grid; gap: 10px; }
+.account-create-form p { margin: 0 0 6px; color: var(--muted); font-size: 12px; }
+.account-create-form label { font-weight: 650; }
+.account-create-form input { width: 100%; min-height: 40px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 4px; font: inherit; }
+.account-table { width: 100%; border-collapse: collapse; text-align: left; }
+.account-table th, .account-table td { padding: 10px 9px; border-bottom: 1px solid var(--line); }
+.account-table th { color: var(--muted); font-size: 12px; font-weight: 650; }
+.account-row-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.credential-dialog { width: min(480px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); box-shadow: 0 18px 48px #17221d33; }
+.credential-dialog::backdrop { background: #17201d66; }
+.credential-dialog > section { display: grid; gap: 14px; padding: 24px; }
+.credential-dialog h2, .credential-dialog p { margin: 0; }
+.credential-dialog p { color: var(--muted); }
+.credential-secret { display: block; overflow-wrap: anywhere; padding: 12px; border: 1px solid var(--line); background: var(--canvas); font: 600 16px/1.5 ui-monospace, monospace; user-select: all; }
+.password-page { min-height: 70vh; }
+.warning-text { color: var(--danger); }
 main { width: min(1440px, calc(100% - 48px)); margin: 0 auto; padding: 30px 0 56px; }
 html { scroll-behavior: smooth; }
-.section-nav { position: fixed; z-index: 20; top: 82px; right: 0; display: grid; gap: 2px; width: 156px; max-height: calc(100vh - 100px); overflow-y: auto; padding: 4px 0; scrollbar-width: thin; }
+.section-nav { position: fixed; z-index: 20; top: 82px; right: 0; display: grid; gap: 8px; width: 172px; max-height: calc(100vh - 100px); overflow-y: auto; padding: 4px 0; scrollbar-width: thin; }
+.section-nav-group { display: grid; gap: 2px; align-content: start; }
+.section-nav-heading { padding: 3px 7px 1px 23px; color: var(--muted); font-size: 10px; font-weight: 700; line-height: 1.3; white-space: nowrap; }
 .section-nav a { display: flex; align-items: center; gap: 9px; min-height: 28px; padding: 4px 7px; border-radius: 4px; color: var(--muted); font-size: 12px; line-height: 1.3; text-decoration: none; }
 .section-nav a::before { content: ""; flex: 0 0 7px; width: 7px; height: 7px; border: 1px solid #aeb8b4; border-radius: 50%; background: var(--surface); }
 .section-nav a:hover { background: #e9efec; color: var(--ink); }
@@ -106,6 +128,13 @@ html { scroll-behavior: smooth; }
 .browser-identity-actions .identity-reject { background: #e9a4a4; border-color: #d97d7d; color: #111; }
 .browser-identity-actions .identity-reject:hover { background: #df9090; }
 .browser-identity-actions .link-button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.dianxiaomi-identity-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.dianxiaomi-identity-actions .link-button { border: 1px solid transparent; border-radius: 4px; padding: 5px 9px; color: #111; font-size: 12px; }
+.dianxiaomi-identity-actions .identity-confirm { background: #a8d8b5; border-color: #7ebf91; color: #111; }
+.dianxiaomi-identity-actions .identity-confirm:hover { background: #92cfa2; }
+.dianxiaomi-identity-actions .identity-reject { background: #e9a4a4; border-color: #d97d7d; color: #111; }
+.dianxiaomi-identity-actions .identity-reject:hover { background: #df9090; }
+.dianxiaomi-identity-actions .link-button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
 .browser-item-error { color: var(--danger); font-size: 12px; }
 .status-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .status-grid > * { min-height: 72px; display: flex; flex-direction: column; justify-content: center; gap: 5px; padding: 12px 16px; border-right: 1px solid var(--line); color: var(--ink); }
@@ -140,6 +169,7 @@ input:focus, select:focus { outline: 2px solid #9bd8c3; outline-offset: 1px; bor
 .store-summary-title { position: relative; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-width: 0; }
 .store-summary-title > strong { overflow-wrap: anywhere; }
 .store-summary-title > small { flex-basis: 100%; }
+.store-summary-added-at { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .icon-button { display: inline-grid; place-items: center; width: 25px; height: 25px; padding: 0; border: 1px solid #cad8cc; border-radius: 50%; color: var(--accent-dark); background: #fff; cursor: pointer; font: inherit; line-height: 1; }
 .icon-button:hover { background: #edf7ef; }
   .inline-rename { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; }
@@ -235,9 +265,20 @@ tr:last-child td { border-bottom: 0; }
 .dianxiaomi-filter.active { background: #fff7df; color: #704500; box-shadow: inset 0 -3px #d7a133; }
 .dianxiaomi-filter small { color: var(--muted); font-size: 11px; }
 .dianxiaomi-filter b { font-size: 18px; font-variant-numeric: tabular-nums; }
-.dianxiaomi-list-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 16px 14px 4px; }
+.dianxiaomi-list-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 14px 4px; }
+.dianxiaomi-list-heading-main { display: flex; align-items: center; gap: 10px; }
+.dianxiaomi-list-heading-main [hidden] { display: none; }
 .dianxiaomi-list-heading strong { font-size: 14px; }
-.dianxiaomi-list-heading span { color: var(--muted); font-size: 11px; }
+.dianxiaomi-list-heading > span { color: var(--muted); font-size: 11px; }
+.dianxiaomi-admin-dialog { width: min(420px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--ink); box-shadow: 0 18px 48px #17221d33; }
+.dianxiaomi-admin-dialog::backdrop { background: #17201d66; }
+.dianxiaomi-admin-form { display: grid; gap: 14px; padding: 22px; }
+.dianxiaomi-admin-form h2, .dianxiaomi-admin-form p { margin: 0; }
+.dianxiaomi-admin-form p { color: var(--muted); }
+.dianxiaomi-admin-form label { display: grid; gap: 6px; font-weight: 600; }
+.dianxiaomi-admin-form input { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+.dianxiaomi-admin-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.dianxiaomi-admin-login-error { color: var(--danger); }
 .dianxiaomi-items { display: grid; gap: 8px; min-height: 42px; margin-top: 6px; padding: 0 12px; }
 .dianxiaomi-items > .muted-value { margin: 8px 2px; }
 .dianxiaomi-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; padding: 11px 12px; border: 1px solid var(--line); background: #fffdf7; }
@@ -296,6 +337,9 @@ tr:last-child td { border-bottom: 0; }
 }
 @media (max-width: 1599px) {
   .section-nav { position: sticky; top: 0; right: auto; display: flex; width: 100%; max-height: none; overflow-x: auto; overflow-y: hidden; gap: 3px; margin: -12px 0 18px; padding: 8px 0; border-bottom: 1px solid var(--line); background: var(--canvas); }
+  .section-nav-group { display: flex; flex: 0 0 auto; align-items: center; gap: 3px; padding-right: 7px; border-right: 1px solid var(--line); }
+  .section-nav-group:last-child { padding-right: 0; border-right: 0; }
+  .section-nav-heading { padding: 0 4px; }
   .section-nav a { flex: 0 0 auto; min-height: 32px; padding: 5px 9px; }
 }
 @media (max-width: 560px) {
@@ -320,7 +364,7 @@ tr:last-child td { border-bottom: 0; }
   .dianxiaomi-filter:nth-child(3n) { border-right: 1px solid var(--line); }
   .dianxiaomi-filter:nth-child(2n) { border-right: 0; }
   .dianxiaomi-filter:nth-child(-n+4) { border-bottom: 1px solid var(--line); }
-  .dianxiaomi-list-heading { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .dianxiaomi-list-heading { align-items: flex-start; flex-direction: column; gap: 8px; }
   .status-grid > *:nth-child(3n) { border-right: 1px solid var(--line); }
   .status-grid > *:nth-child(2n) { border-right: 0; }
   .browser-progress-grid { grid-template-columns: repeat(2, 1fr); }
@@ -367,6 +411,9 @@ tr:last-child td { border-bottom: 0; }
 .term-row span { color: var(--muted); font-size: 11px; }
 .term-row b { text-align: right; font-variant-numeric: tabular-nums; }
 @media (max-width: 760px) {
+  .account-layout { grid-template-columns: 1fr; }
+  .topbar { height: auto; min-height: 58px; align-items: flex-start; flex-direction: column; gap: 10px; padding: 12px 16px; }
+  .topbar nav { flex-wrap: wrap; gap: 10px 14px; }
   .insight-columns { grid-template-columns: minmax(0, 1fr); }
   .review-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

@@ -1,6 +1,6 @@
 # 监控台 NAS 部署账号设计
 
-**状态：** 待用户审阅
+**状态：** 用户已确认并授权实施；账号与 SSH Docker context 已建立，实际部署未执行
 **日期：** 2026-10-25
 
 ## 目标
@@ -17,10 +17,14 @@
 
 ## 当前证据与待核验项
 
-- 本地仓库的脚本主要是 Windows `.bat` 和 `.ps1`。`start.bat` 会构建并启动整套 Compose；`stop.bat` 会停止整套 Compose；`scripts/create-admin.ps1` 会构建 backend、运行 Alembic 迁移、创建或确保管理员账号，并启动整套 Compose。这些脚本不能直接作为 NAS Linux 脚本运行。
-- 本轮通过不提示密码的方式测试 NAS SSH 公钥登录，结果为 `Permission denied (publickey,password)`。尚无证据表明本机已经有可用的 NAS 专用密钥。
-- NAS 上 `/vol1/docker-projects/aliexpress-monitor` 的实际脚本、账户组和目录权限尚未清点；不能据本地仓库脚本推断 NAS 上存在相同脚本。
-- 目前没有创建账号、生成密钥或修改 NAS SSH/Docker 权限。
+- 本机专用 Ed25519 密钥已生成、受 Windows 文件 ACL 保护并加载到 ssh-agent；NAS SSH 主机密钥已通过既有可信会话核对。`monitor-nas` 别名可在 BatchMode 下公钥登录。
+- NAS 用户 `monitor-deploy` 已由 fnOS 创建为非 Web 管理员；home 为 `/home/monitor-deploy`，`.ssh` 权限 `700`、`authorized_keys` 权限 `600`。只加入现有 `docker` 组（GID 994），没有加入 NAS 管理员组。该组对 NAS 所有容器及潜在主机挂载有近 root 权限。
+- Windows Docker CLI 已创建显式 context `monitor-nas`，目标为 `ssh://monitor-nas`。默认本地 Docker context 未改变。通过此 context 已只读验证 NAS `docker ps`、本仓库 `docker compose ps`、`config --services` 与 backend `/health`。
+- fnOS 用户页面显示 `Codex专用` 团队共享路径为 `/vol1/team/Codex专用`；监控项目路径为 `/vol1/docker-projects/aliexpress-monitor`，两者不同。尝试添加仅针对该监控项目的 ACL 后，实际文件仍不可读；本次添加的 ACL 已撤销。没有扩大共享权限。
+- 直接对 NAS 项目路径执行 Compose 解析仍因 `.env permission denied` 失败；不需要此权限，因为本机 Docker context 可使用本机仓库的 Compose 配置连接 NAS daemon。
+- 可见项目脚本为 Windows `.bat` / `.ps1`，没有安装 PowerShell 或在 NAS 运行这些脚本。backend 容器启动命令会先执行 `alembic upgrade head`，重建 backend 仍可能触发迁移。
+- 当前最新队列只读状态为 run 35，`2026-10-25 / CATCH_UP / PENDING / STORE_DISCOVERY`，16 项待处理、派发关闭；设置过程中未更改队列或任何服务。
+- 未核实 NAS 路由器端口转发与防火墙规则，不能声称 SSH 未对公网开放。未执行实际部署、镜像构建、数据库迁移或容器重启。
 
 ## 方案
 

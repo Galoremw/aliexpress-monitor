@@ -91,8 +91,11 @@ document.querySelector("#store-form")?.addEventListener("submit", async (event) 
   event.preventDefault();
   const data = new FormData(event.currentTarget);
   try {
-    await jsonRequest("/api/stores", { method: "POST", body: JSON.stringify({ name: data.get("name"), url: data.get("url") }) });
-    notify("店铺已添加；请在 Orders 商品页用扩展按近 7 日增量筛选并入池");
+    const store = await jsonRequest("/api/stores", { method: "POST", body: JSON.stringify({ name: data.get("name"), url: data.get("url") }) });
+    const message = store.initial_collection_status === "deferred"
+      ? store.initial_collection_message || "店铺已添加；首次采集任务等待队列恢复"
+      : "店铺已添加；采集任务已进入待处理队列。选择在线采集电脑并点击“开始采集”后执行。";
+    notify(message);
     window.setTimeout(() => window.location.reload(), 2200);
   } catch (error) { notify(error.message, true); }
 });
@@ -231,6 +234,8 @@ document.querySelectorAll(".dianxiaomi-store").forEach((button) => {
 
 let dianxiaomiItems = [];
 let dianxiaomiActiveFilter = "queued";
+let dianxiaomiCanDeleteFailed = false;
+let dianxiaomiFailedCount = 0;
 
 const dianxiaomiFilterStatuses = {
   queued: ["QUEUED"],
@@ -253,6 +258,17 @@ function renderDianxiaomiFilter() {
   if (title) title.textContent = `${label}商品 · ${filteredItems.length}`;
   if (caption) caption.textContent = `最近 100 项中显示${label}状态；上方汇总为全队列总数`;
   list.innerHTML = filteredItems.map(renderDianxiaomiItem).join("") || `<p class="muted-value">当前没有${escapeDianxiaomiHtml(label)}商品。</p>`;
+  updateDianxiaomiDeleteControls();
+}
+
+function updateDianxiaomiDeleteControls() {
+  const hasFailed = dianxiaomiFailedCount > 0;
+  const deleteAll = document.querySelector("#dianxiaomi-delete-failed");
+  if (deleteAll) {
+    deleteAll.hidden = !hasFailed || !dianxiaomiCanDeleteFailed;
+    deleteAll.textContent = `批量清空失败任务（${dianxiaomiFailedCount}）`;
+    deleteAll.title = `永久删除全部 ${dianxiaomiFailedCount} 条失败记录`;
+  }
 }
 
 async function refreshDianxiaomiStatus() {
@@ -264,11 +280,15 @@ async function refreshDianxiaomiStatus() {
       const target = section.querySelector(`[data-dianxiaomi-value="${key}"]`);
       if (target) target.textContent = status[key];
     });
+    dianxiaomiCanDeleteFailed = Boolean(status.can_delete_failed);
+    dianxiaomiFailedCount = Number(status.failed_count) || 0;
     dianxiaomiItems = status.items || [];
     renderDianxiaomiFilter();
     updateDianxiaomiQueue(status);
+    return status;
   } catch {
     // The integration is optional; a temporary API restart should not affect the dashboard.
+    return null;
   }
 }
 
@@ -276,21 +296,34 @@ function updateDianxiaomiQueue(status) {
   const online = document.querySelector("#dianxiaomi-worker-online");
   const state = document.querySelector("#dianxiaomi-queue-state");
   const current = document.querySelector("#dianxiaomi-current-item");
+  const ownerWaiting = document.querySelector("#dianxiaomi-owner-waiting");
   const heartbeat = document.querySelector("#dianxiaomi-last-heartbeat");
   const resume = document.querySelector("#dianxiaomi-queue-resume");
   const pause = document.querySelector("#dianxiaomi-queue-pause");
   if (online) {
-    online.className = `status ${status.worker_online ? "success" : "pending"}`;
-    online.textContent = status.worker_online ? "本机 Chrome worker 在线" : "本机 Chrome worker 离线";
+    const selected = status.selected_worker;
+    online.className = `status ${selected?.online ? "success" : "pending"}`;
+    online.textContent = selected
+      ? `当前采集电脑：${selected.label} · ${selected.online ? "在线" : "离线"}`
+      : "尚未选择采集电脑";
   }
   if (state) {
     state.textContent = status.paused
       ? status.paused_reason === "needs_confirmation" ? "等待人工确认，队列已暂停" : "店小秘队列已手动暂停"
+      : status.waiting_for_owner ? "等待上一台采集电脑的在途任务结束"
+      : status.waiting_reason ? status.waiting_reason
       : status.needs_confirmation_count ? "有任务等待人工确认"
       : status.stalled_count ? "任务响应超时，等待扩展恢复"
       : (status.processing_count || status.submitted_count) ? "店小秘队列正在处理"
       : status.queued_count ? (status.worker_online ? "队列运行中，等待下一项" : "队列待运行，等待本机 Chrome")
       : "当前没有待处理任务";
+  }
+  if (ownerWaiting) {
+    const owner = status.active_owner;
+    const ownerIsDifferent = owner && owner.worker_id !== status.selected_worker?.worker_id;
+    ownerWaiting.hidden = !status.waiting_reason && !ownerIsDifferent;
+    ownerWaiting.textContent = status.waiting_reason
+      || (ownerIsDifferent ? `当前在途任务由 ${owner.label} 处理，任务结束后再交接。` : "");
   }
   if (current) {
     const item = status.current_item;
@@ -326,8 +359,22 @@ function escapeDianxiaomiHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[character]));
 }
 
+function isDianxiaomiProductPageMismatch(item) {
+  if (item.error_type === "product_page_mismatch") return true;
+  const mismatch = item.detail?.product_page_mismatch;
+  if (mismatch && /^\d+$/.test(String(mismatch.expected_product_id || ""))
+    && /^\d+$/.test(String(mismatch.actual_product_id || ""))
+    && String(mismatch.expected_product_id) !== String(mismatch.actual_product_id)) return true;
+  const message = String(item.error_message || "");
+  const ids = message.match(/目标商品 ID\s*(\d+)\D+当前商品 ID\s*(\d+)/);
+  return Boolean(ids && ids[1] !== ids[2]);
+}
+
 function dianxiaomiNextAction(item) {
   if (item.status === "NEEDS_CONFIRMATION") {
+    if (isDianxiaomiProductPageMismatch(item)) {
+      return "请核对目标商品与实际打开的商品；确认后会记录此商品的 URL 并自动重排";
+    }
     const message = String(item.error_message || "");
     if (message.includes("协议")) return "请在店小秘页面勾选采集协议后点击“重新排队”";
     if (message.includes("登录")) return "请在店小秘页面登录后点击“重新排队”";
@@ -340,17 +387,34 @@ function dianxiaomiNextAction(item) {
 function renderDianxiaomiItem(item) {
   const status = dianxiaomiStatusLabels[item.status] || item.status;
   const statusClass = item.status === "SUCCEEDED" ? "success" : ["FAILED", "NEEDS_CONFIRMATION"].includes(item.status) ? "error" : "";
-  const action = ["NEEDS_CONFIRMATION", "FAILED"].includes(item.status)
+  const productMismatchReview = item.status === "NEEDS_CONFIRMATION"
+    && isDianxiaomiProductPageMismatch(item);
+  const mismatchEvidence = item.detail?.product_page_mismatch || {};
+  const actualId = mismatchEvidence.actual_product_id
+    || String(item.error_message || "").match(/当前商品 ID\s*(\d+)/)?.[1]
+    || "";
+  const actualUrl = mismatchEvidence.actual_url
+    || (actualId ? `https://www.aliexpress.com/item/${actualId}.html` : "");
+  const actualPage = productMismatchReview && actualUrl
+    ? `<span class="dianxiaomi-item-meta">实际打开页：ID ${escapeDianxiaomiHtml(actualId)} · <a href="${escapeDianxiaomiHtml(actualUrl)}" target="_blank" rel="noreferrer">查看实际商品</a></span>`
+    : "";
+  const action = productMismatchReview
+    ? `<div class="dianxiaomi-identity-actions"><button class="link-button identity-confirm" type="button" data-dianxiaomi-action="identity-confirm" data-handoff-id="${item.id}">确认商品无误</button><button class="link-button identity-reject" type="button" data-dianxiaomi-action="identity-reject" data-handoff-id="${item.id}">错误</button></div>`
+    : ["NEEDS_CONFIRMATION", "FAILED"].includes(item.status)
     ? `<button class="link-button" type="button" data-dianxiaomi-action="resume" data-handoff-id="${item.id}">重新排队</button>`
     : ["QUEUED", "CLAIMED", "OPENED", "FILLED", "COLLECTING"].includes(item.status)
       ? `<button class="link-button danger" type="button" data-dianxiaomi-action="cancel" data-handoff-id="${item.id}">取消</button>`
       : "";
+  const deleteAction = item.status === "FAILED"
+    && dianxiaomiCanDeleteFailed
+    ? `<button class="link-button danger" type="button" data-dianxiaomi-action="delete" data-handoff-id="${item.id}">删除</button>`
+    : "";
   const label = `商品 ID ${escapeDianxiaomiHtml(item.platform_product_id || item.product_id || "—")}`;
   const store = escapeDianxiaomiHtml(item.store_name || `店铺 #${item.store_id}`);
   const url = escapeDianxiaomiHtml(item.target_url);
   const error = item.error_message ? ` · ${escapeDianxiaomiHtml(item.error_message)}` : "";
   const nextAction = dianxiaomiNextAction(item);
-  return `<article class="dianxiaomi-item"><div class="dianxiaomi-item-main"><strong class="dianxiaomi-item-title">${label}</strong><span class="dianxiaomi-item-meta">${store} · <a href="${url}" target="_blank" rel="noreferrer">${url}</a></span><span class="dianxiaomi-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(item.requested_at))}${error}</span>${nextAction ? `<span class="dianxiaomi-item-hint">${escapeDianxiaomiHtml(nextAction)}</span>` : ""}</div><div class="dianxiaomi-item-side"><span class="dianxiaomi-status ${statusClass}">${status}</span><span class="dianxiaomi-item-actions">${action}</span></div></article>`;
+  return `<article class="dianxiaomi-item"><div class="dianxiaomi-item-main"><strong class="dianxiaomi-item-title">${label}</strong><span class="dianxiaomi-item-meta">${store} · <a href="${url}" target="_blank" rel="noreferrer">${url}</a></span><span class="dianxiaomi-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(item.requested_at))}${error}</span>${actualPage}${nextAction ? `<span class="dianxiaomi-item-hint">${escapeDianxiaomiHtml(nextAction)}</span>` : ""}</div><div class="dianxiaomi-item-side">${deleteAction}<span class="dianxiaomi-status ${statusClass}">${status}</span><span class="dianxiaomi-item-actions">${action}</span></div></article>`;
 }
 
 function formatDashboardDate(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—"; }
@@ -371,12 +435,42 @@ document.querySelector("#dianxiaomi-status")?.addEventListener("click", (event) 
 document.querySelector("#dianxiaomi-items")?.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-dianxiaomi-action]");
   if (!button) return;
+  const action = button.dataset.dianxiaomiAction;
+  if (action === "delete" && !dianxiaomiCanDeleteFailed) return;
+  if (action === "delete" && !window.confirm("确定永久删除这条采集失败的店小秘任务吗？此操作不可恢复。")) return;
+  if (action === "identity-confirm"
+    && !window.confirm("确认实际打开的商品与监控商品是同一商品吗？确认后会保存该商品的已审核 URL，并自动重新排队。")) return;
+  if (action === "identity-reject"
+    && !window.confirm("确认实际打开的商品与监控商品不一致吗？本条任务将取消，不影响其他队列任务。")) return;
   button.disabled = true;
   try {
-    const action = button.dataset.dianxiaomiAction;
-    const endpoint = action === "resume" ? "resume" : "cancel";
-    await jsonRequest(`/api/integrations/dianxiaomi/handoffs/${button.dataset.handoffId}/${endpoint}`, { method: "POST" });
-    notify(action === "resume" ? "店小秘任务已重新排队" : "店小秘任务已取消");
+    if (action === "delete") {
+      await jsonRequest(`/api/integrations/dianxiaomi/handoffs/${button.dataset.handoffId}`, { method: "DELETE" });
+      notify("失败任务已删除");
+    } else if (["identity-confirm", "identity-reject"].includes(action)) {
+      const decision = action === "identity-confirm" ? "confirm" : "reject";
+      await jsonRequest(`/api/integrations/dianxiaomi/handoffs/${button.dataset.handoffId}/identity-review/${decision}`, { method: "POST" });
+      notify(action === "identity-confirm" ? "已记录商品 URL 身份并重新排队" : "已取消该商品任务，其他队列不受影响");
+    } else {
+      const endpoint = action === "resume" ? "resume" : "cancel";
+      await jsonRequest(`/api/integrations/dianxiaomi/handoffs/${button.dataset.handoffId}/${endpoint}`, { method: "POST" });
+      notify(action === "resume" ? "店小秘任务已重新排队" : "店小秘任务已取消");
+    }
+    await refreshDianxiaomiStatus();
+  } catch (error) {
+    notify(error.message, true);
+    button.disabled = false;
+  }
+});
+document.querySelector("#dianxiaomi-delete-failed")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const count = dianxiaomiFailedCount;
+  if (!count || !dianxiaomiCanDeleteFailed) return;
+  if (!window.confirm(`确定永久删除全部 ${count} 条店小秘采集失败记录吗？其他状态的任务不会删除，此操作不可恢复。`)) return;
+  button.disabled = true;
+  try {
+    const result = await jsonRequest("/api/integrations/dianxiaomi/handoffs/failed", { method: "DELETE" });
+    notify(`已删除 ${result.deleted_count} 条失败记录`);
     await refreshDianxiaomiStatus();
   } catch (error) {
     notify(error.message, true);
@@ -878,7 +972,7 @@ function updateBrowserCollection(run) {
     workerState.className = `browser-worker-state status ${taskState.className}`;
   }
   if (phase) phase.textContent = browserPhaseLabels[run.phase] || run.phase;
-  if (date) date.textContent = `${run.target_date} · 每日店铺页队列`;
+  if (date) date.textContent = `目标 IXSPY 数据日 ${run.latest_data_date || run.target_date} · 每日店铺页队列`;
   if (current) {
     const item = run.current_item;
     current.textContent = item ? `当前：${item.title || item.target_url}` : (run.phase === "COMPLETED" ? "今日队列已完成" : "等待扩展领取任务");

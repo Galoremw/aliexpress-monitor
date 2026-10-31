@@ -26,6 +26,7 @@ function makeWorkerHarness({
   windowCreationStealsFocus = false,
   activeTabCreationStealsFocus = false,
   activeTabActivationStealsFocus = false,
+  initialDashboardWindowState = "normal",
   claimsHeld = false,
   heartbeatConflict = false,
   poolResetBatch = null,
@@ -78,7 +79,7 @@ function makeWorkerHarness({
   let identityReviewPaused = false;
   let currentRunStatus = "RUNNING";
   let focusedWindowId = 7;
-  const windowStates = new Map([[7, "normal"]]);
+  const windowStates = new Map([[7, initialDashboardWindowState]]);
   let currentCollectionResult = collectionResult;
   let currentHeartbeatConflict = heartbeatConflict;
   let currentPoolResetBatch = poolResetBatch;
@@ -88,7 +89,7 @@ function makeWorkerHarness({
     { id: 102, target_type: "PRODUCT", target_url: "https://www.aliexpress.com/item/100000000102.html", title: "Product 2" },
     { id: 103, target_type: "PRODUCT", target_url: "https://www.aliexpress.com/item/100000000103.html", title: "Product 3" },
   ]).map((item, index) => ({ ...item, run_id: 9, position: index + 1, attempt_count: 1, status: "PENDING" }));
-  const dianxiaomiItems = dianxiaomiQueue.map((item) => ({ ...item, status: "QUEUED" }));
+  const dianxiaomiItems = dianxiaomiQueue.map((item) => ({ ...item, status: item.status || "QUEUED" }));
 
   function runPayload() {
     const items = queue.map((item) => ({ ...item }));
@@ -322,6 +323,7 @@ function makeWorkerHarness({
     chrome, context, listeners, storage, queue, dianxiaomiQueue: dianxiaomiItems,
     createdTabs, updatedTabs, removedTabs, windowUpdates, windowCreates, windowRemoves,
     requests, notifications, collectionMessages, candidateScanMessages, scriptCalls, pendingTimers, flush,
+    windowStateFor: (windowId) => windowStates.get(windowId),
     get focusedWindowId() { return focusedWindowId; },
     setCollectionResult(value) { currentCollectionResult = value; },
     setHeartbeatConflict(value) { currentHeartbeatConflict = value; },
@@ -2361,6 +2363,48 @@ test("waitForStorePage accepts an alias only when the backend approved that exac
   assert.deepEqual(worker.collectionMessages[0].approved_store_url_identities, approved);
 });
 
+test("store task opens its backend-approved URL while retaining the canonical target URL", async () => {
+  const targetStoreId = "1105179516";
+  const routeStoreId = "1105182474";
+  const approvedUrl = `https://www.aliexpress.com/store/${routeStoreId}/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc`;
+  const worker = makeWorkerHarness();
+  const item = {
+    id: 824,
+    target_type: "STORE",
+    target_url: `https://www.aliexpress.com/store/${targetStoreId}/pages/all-items.html?sortType=bestmatch_sort&shop_sortType=orders_desc`,
+    collection_start_url: approvedUrl,
+    approved_store_url_identities: [{
+      route_store_id: routeStoreId,
+      normalized_page_identity: `www.aliexpress.com/store/${routeStoreId}/pages/all-items.html`,
+      evidence: { ixspy_store_name: "AMZSTEM Pop Toys Store" },
+    }],
+  };
+
+  await worker.context.openAutomationItem(item, "STORE");
+
+  assert.ok(
+    worker.createdTabs.some((tab) => tab.url === approvedUrl)
+      || worker.updatedTabs.some((tab) => tab.url === approvedUrl),
+    JSON.stringify({ createdTabs: worker.createdTabs, updatedTabs: worker.updatedTabs }),
+  );
+  assert.equal(worker.storage.automationItem.target_url, item.target_url);
+});
+
+test("store task ignores a collection start URL that is not in its approved identities", async () => {
+  const targetUrl = "https://www.aliexpress.com/store/1105179516/pages/all-items.html?shop_sortType=orders_desc";
+  const worker = makeWorkerHarness();
+
+  await worker.context.openAutomationItem({
+    id: 825,
+    target_type: "STORE",
+    target_url: targetUrl,
+    collection_start_url: "https://www.aliexpress.com/store/1105182474/pages/all-items.html?shop_sortType=orders_desc",
+    approved_store_url_identities: [],
+  }, "STORE");
+
+  assert.ok(worker.updatedTabs.some((tab) => tab.url === targetUrl));
+});
+
 test("waitForStorePage refuses an alias omitted from this store's backend identity list", async () => {
   const targetStoreId = "1105179516";
   const routeStoreId = "1105182474";
@@ -2621,10 +2665,9 @@ test("single-product IXSPY test briefly focuses the worker window and restores p
   assert.equal(worker.storage.foregroundSingleTestReturnWindowId, undefined);
 });
 
-test("a local dashboard handoff wakes Dianxiaomi collection in the same Chrome window", async () => {
+test("Dianxiaomi does not claim without a worker dashboard context", async () => {
   const worker = makeWorkerHarness({
     dedicatedProfile: false,
-    legacyDianxiaomiHeartbeat: true,
     dianxiaomiQueue: [{
       id: 401,
       target_url: "https://www.aliexpress.com/item/100000000401.html",
@@ -2641,13 +2684,149 @@ test("a local dashboard handoff wakes Dianxiaomi collection in the same Chrome w
   }, () => {});
   await worker.flush();
 
-  assert.ok(worker.requests.some((request) => request.pathname.endsWith("/queue/heartbeat")));
+  assert.equal(worker.requests.some((request) => request.pathname.endsWith("/handoffs/claim-batch")), false);
+  assert.equal(worker.createdTabs.length, 0);
+  assert.equal(worker.windowCreates.length, 0);
+});
+
+test("Dianxiaomi uses the stable browser worker UUID for heartbeat, claim, and status", async () => {
+  const worker = makeWorkerHarness({
+    dedicatedProfile: false,
+    dashboardUrl: "http://192.168.66.115:3000/?browser_collection=1",
+    dianxiaomiQueue: [{
+      id: 402,
+      target_url: "https://www.aliexpress.com/item/100000000402.html",
+      product_id: 402,
+      status: "QUEUED",
+    }],
+  });
+  await worker.listeners.message.callback({
+    type: "dashboard-context",
+    browser_collection_mode: true,
+    browser_collection_mode_explicit: true,
+    dianxiaomi_browser_worker_mode: true,
+    api_base_url: "http://192.168.66.115:3000",
+  }, {
+    tab: { id: 1, windowId: 7, url: "http://192.168.66.115:3000/?browser_collection=1" },
+  }, () => {});
+  await worker.flush();
+
+  assert.equal(worker.storage.dianxiaomiWorkerMode, true);
+  assert.equal(worker.storage.dianxiaomiDashboardTabId, 1);
+  assert.equal(worker.storage.dianxiaomiDashboardWindowId, 7);
+  assert.ok(await worker.context.dianxiaomiWorkerDashboardContext());
+  const workerId = worker.storage.browserCollectionWorkerId;
+  const heartbeat = worker.requests.find((request) => request.pathname.endsWith("/queue/heartbeat"));
+  const claim = worker.requests.find((request) => request.pathname.endsWith("/handoffs/claim-batch"));
+  const status = worker.requests.find((request) => /\/handoffs\/402\/status$/.test(request.pathname));
+  assert.ok(workerId);
+  assert.equal(heartbeat.body.worker_id, workerId);
+  assert.equal(claim.body.worker_id, workerId);
+  assert.equal(status.body.worker_id, workerId);
+});
+
+test("Dianxiaomi keeps a product-page mismatch for review and continues to the next queued item", async () => {
+  const workerId = "qx-test-worker";
+  const worker = makeWorkerHarness({
+    dedicatedProfile: false,
+    dashboardUrl: "http://192.168.66.115:3000/?browser_collection=1",
+    dianxiaomiQueue: [
+      {
+        id: 410,
+        status: "NEEDS_CONFIRMATION",
+        worker_id: workerId,
+        error_type: "manual_confirmation_required",
+        error_message: "店小秘工作窗口未加载队列商品（目标商品 ID 3256812865076992，当前商品 ID 1005013051391744）",
+      },
+      {
+        id: 411,
+        status: "QUEUED",
+        target_url: "https://www.aliexpress.com/item/100000000411.html",
+        product_id: 411,
+      },
+    ],
+  });
+  await worker.chrome.storage.local.set({ browserCollectionWorkerId: workerId });
+
+  await worker.listeners.message.callback({
+    type: "dashboard-context",
+    browser_collection_mode: true,
+    browser_collection_mode_explicit: true,
+    dianxiaomi_browser_worker_mode: true,
+    api_base_url: "http://192.168.66.115:3000",
+  }, {
+    tab: { id: 1, windowId: 7, url: "http://192.168.66.115:3000/?browser_collection=1" },
+  }, () => {});
+  await worker.flush();
+
+  assert.equal(worker.dianxiaomiQueue[0].status, "NEEDS_CONFIRMATION");
+  assert.notEqual(worker.dianxiaomiQueue[1].status, "QUEUED");
   assert.ok(worker.requests.some((request) => request.pathname.endsWith("/handoffs/claim-batch")));
+});
+
+test("Dianxiaomi reuses the worker dashboard window for its product tab", async () => {
+  const worker = makeWorkerHarness({
+    dedicatedProfile: false,
+    dashboardUrl: "http://192.168.66.115:3000/?browser_collection=1",
+    dashboardUrl: "http://192.168.66.115:3000/?browser_collection=1",
+    dianxiaomiQueue: [{
+      id: 403,
+      target_url: "https://www.aliexpress.com/item/100000000403.html",
+      product_id: 403,
+      status: "QUEUED",
+    }],
+  });
+  await worker.listeners.message.callback({
+    type: "dashboard-context",
+    browser_collection_mode: true,
+    browser_collection_mode_explicit: true,
+    dianxiaomi_browser_worker_mode: true,
+    api_base_url: "http://192.168.66.115:3000",
+  }, {
+    tab: { id: 1, windowId: 7, url: "http://192.168.66.115:3000/?browser_collection=1" },
+  }, () => {});
+  await worker.flush();
+
+  assert.equal(worker.windowCreates.length, 0);
   assert.equal(worker.createdTabs.length, 1);
   assert.equal(worker.createdTabs[0].windowId, 7);
-  assert.equal(worker.createdTabs[0].active, false);
-  assert.equal(worker.storage.dianxiaomiWorkerMode, true);
-  assert.equal(worker.dianxiaomiQueue[0]?.status, "SUCCEEDED");
+  assert.equal(worker.storage.dianxiaomiDashboardTabId, 1);
+  assert.equal(worker.storage.dianxiaomiDashboardWindowId, 7);
+});
+
+test("Dianxiaomi waits until a reused tab has loaded the target product before dispatching", async () => {
+  const worker = makeWorkerHarness({ dedicatedProfile: false, realTimers: true });
+  const oldUrl = "https://www.aliexpress.com/item/100000000499.html";
+  const targetUrl = "https://www.aliexpress.com/item/100000000403.html";
+  const tab = await worker.chrome.tabs.create({ windowId: 7, url: oldUrl, active: true });
+
+  setTimeout(() => {
+    tab.url = targetUrl;
+    tab.status = "complete";
+  }, 25);
+
+  const ready = await worker.context.waitForDianxiaomiProductTab(tab.id, "100000000403");
+
+  assert.equal(new URL(ready.url).pathname, new URL(targetUrl).pathname);
+  assert.equal(ready.status, "complete");
+});
+
+test("Dianxiaomi focuses its product tab without restoring a maximized Chrome window", async () => {
+  const worker = makeWorkerHarness({ initialDashboardWindowState: "maximized" });
+  const tab = await worker.chrome.tabs.create({
+    windowId: 7,
+    url: "https://www.aliexpress.com/item/100000000404.html",
+    active: true,
+  });
+
+  await worker.context.focusDianxiaomiProductTab(tab.id);
+
+  assert.equal(worker.windowStateFor(7), "maximized");
+  assert.deepEqual(worker.windowUpdates.at(-1), {
+    id: 7,
+    focused: true,
+    collectionMessageCount: 0,
+  });
 });
 
 test("collection heartbeat renews the active and prefetched task leases", async () => {
@@ -2698,6 +2877,44 @@ test("worker identity is stable per extension profile and heartbeat advertises i
   const localHeartbeat = localWorker.requests.find((request) => request.pathname === "/api/browser-collection/heartbeat");
   assert.notEqual(localWorker.storage.browserCollectionWorkerId, firstId);
   assert.equal(localHeartbeat.body.worker_label, "Galore主机");
+});
+
+test("custom collection URL advertises its own worker label after extension restart", async () => {
+  const worker = makeWorkerHarness({
+    dedicatedProfile: false,
+    dashboardUrl: "http://192.168.66.115:3000/?browser_collection=1&browser_collection_name=Qx%E7%9A%84computer",
+    claimsHeld: true,
+  });
+
+  await worker.context.syncDedicatedWorkerMode();
+  await worker.context.sendBrowserCollectionHeartbeat();
+
+  const heartbeat = worker.requests.find((request) => request.pathname === "/api/browser-collection/heartbeat");
+  assert.equal(heartbeat.body.worker_label, "Qx的computer");
+});
+
+test("dashboard context clears a custom worker label when returning to the legacy URL", async () => {
+  const worker = makeWorkerHarness({ dedicatedProfile: false, claimsHeld: true });
+  const dashboardContext = async (url) => {
+    await worker.chrome.tabs.update(1, { url });
+    worker.listeners.message.callback({
+      type: "dashboard-context",
+      browser_collection_mode: true,
+      browser_collection_mode_explicit: true,
+    }, { tab: { id: 1, windowId: 7, url } }, () => {});
+    await worker.flush();
+    await worker.context.sendBrowserCollectionHeartbeat();
+    return worker.requests.filter((request) => request.pathname === "/api/browser-collection/heartbeat").at(-1);
+  };
+
+  const custom = await dashboardContext(
+    "http://192.168.66.115:3000/?browser_collection=1&browser_collection_name=Qx%E7%9A%84computer",
+  );
+  const legacy = await dashboardContext("http://192.168.66.115:3000/?browser_collection=1");
+
+  assert.equal(custom.body.worker_label, "Qx的computer");
+  assert.equal(legacy.body.worker_label, "第二台电脑");
+  assert.equal(custom.body.worker_id, legacy.body.worker_id);
 });
 
 test("a held browser worker does not create an automation window before a claim", async () => {
@@ -2840,6 +3057,132 @@ test("manual start leaves the dashboard window alone and maximizes the focused w
   assert.equal(worker.windowCreates[0].focused, true);
   assert.equal(worker.windowCreates[0].state, "maximized");
   assert.equal(worker.windowUpdates.some((update) => update.id === 7 && update.focused === true), false);
+});
+
+test("remote QX collection opens tasks in the monitor window and preserves its dashboard tab", async () => {
+  const origin = "http://192.168.66.115:3000";
+  const dashboardUrl = `${origin}/?browser_collection=1&browser_collection_name=Qx%E7%9A%84computer`;
+  const worker = makeWorkerHarness({ dedicatedProfile: false, dashboardUrl });
+
+  worker.listeners.message.callback({
+    type: "dashboard-context",
+    api_base_url: origin,
+    browser_collection_mode: true,
+    browser_collection_mode_explicit: true,
+  }, { tab: { id: 1, windowId: 7, url: dashboardUrl } }, () => {});
+  await worker.flush();
+  assert.equal(worker.storage.browserCollectionRemoteProfileEnabled, true, "detects QX remote mode");
+  worker.listeners.message.callback({ type: "browser-collection-run-requested", api_base_url: origin }, {
+    tab: { id: 1, windowId: 7, url: dashboardUrl },
+  }, () => {});
+  await worker.flush();
+
+  const taskTab = await worker.chrome.tabs.get(worker.storage.automationTabId);
+  assert.equal(worker.windowCreates.length, 0, "remote collection does not open another Chrome window");
+  assert.equal(worker.createdTabs.length, 1, "creates only the actual task tab, not an idle blank tab");
+  assert.equal(worker.createdTabs[0].url, "https://www.aliexpress.com/item/100000000101.html");
+  assert.equal(worker.storage.automationWindowId, 7);
+  assert.equal(worker.storage.automationWindowOwned, false, "the monitor window is not owned by the collector");
+  assert.equal(taskTab.windowId, 7);
+  assert.equal(taskTab.active, true, "the task opens as a foreground tab beside the monitor");
+  assert.equal((await worker.chrome.tabs.get(1)).url, dashboardUrl, "the monitor tab is not navigated or closed");
+});
+
+test("held remote QX worker creates no idle tab before collection starts", async () => {
+  const origin = "http://192.168.66.115:3000";
+  const dashboardUrl = `${origin}/?browser_collection=1&browser_collection_name=Qx%E7%9A%84computer`;
+  const worker = makeWorkerHarness({
+    dedicatedProfile: false,
+    dashboardUrl,
+    claimsHeld: true,
+  });
+
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.equal(worker.windowCreates.length, 0);
+  assert.equal(worker.createdTabs.length, 0, "a held queue leaves the current monitor window untouched");
+  assert.equal((await worker.chrome.tabs.get(1)).url, dashboardUrl);
+});
+
+test("remote QX collection keeps an existing task in the monitor window after extension reload", async () => {
+  let finishCollection;
+  const collectionGate = new Promise((resolve) => { finishCollection = resolve; });
+  const origin = "http://192.168.66.115:3000";
+  const dashboardUrl = `${origin}/?browser_collection=1&browser_collection_name=Qx%E7%9A%84computer`;
+  const worker = makeWorkerHarness({
+    dedicatedProfile: false,
+    dashboardUrl,
+    collectionResult: collectionGate,
+  });
+  const task = worker.queue[0];
+  task.status = "RUNNING";
+  const taskTab = await worker.chrome.tabs.create({
+    windowId: 8,
+    url: task.target_url,
+    active: true,
+  });
+  Object.assign(worker.storage, {
+    browserCollectionWorkerMode: true,
+    browserCollectionRemoteProfileEnabled: true,
+    automationDashboardTabId: 1,
+    automationWindowId: 8,
+    automationWindowOwned: true,
+    automationWindowBackground: true,
+    automationTabId: taskTab.id,
+    automationItem: task,
+    automationClaimToken: "remote-reload-claim",
+    automationTaskKind: "PRODUCT",
+  });
+
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.equal(worker.windowCreates.length, 0, "reload recovery does not create a separate collector window");
+  assert.equal((await worker.chrome.tabs.get(taskTab.id)).windowId, 7,
+    "the in-flight task is moved into the existing monitor window");
+  assert.equal((await worker.chrome.tabs.get(1)).url, dashboardUrl, "the dashboard remains intact");
+  assert.equal(worker.storage.automationWindowOwned, false);
+  assert.ok(worker.collectionMessages.length > 0, "collection resumes in the migrated tab");
+  finishCollection({ state: "partial", payload: {} });
+  await worker.flush();
+});
+
+test("remote QX collection corrects stale window ownership when its task is already beside the dashboard", async () => {
+  let finishCollection;
+  const collectionGate = new Promise((resolve) => { finishCollection = resolve; });
+  const origin = "http://192.168.66.115:3000";
+  const dashboardUrl = `${origin}/?browser_collection=1&browser_collection_name=Qx%E7%9A%84computer`;
+  const worker = makeWorkerHarness({
+    dedicatedProfile: false,
+    dashboardUrl,
+    collectionResult: collectionGate,
+  });
+  const task = worker.queue[0];
+  task.status = "RUNNING";
+  const taskTab = await worker.chrome.tabs.create({ windowId: 7, url: task.target_url, active: true });
+  Object.assign(worker.storage, {
+    browserCollectionWorkerMode: true,
+    browserCollectionRemoteProfileEnabled: true,
+    automationDashboardTabId: 1,
+    automationWindowId: 7,
+    automationWindowOwned: true,
+    automationWindowBackground: true,
+    automationTabId: taskTab.id,
+    automationItem: task,
+    automationClaimToken: "same-window-reload-claim",
+    automationTaskKind: "PRODUCT",
+  });
+
+  worker.chrome.alarms.onAlarm.callback({ name: "aliexpress-monitor-browser-collection" });
+  await worker.flush();
+
+  assert.equal(worker.windowCreates.length, 0);
+  assert.equal(worker.storage.automationWindowOwned, false, "the shared monitor window is never treated as disposable");
+  assert.equal((await worker.chrome.tabs.get(taskTab.id)).windowId, 7);
+  assert.equal((await worker.chrome.tabs.get(1)).url, dashboardUrl);
+  finishCollection({ state: "partial", payload: {} });
+  await worker.flush();
 });
 
 test("a stale worker-window id that points at the dashboard is replaced with a separate task window", async () => {

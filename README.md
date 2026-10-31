@@ -29,7 +29,7 @@
 
 项目目录中还提供 `AliExpress Monitor.url`，可以右键发送到桌面作为网页快捷方式。网页快捷方式要求服务已经运行；希望双击时自动启动 Docker 的场景，请为 `open-monitor.bat` 创建桌面快捷方式。
 
-监控台的“打开专用 Chrome”按钮使用隔离配置 `%LOCALAPPDATA%\AliExpressMonitor\DianxiaomiProfile`，不会打开或关闭日常 Chrome。已有专用窗口时会唤回原窗口并保留当前标签。首次运行 `start.bat` 会为当前 Windows 用户注册本机 `aliexpress-monitor://` 启动协议；浏览器首次询问是否打开外部应用时选择允许。
+店小秘任务本身不再额外启动 Chrome 配置或窗口；它复用当前选中的采集电脑上已打开的监控台 worker 窗口，并在同一窗口打开商品标签。`aliexpress-monitor-collector://start` 是 Galore 日常浏览器采集的独立启动入口，不由店小秘任务调用，也不能改变后端选中的采集电脑。首次运行 `start.bat` 会为当前 Windows 用户注册本机 `aliexpress-monitor://` 启动协议；浏览器首次询问是否打开外部应用时选择允许。
 
 ## Hosted Frontend and Backend
 
@@ -116,13 +116,13 @@ docker compose up -d --build
 
 ## 每日浏览器自动采集
 
-双击 `install-browser-collector.bat` 会创建 Windows 计划任务 `AliExpress Monitor Daily Collection`，每天北京时间 `02:00` 调用 `start-browser-collector.bat`。如果计划时间电脑未开机，Windows 会在当前用户下次登录后尽快补跑。计划任务确保本地服务运行，并启动独立 Chrome 用户配置 `%LOCALAPPDATA%\AliExpressMonitor\BrowserCollectorProfile`；它不会关闭、复用或改动日常 Chrome 配置。
+双击 `install-browser-collector.bat` 会创建 Windows 计划任务 `AliExpress Monitor Daily Collection`，每天北京时间 `15:15` 调用 `start-browser-collector.bat`。如果计划时间电脑未开机，Windows 会在当前用户下次登录后尽快补跑。计划任务确保本地服务运行，并启动独立 Chrome 用户配置 `%LOCALAPPDATA%\AliExpressMonitor\BrowserCollectorProfile`；它不会关闭、复用或改动日常 Chrome 配置。
 
 首次启用时，运行一次 `start-browser-collector.bat`，从任务栏打开新出现的独立 Chrome 窗口，在该配置中登录监控台、AliExpress 和 IXSPY。启动器通过 Chrome 的 `--load-extension` 加载项目 `extension/`；无需把 worker 参数加到日常监控台。独立配置完成登录后可保持运行，计划任务会复用它；如果尚未运行，计划任务会单独启动它。采集窗口保持可见但不抢键盘焦点；若遇到验证，才会将验证页置前。普通 Chrome 可以照常使用。
 
 在 Galore 主机本机通过 `http://127.0.0.1:3000` 打开监控台，可点击“Galore主机采集”启动或唤起该独立 Chrome；按钮只负责启动浏览器，不创建或启动采集队列。`start.bat` 会注册按钮所需的本机启动协议。
 
-每日 `02:00` 调度只准备当日店铺页队列，队列保持待启动，不会自动打开店铺或商品页面。要运行队列，在监控台“每日浏览器采集”中选择一台在线采集电脑，再单独点击“开始采集”；只有所选电脑可以领取任务，没有自动切换或并行采集。切换电脑时需等旧任务结束，再重新选择并点击开始。`立即采集全部` 与“重新检查今日任务”只准备或刷新队列，不会启动采集。
+每日 `15:15` 调度准备待启动的店铺页队列，并以 IXSPY 已截止的最新数据日作为窗口末日；采集不会自动打开店铺或商品页面。上海时间 15:00 前，数据窗口截止到前两天；15:00 起，截止到前一天。要运行队列，在监控台“每日浏览器采集”中选择一台在线采集电脑，再单独点击“开始采集”；只有所选电脑可以领取任务，没有自动切换或并行采集。切换电脑时需等旧任务结束，再重新选择并点击开始。`立即采集全部` 与“重新检查今日任务”只准备或刷新队列，不会启动采集。
 
 开始后，扩展会逐个访问活跃店铺的公开 Orders 排序页更新监控池，再采集当天尚无有效快照的商品。自动发现且已离开前 20 的商品会停用，手动添加商品不会自动停用。扩展心跳仅表示电脑在线；页面验证仍由用户处理。扩展需使用包含 worker identity 与 claim token 的新版本；旧版本不会领取受控队列。
 

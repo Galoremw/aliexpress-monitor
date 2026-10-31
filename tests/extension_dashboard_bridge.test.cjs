@@ -32,6 +32,7 @@ test("LAN dashboard bridge uses its same-origin API and enables the remote worke
   assert.equal(messages[0].api_base_url, "http://192.168.66.115:3000");
   assert.equal(messages[0].browser_collection_mode, true);
   assert.equal(messages[0].browser_collection_local_mode, false);
+  assert.equal(messages[0].dianxiaomi_browser_worker_mode, true);
   assert.equal(messages[0].api_access_token, "session-token");
 });
 

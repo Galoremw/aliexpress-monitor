@@ -30,12 +30,21 @@ def utcnow() -> datetime:
 
 class User(Base):
     __tablename__ = "users"
-    __table_args__ = (Index("ix_users_username", "username", unique=True),)
+    __table_args__ = (
+        Index("ix_users_username", "username", unique=True),
+        CheckConstraint("role IN ('admin', 'operator')", name="ck_users_role"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     username: Mapped[str] = mapped_column(String(128), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    role: Mapped[str] = mapped_column(
+        String(16), default="operator", server_default="operator", nullable=False
+    )
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

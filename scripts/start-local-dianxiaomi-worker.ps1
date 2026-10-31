@@ -1,36 +1,8 @@
 $ErrorActionPreference = "Stop"
-$projectRoot = Split-Path -Parent $PSScriptRoot
-$healthUrls = @("http://127.0.0.1:8000/health", "http://127.0.0.1:3000/health")
 
-function Test-MonitorHealth {
-    foreach ($url in $healthUrls) {
-        try { Invoke-WebRequest -UseBasicParsing $url -TimeoutSec 3 | Out-Null }
-        catch { return $false }
-    }
-    return $true
-}
-
-if (-not (Test-MonitorHealth)) {
-    $startScript = Join-Path $projectRoot "start.bat"
-    & $startScript --no-open
-    $healthy = $false
-    for ($attempt = 0; $attempt -lt 60; $attempt++) {
-        if (Test-MonitorHealth) {
-            $healthy = $true
-            break
-        }
-        Start-Sleep -Seconds 2
-    }
-    if (-not $healthy) { throw "AliExpress Monitor backend or frontend did not become healthy." }
-}
-
-$chromeCandidates = @(
-    (Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"),
-    (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"),
-    (Join-Path $env:LOCALAPPDATA "Google\Chrome\Application\chrome.exe")
-)
-$chromeExe = $chromeCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-if (-not $chromeExe) { throw "Google Chrome was not found." }
-
-$workerUrl = "http://127.0.0.1:3000/?dianxiaomi_worker=1&dianxiaomi_local=1"
-Start-Process -FilePath $chromeExe -ArgumentList @("--new-tab", $workerUrl)
+Write-Host "店小秘采集复用监控台当前选中的采集电脑和已打开的 Chrome 窗口。"
+Write-Host "请在已登录监控台、AliExpress，并已启用本项目扩展和店小秘助手的 Chrome 中打开 worker 模式监控台。"
+Write-Host "NAS/LAN worker 地址：在当前监控台地址后添加 ?browser_collection=1；已有 ? 参数时使用 &browser_collection=1。"
+Write-Host "本机 127.0.0.1/localhost 地址：使用 ?browser_collection=1&browser_collection_profile=isolated，或 ?dianxiaomi_worker=1&dianxiaomi_local=1。"
+Write-Host "然后在监控台唯一的“采集电脑”选择器中选中本机，并手动开始或继续队列。"
+Write-Host "此脚本不会启动、关闭或更改 Chrome 配置，也不会开始采集。"

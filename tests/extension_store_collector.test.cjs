@@ -1059,6 +1059,27 @@ test("backend-approved URL alias is accepted only when listed for the current st
   assert.equal(result.store_identity.identity_method, "backend_approved_url_alias");
 });
 
+test("previously confirmed exact store URL is accepted when the current page hides its Store ID", async () => {
+  const storeId = "1105272224";
+  const result = await loadStoreCollector({
+    routeStoreId: storeId,
+    visibleStoreId: "",
+    storeInfoId: null,
+    ixspyStoreName: null,
+  }).collect("STORE_IDENTITY", targetDate, {
+    expected_store_id: storeId,
+    approved_store_url_identities: [{
+      route_store_id: storeId,
+      normalized_page_identity: `www.aliexpress.com/store/${storeId}/pages/all-items.html`,
+      evidence: { ixspy_store_name: "3D_ZeapoAI 3DPrinted Store" },
+    }],
+  });
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.platform_store_id, storeId);
+  assert.equal(result.store_identity.identity_method, "backend_approved_url_identity");
+});
+
 test("approved URL alias remains under review when the IXSPY store name conflicts", async () => {
   const routeStoreId = "1105182474";
   const result = await loadStoreCollector({

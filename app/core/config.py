@@ -20,8 +20,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://monitor:monitor@localhost:5432/monitor"
     timezone: str = "Asia/Shanghai"
     scheduler_enabled: bool = True
-    scheduler_hour: int = Field(default=2, ge=0, le=23)
-    scheduler_minute: int = Field(default=0, ge=0, le=59)
+    scheduler_hour: int = Field(default=15, ge=0, le=23)
+    scheduler_minute: int = Field(default=15, ge=0, le=59)
     collector_timeout_seconds: float = Field(default=20.0, gt=0)
     collector_user_agent: str = "AliExpressMonitor/0.1 (+public-data-research)"
     firecrawl_enabled: bool = True

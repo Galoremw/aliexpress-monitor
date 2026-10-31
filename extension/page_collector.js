@@ -1,7 +1,7 @@
 (function () {
   if (globalThis.AliExpressMonitorPageCollector) return;
 
-  const PAGE_COLLECTOR_VERSION = "0.6.105";
+  const PAGE_COLLECTOR_VERSION = "0.6.122";
   let verifiedStoreIdentity = null;
   const STORE_MORE_ACTION_WAIT_MS = 5000;
   const STORE_PRODUCT_HISTORY_TIMEOUT_MS = 75 * 1000;
@@ -764,18 +764,36 @@
   function storeOrdersUrlIdentity(value) {
     try {
       const parsed = new URL(value);
-      const routeStoreId = parsed.pathname.match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
+      const routeStoreId = parsed.pathname.match(/^\/store\/(\d+)(?:\/pages\/all-items\.html)?$/)?.[1];
       if (parsed.protocol !== "https:"
         || !/(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
         || (parsed.port && parsed.port !== "443")
         || !routeStoreId) return null;
       return {
         route_store_id: routeStoreId,
-        normalized_page_identity: `${parsed.hostname.toLowerCase()}${parsed.pathname}`,
+        normalized_page_identity: `${parsed.hostname.toLowerCase()}/store/${routeStoreId}/pages/all-items.html`,
       };
     } catch {
       return null;
     }
+  }
+
+  function normalizedStoreOrdersPagePath(value) {
+    try {
+      const raw = String(value || "");
+      const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+      if (!/(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
+        || parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) return null;
+      const routeStoreId = parsed.pathname.match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
+      return routeStoreId ? `/store/${routeStoreId}/pages/all-items.html` : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function sameStoreOrdersPageIdentity(left, right) {
+    const leftPath = normalizedStoreOrdersPagePath(left);
+    return Boolean(leftPath && leftPath === normalizedStoreOrdersPagePath(right));
   }
 
   function approvedStoreUrlIdentity(pageUrl, expectedStoreId, approvedIdentities = []) {
@@ -783,7 +801,7 @@
     if (!current || !Array.isArray(approvedIdentities)) return null;
     return approvedIdentities.find((identity) =>
       String(identity?.route_store_id || "") === current.route_store_id
-      && identity?.normalized_page_identity === current.normalized_page_identity
+      && sameStoreOrdersPageIdentity(identity?.normalized_page_identity, current.normalized_page_identity)
       && Boolean(expectedStoreId)
     ) || null;
   }
@@ -810,6 +828,69 @@
       if (names.length === 1) return names[0];
     }
     return null;
+  }
+
+  function readStoreNameCandidates(ixspyStoreName = null) {
+    const title = clean(document.title);
+    const titleName = title.split(/\s+(?:-|—|\||·)\s+/)[0]?.trim();
+    const headingNames = [...document.querySelectorAll("h1, h2, [role='heading']")]
+      .filter((node) => typeof node?.getBoundingClientRect === "function" && visible(node))
+      .map((node) => clean(node.innerText || node.textContent))
+      .filter((value) => value && value.length <= 255
+        && !/^(?:store|shop\s*\d+\s+store|store\s*(?:id|overview)|店铺(?:\s*(?:id|概览))?)$/i.test(value));
+    return [...new Set([ixspyStoreName, titleName, ...headingNames]
+      .filter((value) => typeof value === "string")
+      .map((value) => clean(value))
+      .filter((value) => value && value.length <= 255
+        && !/^(?:aliexpress|shop\s*\d+\s+store)$/i.test(value)))];
+  }
+
+  function storeIdentityProductEvidence(options = {}, ixspyStoreName = null) {
+    const configuredIds = Array.isArray(options.identity_monitored_product_ids)
+      && options.identity_monitored_product_ids.length
+      ? options.identity_monitored_product_ids
+      : Array.isArray(options.monitored_product_ids) ? options.monitored_product_ids : [];
+    const monitoredIds = new Set(configuredIds.map(String));
+    const visibleIds = [...new Set(scanStoreProducts().products
+      .map((product) => String(product.platform_product_id)))];
+    const visibleSet = new Set(visibleIds);
+    const matchedProductIds = [...monitoredIds].filter((productId) => visibleSet.has(productId)).sort();
+    const observedStoreNames = readStoreNameCandidates(ixspyStoreName);
+    const knownStoreNames = [
+      options.expected_store_name,
+      ...(Array.isArray(options.approved_store_url_identities)
+        ? options.approved_store_url_identities.map((identity) => identity?.evidence?.ixspy_store_name)
+        : []),
+    ].filter((value) => typeof value === "string" && value.trim());
+    const normalizedKnownNames = new Set(knownStoreNames.map(normalizeStoreName).filter(Boolean));
+    const matchedStoreName = observedStoreNames.find((value) => normalizedKnownNames.has(normalizeStoreName(value))) || null;
+    return {
+      visible_product_ids: visibleIds,
+      matched_product_ids: matchedProductIds,
+      catalog_match_count: matchedProductIds.length,
+      expected_store_name: options.expected_store_name || null,
+      ixspy_store_name: ixspyStoreName || null,
+      observed_store_names: observedStoreNames,
+      matched_store_name: matchedStoreName,
+      store_name_match: Boolean(matchedStoreName),
+    };
+  }
+
+  function storeIdentityProductEvidenceIsStrong(evidence) {
+    return evidence.catalog_match_count >= 2
+      || (evidence.catalog_match_count >= 1 && evidence.store_name_match);
+  }
+
+  async function waitForStoreProductIdentityEvidence(options, ixspyStoreName, timeoutMs = 1500) {
+    const deadline = Date.now() + timeoutMs;
+    let observedStoreName = ixspyStoreName;
+    let evidence = storeIdentityProductEvidence(options, observedStoreName);
+    while (!storeIdentityProductEvidenceIsStrong(evidence) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      observedStoreName = readIxspyStoreOverviewName() || observedStoreName;
+      evidence = storeIdentityProductEvidence(options, observedStoreName);
+    }
+    return evidence;
   }
 
   async function waitForStoreIdentityEvidence(timeoutMs = 1800) {
@@ -866,25 +947,6 @@
         trigger.dispatchEvent(new MouseEvent("mouseleave", { cancelable: false, view: window }));
         return { evidence, trigger_text: text, method: "hover", trigger_count: triggers.length, attempted_count: attemptedCount };
       }
-      const link = trigger.closest?.("a[href]");
-      const preventNavigation = (event) => event.preventDefault();
-      if (link) link.addEventListener("click", preventNavigation, { capture: true, once: true });
-      trigger.dispatchEvent(new pointerEvent("pointerdown", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1 }));
-      trigger.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 1 }));
-      trigger.dispatchEvent(new pointerEvent("pointerup", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 0 }));
-      trigger.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window, button: 0, buttons: 0 }));
-      trigger.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-      if (link) link.removeEventListener("click", preventNavigation, true);
-      const clickedEvidence = await waitForStoreIdentityEvidence();
-      if (clickedEvidence.labeled_store_ids.length) {
-        return {
-          evidence: clickedEvidence,
-          trigger_text: text,
-          method: link ? "safe_link_click" : "click",
-          trigger_count: triggers.length,
-          attempted_count: attemptedCount,
-        };
-      }
       trigger.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, cancelable: true, view: window }));
       trigger.dispatchEvent(new MouseEvent("mouseleave", { cancelable: false, view: window }));
     }
@@ -902,11 +964,13 @@
       location.href, targetStoreId, options.approved_store_url_identities,
     );
     let probe = null;
-    if (!evidence.labeled_store_ids.length) {
+    if (!evidence.labeled_store_ids.length && !savedAlias) {
       probe = await revealStoreIdentity();
       evidence = probe?.evidence || readStoreIdentityEvidence();
     }
-    evidence = { ...evidence, ixspy_store_name: ixspyStoreName };
+    const productIdentityEvidence = await waitForStoreProductIdentityEvidence(options, ixspyStoreName);
+    evidence = { ...evidence, ixspy_store_name: ixspyStoreName, ...productIdentityEvidence };
+    const strongProductIdentity = storeIdentityProductEvidenceIsStrong(productIdentityEvidence);
     const conflictingDisplayedId = evidence.labeled_store_ids.find((id) => id !== targetStoreId)
       || (evidence.heading_store_id !== null && evidence.heading_store_id !== targetStoreId
         ? evidence.heading_store_id : null);
@@ -916,7 +980,11 @@
     let identityError = null;
     let errorType = "store_identity_unverified";
     let identityMethod = "unverified";
-    if (conflictingDisplayedId) {
+    if (strongProductIdentity) {
+      identityMethod = productIdentityEvidence.catalog_match_count >= 2
+        ? "monitored_product_fingerprint"
+        : "store_name_and_monitored_product";
+    } else if (conflictingDisplayedId) {
       errorType = "store_identity_mismatch";
       identityMethod = "explicit_store_id_conflict";
       identityError = `任务目标店铺 ID ${targetStoreId} 与页面明确显示的 Store ID ${conflictingDisplayedId} 冲突（网址路由 ID ${routeStoreId}）`;
@@ -924,6 +992,10 @@
       errorType = "store_identity_mismatch";
       identityMethod = "ixspy_store_name_conflict";
       identityError = `已确认的 IXSPY 店铺名称“${savedIxspyName}”与当前页面“${ixspyStoreName}”不一致`;
+    } else if (routeStoreId === targetStoreId
+      && savedAlias
+      && !evidence.labeled_store_ids.length) {
+      identityMethod = "backend_approved_url_identity";
     } else if (routeStoreId !== targetStoreId
       && evidence.heading_store_id === targetStoreId
       && !evidence.labeled_store_ids.length) {
@@ -1564,6 +1636,9 @@
     rememberVerifiedStoreIdentity(options.verified_store_identity, options.expected_store_id);
     const readiness = await waitForMonitoredStorePageReady(20000, options.expected_store_id, {
       approved_store_url_identities: options.approved_store_url_identities || [],
+      expected_store_name: options.expected_store_name,
+      identity_monitored_product_ids: options.identity_monitored_product_ids
+        || options.monitored_product_ids || [],
     });
     if (readiness.state !== "ready") return readiness;
     const storeId = readiness.storeId;
@@ -1765,6 +1840,8 @@
     }
     const identity = await checkStoreIdentity(expectedStoreId, {
       approved_store_url_identities: message.approvedStoreUrlIdentities || [],
+      expected_store_name: message.expectedStoreName,
+      identity_monitored_product_ids: message.monitoredProductIds || [],
     });
     if (identity.state !== "ready") return identity;
     const verifiedPageIdentity = identity.store_identity;

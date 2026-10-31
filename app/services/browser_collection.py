@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import secrets
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -48,7 +48,20 @@ def _aware(value: datetime | None) -> datetime | None:
 
 
 def _target_date(value: date | None = None) -> date:
-    return value or datetime.now(ZoneInfo(get_settings().timezone)).date()
+    return value or collection_window_end_date()
+
+
+def collection_window_end_date(now: datetime | None = None) -> date:
+    """Return the exclusive end date for the latest complete IXSPY window."""
+    timezone_info = ZoneInfo(get_settings().timezone)
+    current = now or datetime.now(timezone_info)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone_info)
+    else:
+        current = current.astimezone(timezone_info)
+    if current.timetz().replace(tzinfo=None) < time(15, 0):
+        return current.date() - timedelta(days=1)
+    return current.date()
 
 
 def _browser_control_row(db: Session, *, lock: bool = False) -> BrowserCollectionControl:
@@ -308,6 +321,8 @@ def ensure_browser_collection_run(
         select(BrowserCollectionRun).where(BrowserCollectionRun.target_date == selected_date)
     )
     if run is not None:
+        if trigger == "SCHEDULED":
+            _reconcile_scheduled_store_items(db, run)
         added_candidates = _queue_selection_candidate_products(db, run)
         if added_candidates:
             _advance_run(db, run)
@@ -343,6 +358,58 @@ def ensure_browser_collection_run(
     db.commit()
     db.refresh(run)
     return run
+
+
+def _reconcile_scheduled_store_items(db: Session, run: BrowserCollectionRun) -> None:
+    """Reuse successful early collection and fill gaps at the scheduled time."""
+    if _is_manually_cancelled(run):
+        return
+
+    stores = [
+        store
+        for store in db.scalars(select(Store).where(Store.status == "active").order_by(Store.id))
+        if _supports_store_page_collection(store)
+    ]
+    existing = {item.target_key: item for item in run.items}
+    changed = False
+    next_position = max((item.position for item in run.items), default=0) + 1
+    for store in stores:
+        key = f"store:{store.id}"
+        item = existing.get(key)
+        if item is None:
+            get_or_create_store_page_discovery_state(
+                db, store, first_orders_url=_store_collection_url(store)
+            )
+            item = BrowserCollectionItem(
+                run=run,
+                target_type="STORE",
+                target_key=key,
+                store_id=store.id,
+                target_url=_store_collection_url(store),
+                position=next_position,
+            )
+            db.add(item)
+            existing[key] = item
+            next_position += 1
+            changed = True
+        elif item.status in {"PARTIAL", "FAILED", "SKIPPED"}:
+            _reset_item(item)
+            item.target_url = _store_collection_url(store)
+            changed = True
+
+    if not changed:
+        return
+
+    run.completed_at = None
+    run.phase = "STORE_DISCOVERY"
+    if run.status in {"PAUSED", "NEEDS_VERIFICATION"} or any(
+        item.status == "NEEDS_VERIFICATION" for item in run.items
+    ):
+        _refresh_counts(run)
+    else:
+        _advance_run(db, run)
+    db.commit()
+    db.refresh(run)
 
 
 def _queue_selection_candidate_products(
@@ -465,7 +532,7 @@ def get_today_run(db: Session) -> BrowserCollectionRun | None:
 
 
 def queue_store_collection(
-    db: Session, store: Store
+    db: Session, store: Store, *, allow_paused: bool = False
 ) -> tuple[BrowserCollectionRun, int, int, bool]:
     """Queue one store-page read without opening product detail pages."""
     if not _supports_store_page_collection(store):
@@ -478,7 +545,8 @@ def queue_store_collection(
         run = BrowserCollectionRun(target_date=_target_date(), trigger="MANUAL")
         db.add(run)
         db.flush()
-    elif run.status == "PAUSED" and not _is_manually_cancelled(run):
+    elif (run.status == "PAUSED" and not _is_manually_cancelled(run)
+          and not allow_paused):
         raise ValueError("今日队列已暂停，请先恢复后再采集店铺")
 
     queued_count = 0
@@ -506,13 +574,18 @@ def queue_store_collection(
         reused_count = 1
 
     run.completed_at = None
-    if _is_manually_cancelled(run):
+    if _is_manually_cancelled(run) and not allow_paused:
         run.paused_reason = None
         run.status = "RUNNING" if run.started_at else "PENDING"
     elif run.status not in {"NEEDS_VERIFICATION", "PAUSED"}:
         run.status = "RUNNING" if run.started_at else "PENDING"
     run.phase = "STORE_DISCOVERY"
-    _advance_run(db, run)
+    if run.status in {"PAUSED", "NEEDS_VERIFICATION"} or any(
+        item.status == "NEEDS_VERIFICATION" for item in run.items
+    ):
+        _refresh_counts(run)
+    else:
+        _advance_run(db, run)
     db.commit()
     db.refresh(run)
     return run, queued_count, reused_count, discovery_queued
@@ -1358,21 +1431,38 @@ def serialize_item(item: BrowserCollectionItem, *, include_targets: bool = False
     target_products: list[dict[str, str | None]] = []
     discovery_page_url = None
     approved_store_url_identities: list[dict] = []
+    collection_start_url = item.target_url
     if item.target_type == "STORE" and item.store_id is not None:
         session = object_session(item)
         if session is not None:
+            identities = list(session.scalars(
+                select(StoreUrlIdentity)
+                .where(StoreUrlIdentity.store_id == item.store_id)
+                .order_by(StoreUrlIdentity.approved_at.desc(), StoreUrlIdentity.id.desc())
+            ))
             approved_store_url_identities = [
                 {
                     "route_store_id": identity.route_store_id,
                     "normalized_page_identity": identity.normalized_page_identity,
                     "evidence": identity.evidence or {},
                 }
-                for identity in session.scalars(
-                    select(StoreUrlIdentity)
-                    .where(StoreUrlIdentity.store_id == item.store_id)
-                    .order_by(StoreUrlIdentity.id)
-                )
+                for identity in identities
             ]
+            for identity in identities:
+                try:
+                    route_store_id, normalized_identity = normalize_store_orders_identity(
+                        identity.first_observed_url
+                    )
+                except ValueError:
+                    continue
+                if (route_store_id != identity.route_store_id
+                    or normalized_identity != identity.normalized_page_identity):
+                    continue
+                collection_start_url = (
+                    f"https://{normalized_identity}"
+                    "?sortType=bestmatch_sort&shop_sortType=orders_desc"
+                )
+                break
     if include_targets and item.target_type == "STORE" and item.store_id is not None:
         session = object_session(item)
         if session is not None:
@@ -1425,6 +1515,7 @@ def serialize_item(item: BrowserCollectionItem, *, include_targets: bool = False
         "monitored_products": target_products,
         "discovery_page_url": discovery_page_url,
         "approved_store_url_identities": approved_store_url_identities,
+        "collection_start_url": collection_start_url,
     }
 
 
@@ -1458,6 +1549,7 @@ def serialize_run(run: BrowserCollectionRun) -> dict:
     return {
         "id": run.id,
         "target_date": run.target_date,
+        "latest_data_date": run.target_date - timedelta(days=1),
         "trigger": run.trigger,
         "status": run.status,
         "phase": run.phase,

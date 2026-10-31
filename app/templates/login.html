@@ -39,7 +39,7 @@
           error.hidden = false;
           return;
         }
-        location.href = "/";
+        location.href = body.user?.must_change_password ? "/change-password" : "/";
       });
     </script>
   </body>

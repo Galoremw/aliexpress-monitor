@@ -30,6 +30,8 @@ class StoreRead(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+    initial_collection_status: Literal["queued", "deferred"] | None = None
+    initial_collection_message: str | None = None
 
 
 class ProductCreate(BaseModel):
@@ -374,6 +376,7 @@ class BrowserCollectionItemRead(BaseModel):
     monitored_products: list[BrowserCollectionMonitoredProductRead] = Field(default_factory=list)
     discovery_page_url: str | None = None
     approved_store_url_identities: list[dict[str, Any]] = Field(default_factory=list)
+    collection_start_url: str | None = None
 
 
 class StorePoolResetCreateRequest(BaseModel):
@@ -460,6 +463,7 @@ class StorePoolResetClaimRead(BaseModel):
 class BrowserCollectionRunRead(BaseModel):
     id: int
     target_date: date
+    latest_data_date: date
     trigger: str
     status: str
     phase: str

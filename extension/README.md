@@ -20,7 +20,7 @@ POST <BACKEND_URL>/api/collection/browser-extension
 
 ## 每日自动采集
 
-项目根目录的 `install-browser-collector.bat` 会创建每天 `02:00` 运行的 Windows 计划任务。任务通过 `scripts/open-browser-collector-chrome.ps1` 在 `%LOCALAPPDATA%\AliExpressMonitor\BrowserCollectorProfile` 启动或复用独立 Chrome，并加载本目录扩展。首次运行 `start-browser-collector.bat` 后，从任务栏打开独立窗口，由用户登录监控台、AliExpress 和 IXSPY；日常 Chrome 不会领取队列，也不会被启动器关闭。Backend 每天 `02:00` 只建立待启动的店铺页队列，不会自动开始采集。
+项目根目录的 `install-browser-collector.bat` 会创建每天 `15:15` 运行的 Windows 计划任务。任务通过 `scripts/open-browser-collector-chrome.ps1` 在 `%LOCALAPPDATA%\AliExpressMonitor\BrowserCollectorProfile` 启动或复用独立 Chrome，并加载本目录扩展。首次运行 `start-browser-collector.bat` 后，从任务栏打开独立窗口，由用户登录监控台、AliExpress 和 IXSPY；日常 Chrome 不会领取队列，也不会被启动器关闭。Backend 每天 `15:15` 只建立待启动的店铺页队列，不会自动开始采集。
 
 要派发当天队列，在监控台“每日浏览器采集”中先选择在线电脑，再单独点击“开始采集”。只有当前选中的电脑可以领取；选择不会自动开跑，也没有自动故障切换。换电脑时，等旧任务结束后重新选择新电脑并点击开始。`立即采集全部` 和“重新检查今日任务”只准备/刷新队列，不会唤醒采集 worker。浏览器扩展需要使用支持 worker identity 和 claim token 的新版本；旧版扩展不能领取受控队列。
 
@@ -36,7 +36,7 @@ POST <BACKEND_URL>/api/collection/browser-extension
 
 将本目录扩展加载到两台电脑的 Chrome，并在各自浏览器中登录监控台、AliExpress 和 IXSPY。NAS 当前地址为 `192.168.66.115`；建议在路由器中为 NAS 保留此地址。监控台只需在 NAS 上向局域网开放前端 `3000`，Backend 与数据库继续保持私有，不要在路由器配置公网端口转发。
 
-主机使用 `http://192.168.66.115:3000/?browser_collection=1&browser_collection_profile=isolated`；第二台电脑使用 `http://192.168.66.115:3000/?browser_collection=1`。前者标记为“Galore主机”，后者标记为“第二台电脑”，两者连接同一个队列 API。Chrome 保持运行，采集窗口可见且不要最小化；窗口不需要持续获得键盘焦点。需要由第二台电脑执行时，在监控台采集电脑选择器中选中它并点击“开始采集”；未被选中的电脑只报告在线状态，不会领取任务。验证码仍由用户处理。
+主机使用 `http://192.168.66.115:3000/?browser_collection=1&browser_collection_profile=isolated`；第二台电脑使用 `http://192.168.66.115:3000/?browser_collection=1`。Qx 的电脑使用 `http://192.168.66.115:3000/?browser_collection=1&browser_collection_name=Qx%E7%9A%84computer`，监控台显示名称为“Qx的computer”。每台电脑的扩展配置会生成自己的采集机 ID；自定义名称只影响显示标签。所有电脑连接同一个队列 API。Chrome 保持运行，采集窗口可见且不要最小化；窗口不需要持续获得键盘焦点。需要指定电脑执行时，在监控台采集电脑选择器中选中它并点击“开始采集”；未被选中的电脑只报告在线状态，不会领取任务。验证码仍由用户处理。
 
 任务所有权由监控台的单机选择控制；不需要为了队列独占而关闭另一台电脑的 worker。调度器和数据库仍运行在主机。若主机 LAN 地址变更，需要同步更新 `manifest.json` 中的 LAN 地址、重新加载两台电脑上的扩展，并重新打开监控台。
 
@@ -48,31 +48,15 @@ POST <BACKEND_URL>/api/collection/browser-extension
 
 Render 部署时，Frontend 的 `VITE_API_BASE_URL` 也必须填写同一个 Backend HTTPS origin。扩展和 Frontend 必须指向同一个 Backend，否则会出现“商品尚未加入监控”或看不到历史快照。
 
-## 店小秘链接交接
+## 店小秘助手商品页采集
 
-监控台的“采集到店小秘”按钮会创建交接队列。扩展只在已登录的
-`https://www.dianxiaomi.com/web/productCrawl/dataAcquisition` 页面中，使用页面可见的
-“链接采集”文本框和“开始采集”按钮提交商品链接。
+监控台的“采集到店小秘”按钮会创建顺序交接队列。工作扩展逐个在当前监控台 Chrome 窗口打开对应的 AliExpress 商品页，确认页面商品 ID 与队列任务一致后，等待商品页上的店小秘助手“本页采集”控件，再直接调用该控件。此流程不使用店小秘“链接采集”页，也不把商品网址粘贴到店小秘输入框。
 
-这不是店小秘官方 API，也不会调用或修改第三方“店小秘助手”扩展。扩展不会读取 Cookie、密码或 Token，
-不会绕过登录、协议确认、验证码或平台访问限制。提交后监控台显示“采集中”，表示链接已交给店小秘页面，
-不等同于店小秘已经完成商品资料采集。
+请在每台采集电脑当前使用的 Chrome 配置中安装并启用本项目扩展和官方“店小秘助手”，登录监控台、AliExpress 和店小秘，并完成平台正常要求的协议确认。NAS/LAN 监控台在当前地址后添加 `?browser_collection=1`；若已有 `?` 参数则添加 `&browser_collection=1`，例如 `http://192.168.66.115:3000/?browser_collection=1`。本机 `127.0.0.1`/`localhost` 地址需使用 `?browser_collection=1&browser_collection_profile=isolated`，或 `?dianxiaomi_worker=1&dianxiaomi_local=1`。随后在监控台唯一的“采集电脑”选择器中选中实际执行电脑，再手动开始或继续队列。`setup-dianxiaomi-worker.bat` 与 `start-dianxiaomi-worker.bat` 现在只显示此说明，不会启动、关闭或更改 Chrome 配置，也不会开始采集。商品页会作为同一 Chrome 窗口中的标签打开；AliExpress/店小秘登录、验证仍由用户处理。
 
-使用前请在 Chrome 中重新加载本目录扩展，并保持店小秘已登录。若页面要求确认采集协议或重新登录，
-任务会停在“待人工确认”；完成正常操作后，在监控台点击“人工确认后重新排队”。
+扩展只把店小秘助手明确报告的成功记为成功，并按一个商品一个商品的顺序处理。助手提示失败、重复商品、需要登录/验证、找不到“本页采集”控件、页面商品不匹配、超时或其他结果不明确时，任务会进入“待人工确认”并暂停队列；先在商品页或店小秘中检查实际状态，再从监控台人工确认并重新排队。浏览器扩展不读取 Cookie、密码或 Token，不绕过登录、协议、验证码或平台访问限制。监控台显示“采集中”不代表已经完成；只有助手明确确认后才记为成功。
 
-如果不希望任务使用日常 Chrome，可以双击项目根目录的
-`setup-dianxiaomi-worker.bat`。它会创建独立的
-`%LOCALAPPDATA%\AliExpressMonitor\DianxiaomiProfile` 配置并只加载本项目扩展。
-店小秘官方的“店小秘助手”需要在这个隔离窗口的 `chrome://extensions`
-中单独加载或安装一次，不能直接复用日常 Chrome 的扩展安装状态。
-首次在该窗口登录监控台、店小秘、加载店小秘助手并确认协议；之后使用
-`start-dianxiaomi-worker.bat`，脚本只会重启自己的隔离配置并在后台最小化运行，
-不会关闭普通 Chrome。
-普通 Chrome 中的扩展不会领取店小秘队列；只有带有
-`?dianxiaomi_worker=1` 的独立工作配置才会执行队列。
-
-扩展也监听本地或托管监控台中的“采集到店小秘”按钮。独立工作配置会每 30 秒检查一次同一地址的队列；如果在工作配置自己的监控台页面点击按钮，则会立即唤醒队列。首次切换到另一个 Backend 时，在扩展弹窗登录一次对应的监控台账号。更新扩展后请在 `chrome://extensions` 点击“重新加载”。
+更新本项目扩展后，在运行队列的同一个 Chrome 配置中重新加载扩展，并确认本项目扩展和官方店小秘助手都已启用。关闭监控台 worker 标签会停止该窗口领取新任务；若无可用 worker 窗口，任务会留在队列中等待。
 商品销量采集
 ------------
 

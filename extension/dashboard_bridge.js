@@ -49,9 +49,13 @@ async function notifyDashboardContext() {
       type: "dashboard-context",
       api_base_url: apiBaseUrl,
       dianxiaomi_local_dashboard: isLocalDashboard(),
-      worker_mode: current.searchParams.get("dianxiaomi_worker") === "1"
+      worker_mode: (current.searchParams.get("dianxiaomi_worker") === "1"
         && current.searchParams.get("dianxiaomi_local") === "1"
-        && ["127.0.0.1", "localhost"].includes(current.hostname),
+        && ["127.0.0.1", "localhost"].includes(current.hostname))
+        || current.searchParams.get("browser_collection") === "1",
+      dianxiaomi_browser_worker_mode: current.searchParams.get("browser_collection") === "1"
+        && (!isLoopbackDashboard(current)
+          || current.searchParams.get("browser_collection_profile") === "isolated"),
       dianxiaomi_mode_explicit: current.searchParams.has("dianxiaomi_worker"),
       browser_collection_mode: current.searchParams.get("browser_collection") === "1"
         && (!isLoopbackDashboard(current)

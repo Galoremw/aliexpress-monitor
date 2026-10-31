@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}账号管理 · AliExpress 竞品监控{% endblock %}
+{% block content %}
+<section class="page-heading compact">
+  <div><p class="eyebrow">ACCESS CONTROL</p><h1>普通用户账号</h1><p>普通用户共享监控数据，可执行日常采集和编辑；删除、停用、清空及整队取消仅管理员可操作。</p></div>
+</section>
+<section class="account-layout">
+  <form id="create-operator-form" class="account-panel account-create-form">
+    <h2>创建普通用户</h2>
+    <label for="operator-username">登录账号</label>
+    <input id="operator-username" name="username" maxlength="128" autocomplete="off" required>
+    <p>系统会生成一次性初始密码。用户首次登录后必须修改密码。</p>
+    <button class="button primary" type="submit">创建账号</button>
+    <span id="account-error" class="warning-text" role="alert" hidden></span>
+  </form>
+  <section class="account-panel">
+    <div class="section-heading"><h2>账号列表</h2><button id="refresh-users" class="button" type="button">刷新</button></div>
+    <div class="table-wrap"><table class="account-table"><thead><tr><th>账号</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody id="operator-list"><tr><td colspan="4" class="empty">正在读取账号…</td></tr></tbody></table></div>
+  </section>
+</section>
+<dialog id="temporary-credential-dialog" class="credential-dialog" aria-labelledby="temporary-credential-title">
+  <section>
+    <h2 id="temporary-credential-title">一次性初始密码</h2>
+    <p>请通过安全渠道交给该用户。关闭窗口后，密码会从页面清除；之后如遗失，需要重新设置密码。</p>
+    <output id="temporary-credential" class="credential-secret"></output>
+    <div class="action-group"><button id="copy-temporary-credential" class="button" type="button">复制密码</button><button id="close-temporary-credential" class="button primary" type="button">我已保存</button></div>
+    <span id="credential-copy-state" class="muted-value" role="status" aria-live="polite"></span>
+  </section>
+</dialog>
+{% endblock %}
+{% block scripts %}
+<script>
+  const usersBody = document.querySelector("#operator-list");
+  const accountError = document.querySelector("#account-error");
+  const credentialDialog = document.querySelector("#temporary-credential-dialog");
+  const credentialOutput = document.querySelector("#temporary-credential");
+  const copyState = document.querySelector("#credential-copy-state");
+
+  async function accountRequest(url, options = {}) {
+    const response = await fetch(url, {
+      ...options,
+      credentials: "include",
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.detail || `请求失败 (${response.status})`);
+    return body;
+  }
+
+  function addCell(row, value) {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    row.append(cell);
+    return cell;
+  }
+
+  function showTemporaryPassword(password) {
+    credentialOutput.textContent = password;
+    copyState.textContent = "";
+    credentialDialog.showModal();
+  }
+
+  async function loadOperators() {
+    try {
+      const users = await accountRequest("/api/auth/users");
+      usersBody.replaceChildren();
+      if (!users.length) {
+        const row = document.createElement("tr");
+        const cell = addCell(row, "暂无普通用户账号");
+        cell.colSpan = 4;
+        cell.className = "empty";
+        usersBody.append(row);
+        return;
+      }
+      for (const user of users) {
+        const row = document.createElement("tr");
+        addCell(row, user.username);
+        addCell(row, user.is_active ? (user.must_change_password ? "启用 · 待首次改密" : "启用") : "已停用");
+        addCell(row, new Date(user.created_at).toLocaleString("zh-CN", { hour12: false }));
+        const actions = document.createElement("td");
+        actions.className = "account-row-actions";
+        if (user.is_active) {
+          const reset = document.createElement("button");
+          reset.type = "button";
+          reset.className = "link-button";
+          reset.textContent = "重置密码";
+          reset.addEventListener("click", async () => {
+            if (!window.confirm(`为 ${user.username} 生成新的一次性密码？现有登录会立即失效。`)) return;
+            reset.disabled = true;
+            try {
+              const result = await accountRequest(`/api/auth/users/${user.id}/reset-password`, { method: "POST" });
+              showTemporaryPassword(result.temporary_password);
+              await loadOperators();
+            } catch (error) {
+              accountError.textContent = error.message;
+              accountError.hidden = false;
+            } finally {
+              reset.disabled = false;
+            }
+          });
+          actions.append(reset);
+
+          const disable = document.createElement("button");
+          disable.type = "button";
+          disable.className = "link-button danger";
+          disable.textContent = "停用账号";
+          disable.addEventListener("click", async () => {
+            if (!window.confirm(`停用 ${user.username}？该账号的所有现有登录会立即失效。`)) return;
+            disable.disabled = true;
+            try {
+              await accountRequest(`/api/auth/users/${user.id}/disable`, { method: "POST" });
+              await loadOperators();
+            } catch (error) {
+              accountError.textContent = error.message;
+              accountError.hidden = false;
+            } finally {
+              disable.disabled = false;
+            }
+          });
+          actions.append(disable);
+        } else {
+          actions.textContent = "—";
+        }
+        row.append(actions);
+        usersBody.append(row);
+      }
+      accountError.hidden = true;
+    } catch (error) {
+      usersBody.replaceChildren();
+      const row = document.createElement("tr");
+      const cell = addCell(row, error.message);
+      cell.colSpan = 4;
+      cell.className = "warning-text";
+      usersBody.append(row);
+    }
+  }
+
+  document.querySelector("#create-operator-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const submit = form.querySelector('[type="submit"]');
+    accountError.hidden = true;
+    submit.disabled = true;
+    try {
+      const username = new FormData(form).get("username");
+      const result = await accountRequest("/api/auth/users", {
+        method: "POST",
+        body: JSON.stringify({ username }),
+      });
+      form.reset();
+      showTemporaryPassword(result.temporary_password);
+      await loadOperators();
+    } catch (error) {
+      accountError.textContent = error.message;
+      accountError.hidden = false;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  document.querySelector("#refresh-users").addEventListener("click", () => void loadOperators());
+  document.querySelector("#copy-temporary-credential").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(credentialOutput.textContent);
+      copyState.textContent = "已复制。请安全保存并通过安全渠道交付。";
+    } catch {
+      copyState.textContent = "复制失败，请手动保存后通过安全渠道交付。";
+    }
+  });
+  document.querySelector("#close-temporary-credential").addEventListener("click", () => credentialDialog.close());
+  credentialDialog.addEventListener("close", () => {
+    credentialOutput.textContent = "";
+    copyState.textContent = "";
+  });
+  window.addEventListener("pagehide", () => {
+    credentialOutput.textContent = "";
+    copyState.textContent = "";
+  });
+  void loadOperators();
+</script>
+{% endblock %}

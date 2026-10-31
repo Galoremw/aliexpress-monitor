@@ -27,7 +27,7 @@ def test_dashboard_renders_empty_state(client):
     assert '<details id="dianxiaomi-status"' in response.text
     assert '<summary class="section-heading dianxiaomi-summary">' in response.text
     assert '<details id="dianxiaomi-status" class="data-section dianxiaomi-band" data-status-endpoint="/api/integrations/dianxiaomi/status" open' not in response.text
-    assert 'dashboard.js?v=galore-collector-02' in response.text
+    assert 'dashboard.js?v=monitor-user-roles-store-enrollment-20261029' in response.text
     assert 'id="browser-run-cancel"' in response.text
     script = client.get("/static/dashboard.js").text
     collect_all_handler = script.split('document.querySelector("#collect-all")', 1)[1].split(
@@ -35,6 +35,19 @@ def test_dashboard_renders_empty_state(client):
     )[0]
     assert '"/api/browser-collection/runs/collect-all"' in collect_all_handler
     assert '"/api/jobs/collect-now"' not in collect_all_handler
+
+
+def test_dianxiaomi_panel_shows_shared_collector_without_second_selector():
+    dashboard = Path("app/templates/dashboard.html").read_text(encoding="utf-8")
+    script = Path("app/static/dashboard.js").read_text(encoding="utf-8")
+
+    assert 'id="dianxiaomi-worker-online"' in dashboard
+    assert 'id="dianxiaomi-owner-waiting"' in dashboard
+    assert 'id="browser-collector-select"' in dashboard
+    assert 'id="dianxiaomi-collector-select"' not in dashboard
+    assert "当前采集电脑" in dashboard
+    assert "status.selected_worker" in script
+    assert "status.waiting_reason" in script
 
 
 def test_galore_collector_launch_button_is_local_only(client):
@@ -835,3 +848,26 @@ def test_identity_buttons_render_only_for_identity_review_items(client):
     assert "const platformVerification = needsVerification && !identityReview" in script
     template = Path("app/templates/dashboard.html").read_text(encoding="utf-8")
     assert 'browser_collection_run.paused_reason == "store_identity_review"' in template
+
+
+def test_dianxiaomi_product_mismatch_has_confirm_and_reject_actions(client):
+    script = client.get("/static/dashboard.js").text
+    renderer = script.split("function renderDianxiaomiItem(item)", 1)[1].split(
+        "function formatDashboardDate", 1
+    )[0]
+    handler = script.split('document.querySelector("#dianxiaomi-items")?.addEventListener("click"', 1)[1].split(
+        'document.querySelector("#dianxiaomi-delete-failed")', 1
+    )[0]
+    css = client.get("/static/dashboard.css").text
+
+    assert "isDianxiaomiProductPageMismatch(item)" in renderer
+    assert 'item.error_type === "product_page_mismatch"' in script
+    assert "目标商品 ID\\s*(\\d+)\\D+当前商品 ID\\s*(\\d+)" in script
+    assert 'data-dianxiaomi-action="identity-confirm"' in renderer
+    assert 'data-dianxiaomi-action="identity-reject"' in renderer
+    assert "确认商品无误" in renderer
+    assert ">错误</button>" in renderer
+    assert 'action === "identity-confirm" ? "confirm" : "reject"' in handler
+    assert "/identity-review/${decision}" in handler
+    assert ".dianxiaomi-identity-actions .identity-confirm { background:" in css
+    assert ".dianxiaomi-identity-actions .identity-reject { background:" in css

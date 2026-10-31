@@ -1,10 +1,24 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from app.collectors.base import CollectorResult
 from app.collectors.dependencies import get_collector
 from app.core.config import Settings
-from app.db.models import BrowserCollectionItem, BrowserCollectionRun, ProductSnapshot
+from app.db.models import BrowserCollectionItem, BrowserCollectionRun, ProductSnapshot, Store
 from app.scheduler import DAILY_COLLECTION_JOB_ID, create_scheduler, run_scheduled_collection
+
+
+def test_scheduler_defaults_to_midnight_in_shanghai_timezone():
+    scheduler = create_scheduler(
+        Settings(database_url="sqlite://", timezone="Asia/Shanghai")
+    )
+    job = scheduler.get_job(DAILY_COLLECTION_JOB_ID)
+
+    assert job is not None
+    assert str(job.trigger.timezone) == "Asia/Shanghai"
+    fields = {field.name: str(field) for field in job.trigger.fields}
+    assert fields["hour"] == "0"
+    assert fields["minute"] == "0"
 
 
 class CycleCollector:
@@ -87,6 +101,90 @@ def test_scheduled_collection_queues_store_pages_without_detail_snapshots(client
     assert items[0].target_type == "STORE"
     assert items[0].store_id == store["id"]
     assert db_session.query(ProductSnapshot).count() == 0
+
+
+def test_scheduled_collection_reuses_success_and_running_items_but_queues_incomplete_stores(
+    client, db_session, monkeypatch
+):
+    import app.scheduler as scheduler_module
+
+    stores = [
+        Store(
+            name=f"Early store {index}",
+            url=f"https://www.aliexpress.com/store/44900{index}",
+            aliexpress_store_id=f"44900{index}",
+        )
+        for index in range(1, 5)
+    ]
+    db_session.add_all(stores)
+    db_session.flush()
+    now = datetime.now(timezone.utc)
+    run = BrowserCollectionRun(
+        target_date=datetime.now(ZoneInfo("Asia/Shanghai")).date(),
+        trigger="MANUAL",
+        status="RUNNING",
+        phase="STORE_DISCOVERY",
+        started_at=now,
+        dispatch_enabled=True,
+    )
+    db_session.add(run)
+    db_session.flush()
+    succeeded = BrowserCollectionItem(
+        run_id=run.id,
+        target_type="STORE",
+        target_key=f"store:{stores[0].id}",
+        store_id=stores[0].id,
+        target_url=stores[0].url,
+        position=1,
+        status="SUCCEEDED",
+        attempt_count=1,
+        completed_at=now,
+    )
+    running = BrowserCollectionItem(
+        run_id=run.id,
+        target_type="STORE",
+        target_key=f"store:{stores[1].id}",
+        store_id=stores[1].id,
+        target_url=stores[1].url,
+        position=2,
+        status="RUNNING",
+        attempt_count=1,
+        claimed_at=now,
+        lease_expires_at=now + timedelta(minutes=5),
+        claimed_worker_id="early-worker",
+        claim_token="early-claim",
+    )
+    partial = BrowserCollectionItem(
+        run_id=run.id,
+        target_type="STORE",
+        target_key=f"store:{stores[2].id}",
+        store_id=stores[2].id,
+        target_url=stores[2].url,
+        position=3,
+        status="PARTIAL",
+        attempt_count=1,
+        completed_at=now,
+    )
+    db_session.add_all([succeeded, running, partial])
+    db_session.commit()
+    monkeypatch.setattr(scheduler_module, "get_session_factory", lambda: lambda: db_session)
+
+    run_scheduled_collection()
+
+    db_session.expire_all()
+    run = db_session.get(BrowserCollectionRun, run.id)
+    items = db_session.query(BrowserCollectionItem).filter_by(run_id=run.id).all()
+    by_store = {item.store_id: item for item in items}
+    assert len(items) == 4
+    assert by_store[stores[0].id].status == "SUCCEEDED"
+    assert by_store[stores[0].id].attempt_count == 1
+    assert by_store[stores[1].id].status == "RUNNING"
+    assert by_store[stores[1].id].claim_token == "early-claim"
+    assert by_store[stores[2].id].status == "PENDING"
+    assert by_store[stores[2].id].attempt_count == 0
+    assert by_store[stores[3].id].status == "PENDING"
+    assert by_store[stores[3].id].position == 4
+    assert run.dispatch_enabled is True
 
 
 def test_scheduler_and_collect_all_leave_run_held(client, db_session, monkeypatch):

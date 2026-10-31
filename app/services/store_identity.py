@@ -2,12 +2,17 @@ import re
 from urllib.parse import urlsplit
 
 
-_STORE_ORDERS_PATH = re.compile(r"^/store/([0-9]+)/pages/all-items\.html$")
+_STORE_ORDERS_PATH = re.compile(r"^/store/([0-9]+)(?:/pages/all-items\.html)?$")
 _ALIEXPRESS_HOST = "aliexpress.com"
 
 
 def normalize_store_orders_identity(page_url: str) -> tuple[str, str]:
-    """Return the route store ID and stable identity for an AliExpress Orders page."""
+    """Return a canonical Orders identity for an AliExpress store or Orders URL.
+
+    AliExpress can rewrite the Orders listing URL to the store root while leaving
+    the same listing rendered. Normalize both routes to one identity so a manually
+    approved store URL remains usable after that rewrite.
+    """
     if not isinstance(page_url, str) or not page_url or page_url != page_url.strip():
         raise ValueError("A valid HTTPS AliExpress Orders URL is required")
 
@@ -38,4 +43,5 @@ def normalize_store_orders_identity(page_url: str) -> tuple[str, str]:
         raise ValueError("URL is not an AliExpress store Orders page")
 
     route_store_id = match.group(1)
-    return route_store_id, f"{normalized_host}{parsed.path}"
+    normalized_path = f"/store/{route_store_id}/pages/all-items.html"
+    return route_store_id, f"{normalized_host}{normalized_path}"

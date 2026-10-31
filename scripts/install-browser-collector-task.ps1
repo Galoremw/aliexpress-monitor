@@ -8,7 +8,7 @@ if (-not (Test-Path -LiteralPath $launcher)) {
 }
 
 $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/d /c `"`"$launcher`"`""
-$trigger = New-ScheduledTaskTrigger -Daily -At "02:00"
+$trigger = New-ScheduledTaskTrigger -Daily -At "15:15"
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `

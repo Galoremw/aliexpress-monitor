@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AliExpress 竞品监控采集助手",
-  "version": "0.6.114",
+  "version": "0.6.125",
   "description": "优先读取 IXSPY 店铺列表卡片的最近 7 日增量，并采集公开商品信息与评论。",
   "permissions": ["activeTab", "scripting", "tabs", "tabGroups", "webNavigation", "alarms", "notifications", "storage"],
   "host_permissions": [
@@ -12,9 +12,7 @@
     "http://localhost:3000/*",
     "http://192.168.66.115:3000/*",
     "http://127.0.0.1:8000/*",
-    "http://localhost:8000/*",
-    "https://www.dianxiaomi.com/*",
-    "https://dianxiaomi.com/*"
+    "http://localhost:8000/*"
   ],
   "action": {
     "default_title": "采集当前商品",
@@ -40,10 +38,11 @@
     },
     {
       "matches": [
-        "https://www.dianxiaomi.com/web/productCrawl/*",
-        "https://dianxiaomi.com/web/productCrawl/*"
+        "https://aliexpress.com/item/*",
+        "https://www.aliexpress.com/item/*",
+        "https://*.aliexpress.com/item/*"
       ],
-      "js": ["dianxiaomi_bridge.js"],
+      "js": ["dianxiaomi_product_bridge.js"],
       "run_at": "document_idle"
     },
     {

@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -20,7 +20,7 @@ from app.db.models import (
     StoreDailyMetric,
     StoreSnapshot,
 )
-from app.core.auth import require_page_auth
+from app.core.auth import require_admin, require_page_auth
 from app.db.session import get_db
 from app.core.config import get_settings
 from app.services.store_discovery import store_top_products
@@ -31,6 +31,7 @@ from app.services.collection_progress import (
 )
 from app.services.browser_collection import (
     browser_collection_control_status,
+    collection_window_end_date,
     get_today_run,
     serialize_run,
 )
@@ -45,6 +46,32 @@ from app.services.selection_qualification import (
 router = APIRouter(include_in_schema=False, dependencies=[Depends(require_page_auth)])
 templates = Jinja2Templates(directory="app/templates")
 templates.env.globals["clean_product_title"] = clean_product_title
+
+
+def _format_store_added_at(value: datetime) -> str:
+    timestamp = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+
+
+def _is_admin(request: Request) -> bool:
+    user = getattr(request.state, "user", None)
+    return bool(user and user.role == "admin")
+
+
+@router.get("/users", response_class=HTMLResponse)
+def user_management_page(
+    request: Request, _admin=Depends(require_admin)
+) -> HTMLResponse:
+    return templates.TemplateResponse(request, "users.html", {"request": request})
+
+
+@router.get("/change-password", response_class=HTMLResponse)
+def change_password_page(request: Request) -> HTMLResponse:
+    if request.state.user is None:
+        raise HTTPException(status_code=404, detail="账号密码管理未启用")
+    return templates.TemplateResponse(
+        request, "change_password.html", {"request": request}
+    )
 
 
 def _collection_status(db: Session) -> dict:
@@ -112,24 +139,28 @@ def _snapshot_status(snapshot: ProductSnapshot | None) -> tuple[str, str]:
 
 
 def _product_monitor_rows(
-    db: Session, products: list[Product], history_dates: list[date]
+    db: Session,
+    products: list[Product],
+    history_dates: list[date],
+    score_dates: list[date],
 ) -> list[dict]:
     product_ids = [product.id for product in products]
     if not product_ids:
         return []
-    metric_start = history_dates[0]
+    metric_start = min(history_dates[0], score_dates[0])
+    metric_end = max(history_dates[-1], score_dates[-1])
     metrics = list(
         db.scalars(
             select(ProductDailyMetric).where(
                 ProductDailyMetric.product_id.in_(product_ids),
                 ProductDailyMetric.metric_date >= metric_start,
-                ProductDailyMetric.metric_date <= history_dates[-1],
+                ProductDailyMetric.metric_date <= metric_end,
                 ProductDailyMetric.calculation_method == "ixspy_visible_daily_increment",
             )
         )
     )
     metric_by_key = {}
-    display_dates = set(history_dates)
+    display_dates = set(history_dates) | set(score_dates)
     for metric in metrics:
         display_date = metric.metric_date
         if display_date not in display_dates:
@@ -164,7 +195,9 @@ def _product_monitor_rows(
             latest_history_snapshot_by_product[snapshot.product_id] = snapshot
 
     rows = []
-    latest_date = history_dates[-1]
+    common_date = score_dates[-1]
+    timezone_info = ZoneInfo(get_settings().timezone)
+    collection_date = datetime.now(timezone_info).date()
     for product in products:
         history = []
         for metric_date in history_dates:
@@ -184,8 +217,25 @@ def _product_monitor_rows(
                     ),
                 }
             )
-        estimable_values = [item["value"] for item in history if item["value"] is not None]
-        latest_metric = metric_by_key.get((product.id, latest_date))
+        score_metrics = [
+            metric_by_key.get((product.id, metric_date))
+            for metric_date in score_dates
+        ]
+        score_values = [
+            metric.estimated_sales
+            for metric in score_metrics
+            if metric and metric.is_estimable and metric.estimated_sales is not None
+        ]
+        latest_metric = next(
+            (
+                metric_by_key[(product.id, metric_date)]
+                for metric_date in reversed(history_dates)
+                if (product.id, metric_date) in metric_by_key
+                and metric_by_key[(product.id, metric_date)].is_estimable
+                and metric_by_key[(product.id, metric_date)].estimated_sales is not None
+            ),
+            None,
+        )
         latest_snapshot = latest_snapshot_by_product.get(product.id)
         history_snapshot = latest_history_snapshot_by_product.get(product.id)
         history_snapshot_data = history_snapshot.raw_data if history_snapshot else {}
@@ -199,8 +249,8 @@ def _product_monitor_rows(
         status_class, status_label = _snapshot_status(latest_snapshot)
         collection_state, collection_label, collection_status_class, collection_captured_at = snapshot_collection_state(
             latest_snapshot,
-            latest_date + timedelta(days=1),
-            ZoneInfo(get_settings().timezone),
+            collection_date,
+            timezone_info,
         )
         rows.append(
             {
@@ -209,20 +259,22 @@ def _product_monitor_rows(
                 or product.aliexpress_product_id,
                 "main_image_url": image_by_product.get(product.id),
                 "latest_metric": latest_metric,
+                "latest_common_metric": metric_by_key.get((product.id, common_date)),
                 "history": history,
+                "score_start_date": score_dates[0],
+                "score_end_date": score_dates[-1],
                 "history_coverage": sum(
                     item["source_method"] == "ixspy_visible_daily_increment"
                     for item in history
                 ),
-                "seven_day_total": sum(estimable_values)
-                if len(estimable_values) == 7
-                and sum(
-                    item["source_method"] == "ixspy_visible_daily_increment"
-                    for item in history
+                "seven_day_total": sum(score_values)
+                if len(score_values) == 7
+                and all(
+                    metric and metric.is_estimable and metric.estimated_sales is not None
+                    for metric in score_metrics
                 )
-                == 7
                 else None,
-                "coverage": len(estimable_values),
+                "coverage": len(score_values),
                 "latest_snapshot": latest_snapshot,
                 "history_snapshot": history_snapshot,
                 "history_points_count": len(history_points),
@@ -297,7 +349,9 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     )
     today = datetime.now(ZoneInfo(get_settings().timezone)).date()
     history_dates = [today - timedelta(days=offset) for offset in range(7, 0, -1)]
-    monitor_rows = _product_monitor_rows(db, products, history_dates)
+    window_end = collection_window_end_date()
+    score_dates = [window_end - timedelta(days=offset) for offset in range(7, 0, -1)]
+    monitor_rows = _product_monitor_rows(db, products, history_dates, score_dates)
     monitor_row_by_product_id = {row["product"].id: row for row in monitor_rows}
     store_by_id = {store.id: store for store in stores}
     growth_metrics = []
@@ -321,7 +375,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     rows_by_store: dict[int, list[dict]] = {store.id: [] for store in stores}
     for row in monitor_rows:
         rows_by_store[row["product"].store_id].append(row)
-    yesterday = history_dates[-1]
+    latest_common_date = score_dates[-1]
     latest_metric_by_store = {}
     latest_store_metrics = []
     for store in stores:
@@ -329,13 +383,15 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
             continue
         store_rows = rows_by_store[store.id]
         estimated = [
-            row["latest_metric"]
+            row["latest_common_metric"]
             for row in store_rows
-            if row["latest_metric"] and row["latest_metric"].is_estimable
+            if row["latest_common_metric"]
+            and row["latest_common_metric"].is_estimable
+            and row["latest_common_metric"].estimated_sales is not None
         ]
         summary = SimpleNamespace(
             store_id=store.id,
-            metric_date=yesterday,
+            metric_date=latest_common_date,
             estimated_sales=sum(metric.estimated_sales or 0 for metric in estimated),
             estimable_products=len(estimated),
             product_scope_count=len(store_rows),
@@ -347,6 +403,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     store_panels = [
         {
             "store": store,
+            "store_added_at": _format_store_added_at(store.created_at),
             "rows": rows_by_store[store.id],
             "latest_metric": latest_metric_by_store.get(store.id),
         }
@@ -356,6 +413,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     browser_collection_run = get_today_run(db)
     context = {
         "request": request,
+        "is_admin": _is_admin(request),
         "stores": stores,
         "products": products,
         "recent_snapshots": recent_snapshots,
@@ -473,6 +531,7 @@ def product_detail(
         "product_detail.html",
         {
             "request": request,
+            "is_admin": _is_admin(request),
             "product": product,
             "store": product.store,
             "snapshots": snapshots,
@@ -586,8 +645,12 @@ def store_detail(
             .limit(90)
         )
     )
-    yesterday = datetime.now(ZoneInfo(get_settings().timezone)).date() - timedelta(days=1)
-    top_products = store_top_products(db, store_id, yesterday, 20)
+    today = datetime.now(ZoneInfo(get_settings().timezone)).date()
+    history_dates = [today - timedelta(days=offset) for offset in range(7, 0, -1)]
+    window_end = collection_window_end_date()
+    score_dates = [window_end - timedelta(days=offset) for offset in range(7, 0, -1)]
+    metric_date = score_dates[-1]
+    top_products = store_top_products(db, store_id, metric_date, 20)
     candidate_products = list(
         db.scalars(
             select(Product)
@@ -606,20 +669,17 @@ def store_detail(
         .order_by(StoreSnapshot.collected_at.desc(), StoreSnapshot.id.desc())
         .limit(1)
     )
-    history_dates = [
-        datetime.now(ZoneInfo(get_settings().timezone)).date() - timedelta(days=offset)
-        for offset in range(7, 0, -1)
-    ]
-    product_rows = _product_monitor_rows(db, products, history_dates)
+    product_rows = _product_monitor_rows(db, products, history_dates, score_dates)
     return templates.TemplateResponse(
         request,
         "store_detail.html",
         {
             "request": request,
+            "is_admin": _is_admin(request),
             "store": store,
             "products": products,
             "metrics": metrics,
-            "yesterday": yesterday,
+            "metric_date": metric_date,
             "top_products": top_products,
             "candidate_products": candidate_products,
             "latest_discovery": latest_discovery,

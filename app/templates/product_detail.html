@@ -3,7 +3,7 @@
 {% block content %}
 <section class="page-heading compact">
   <div><p class="eyebrow">PRODUCT {{ product.aliexpress_product_id }}</p><h1>{{ clean_product_title(product.title) or "未采集商品标题" }}</h1><p><a href="/dashboard/stores/{{ store.id }}">{{ store.name }}</a> · IXSPY 页面可见日增量</p></div>
-  <div class="action-group"><a class="button primary" href="{{ product.url }}#monitor_product_id={{ product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品链接</a>{% if product.status == "active" %}<button class="button dianxiaomi-product" type="button" data-product-id="{{ product.id }}">采集到店小秘</button><button class="button danger deactivate-product" type="button" data-product-id="{{ product.id }}">删除监控</button>{% endif %}</div>
+  <div class="action-group"><a class="button primary" href="{{ product.url }}#monitor_product_id={{ product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品链接</a>{% if product.status == "active" %}<button class="button dianxiaomi-product" type="button" data-product-id="{{ product.id }}">采集到店小秘</button>{% if is_admin %}<button class="button danger deactivate-product" type="button" data-product-id="{{ product.id }}">删除监控</button>{% endif %}{% endif %}</div>
 </section>
 <section class="data-section review-product-controls" data-product-id="{{ product.id }}">
   <div class="section-heading"><h2>评论采集与归属</h2><a href="/reviews/insights">评论洞察</a></div>

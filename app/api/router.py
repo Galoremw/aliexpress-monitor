@@ -1,7 +1,7 @@
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
@@ -65,7 +65,12 @@ from app.collectors.base import Collector, CollectorResult
 from app.collectors.dependencies import get_collector
 from app.collectors.store_dependencies import get_store_discovery_collector
 from app.collectors.store_discovery import StoreDiscoveryCollector
-from app.core.auth import require_authenticated
+from app.core.auth import (
+    is_configured_admin_session,
+    require_admin,
+    require_authenticated,
+    require_dianxiaomi_admin,
+)
 from app.core.config import get_settings
 from app.api.service_auth import (
     require_dianxiaomi_service_token,
@@ -78,8 +83,10 @@ from app.api.utils import (
     normalize_aliexpress_url,
 )
 from app.db.models import (
+    BrowserCollectionControl,
     BrowserCollectionItem,
     BrowserCollectionRun,
+    BrowserCollectionWorker,
     CollectionAttempt,
     DianxiaomiHandoff,
     DianxiaomiQueueControl,
@@ -114,6 +121,7 @@ from app.services.browser_collection import (
     browser_collection_control_status,
     cancel_run,
     claim_next_item,
+    collection_window_end_date,
     confirm_store_identity_review,
     ensure_browser_collection_run,
     fail_item,
@@ -151,11 +159,16 @@ from app.services.store_pool_reset import (
 )
 from app.services.dianxiaomi import (
     ACTIVE_HANDOFF_STATUSES,
+    LEASED_HANDOFF_STATUSES,
+    claim_handoff,
     claim_handoff_batch,
     claim_next_handoff,
+    confirm_product_page_identity,
     create_handoff_batch,
+    delete_failed_handoffs,
     pause_dianxiaomi_queue,
     record_dianxiaomi_heartbeat,
+    reject_product_page_identity,
     resume_dianxiaomi_queue,
     retry_handoff,
     serialize_handoff,
@@ -325,6 +338,7 @@ def _save_store_observation(
     commit: bool = True,
     expected_store_id: int | None = None,
     target_date: date | None = None,
+    allow_pool_deactivation: bool = True,
 ) -> dict:
     normalized_store_url = normalize_aliexpress_url(payload.url, "store")
     url_store_id = extract_store_id(normalized_store_url)
@@ -483,7 +497,7 @@ def _save_store_observation(
         added_count += 1
 
     current_ids = {extract_product_id(link) for link in links}
-    if current_ids:
+    if current_ids and allow_pool_deactivation:
         pool_query = select(Product).where(Product.store_id == store.id, Product.status == "active")
         if not ranked_selection:
             pool_query = pool_query.where(
@@ -595,7 +609,7 @@ def commit_or_conflict(db: Session, detail: str) -> None:
 
 
 @router.post("/stores", response_model=StoreRead, status_code=status.HTTP_201_CREATED)
-def create_store(payload: StoreCreate, db: Session = Depends(get_db)) -> Store:
+def create_store(payload: StoreCreate, db: Session = Depends(get_db)) -> dict:
     normalized_url = normalize_aliexpress_url(payload.url, "store")
     external_id = payload.aliexpress_store_id or extract_store_id(normalized_url)
     store = Store(
@@ -606,7 +620,27 @@ def create_store(payload: StoreCreate, db: Session = Depends(get_db)) -> Store:
     db.add(store)
     commit_or_conflict(db, "Store URL or AliExpress store ID already exists")
     db.refresh(store)
-    return store
+    try:
+        run, _queued_count, _reused_count, _discovery_queued = queue_store_collection(
+            db, store, allow_paused=True
+        )
+        deferred = run.status in {"PAUSED", "NEEDS_VERIFICATION"}
+        initial_collection_status = "deferred" if deferred else "queued"
+        initial_collection_message = (
+            "今日队列已暂停；店铺采集任务已排队，恢复队列后再启动"
+            if run.status == "PAUSED"
+            else "今日队列等待人工验证；店铺采集任务已排队，验证后继续"
+            if run.status == "NEEDS_VERIFICATION"
+            else None
+        )
+    except ValueError as error:
+        initial_collection_status = "deferred"
+        initial_collection_message = str(error)
+    db.refresh(store)
+    result = StoreRead.model_validate(store).model_dump()
+    result["initial_collection_status"] = initial_collection_status
+    result["initial_collection_message"] = initial_collection_message
+    return result
 
 
 @router.post("/stores/{store_id}/browser-collection")
@@ -693,6 +727,7 @@ def collect_from_browser_extension(
 )
 def discover_store_from_browser_extension(
     payload: BrowserStoreDiscoveryRequest,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> dict:
     if payload.raw_data.get("collection_mode") == "top_7d_increment_selection":
@@ -721,7 +756,11 @@ def discover_store_from_browser_extension(
             raise HTTPException(status_code=409, detail="店铺页面商品已发生重复，未修改监控池") from exc
     if not payload.products:
         raise HTTPException(status_code=409, detail="店铺商品发现结果不能为空")
-    return _save_store_observation(db, payload)
+    return _save_store_observation(
+        db,
+        payload,
+        allow_pool_deactivation=is_configured_admin_session(request, db),
+    )
 
 
 @router.post(
@@ -969,7 +1008,9 @@ def reevaluate_selection_candidates(db: Session = Depends(get_db)) -> list[dict]
 
 
 @router.get("/integrations/dianxiaomi/status")
-def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
+def dianxiaomi_handoff_status(
+    request: Request, db: Session = Depends(get_db)
+) -> dict:
     control = db.get(DianxiaomiQueueControl, 1)
     if control is None:
         control = DianxiaomiQueueControl(id=1)
@@ -1003,9 +1044,6 @@ def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
         .order_by(DianxiaomiHandoff.requested_at, DianxiaomiHandoff.id)
         .limit(1)
     )
-    heartbeat_at = control.last_heartbeat_at
-    if heartbeat_at and heartbeat_at.tzinfo is None:
-        heartbeat_at = heartbeat_at.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     def count_for(status_value: str) -> int:
         return int(status_counts.get(status_value, 0))
@@ -1031,6 +1069,54 @@ def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
             (row.claimed_at.replace(tzinfo=timezone.utc) if row.claimed_at.tzinfo is None else row.claimed_at) < stale_cutoff
             for row in active_rows
         )
+    browser_control = db.get(BrowserCollectionControl, 1)
+    selected_worker_id = browser_control.selected_worker_id if browser_control else None
+    selected_worker_row = (
+        db.get(BrowserCollectionWorker, selected_worker_id)
+        if selected_worker_id else None
+    )
+    selected_heartbeat = selected_worker_row.last_heartbeat_at if selected_worker_row else None
+    if selected_heartbeat and selected_heartbeat.tzinfo is None:
+        selected_heartbeat = selected_heartbeat.replace(tzinfo=timezone.utc)
+    selected_worker_online = bool(
+        selected_heartbeat and now - selected_heartbeat <= timedelta(minutes=2)
+    )
+    selected_worker = (
+        {
+            "worker_id": selected_worker_id,
+            "label": selected_worker_row.label if selected_worker_row else (
+                browser_control.selected_worker_label if browser_control else selected_worker_id
+            ),
+            "online": selected_worker_online,
+        }
+        if selected_worker_id else None
+    )
+    active_owner = None
+    if latest_active and latest_active.worker_id:
+        owner_worker = db.get(BrowserCollectionWorker, latest_active.worker_id)
+        active_owner = {
+            "worker_id": latest_active.worker_id,
+            "label": owner_worker.label if owner_worker else latest_active.worker_id,
+        }
+    latest_active_claimed_at = latest_active.claimed_at if latest_active else None
+    if latest_active_claimed_at and latest_active_claimed_at.tzinfo is None:
+        latest_active_claimed_at = latest_active_claimed_at.replace(tzinfo=timezone.utc)
+    active_owner_holds_lease = bool(
+        latest_active
+        and latest_active.status in LEASED_HANDOFF_STATUSES
+        and latest_active.worker_id
+        and latest_active.worker_id != selected_worker_id
+        and latest_active_claimed_at
+        and latest_active_claimed_at >= stale_cutoff
+    )
+    waiting_reason = None
+    if queued_count and not control.is_paused:
+        if not selected_worker_id:
+            waiting_reason = "未选择采集电脑"
+        elif not selected_worker_online:
+            waiting_reason = "选中的采集电脑离线，任务仍保留在队列中"
+        elif active_owner_holds_lease:
+            waiting_reason = "等待当前采集电脑完成在途任务后再交接"
     total_count = sum(status_counts.values())
     legacy_counts = {
         "queued": queued_count,
@@ -1046,8 +1132,12 @@ def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
         "paused_at": control.paused_at,
         "paused_reason": control.paused_reason,
         "worker_id": control.worker_id,
-        "last_heartbeat_at": control.last_heartbeat_at,
-        "worker_online": bool(heartbeat_at and now - heartbeat_at <= timedelta(minutes=2)),
+        "last_heartbeat_at": selected_heartbeat,
+        "worker_online": selected_worker_online,
+        "selected_worker": selected_worker,
+        "active_owner": active_owner,
+        "waiting_for_owner": active_owner_holds_lease and bool(queued_count),
+        "waiting_reason": waiting_reason,
         "total_count": total_count,
         "queued_count": queued_count,
         "processing_count": processing_count,
@@ -1057,11 +1147,41 @@ def dianxiaomi_handoff_status(db: Session = Depends(get_db)) -> dict:
         "failed_count": failed_count,
         "needs_confirmation_count": needs_confirmation_count,
         "stalled_count": stalled_count,
+        "can_delete_failed": is_configured_admin_session(request, db),
+        "admin_delete_configured": bool(get_settings().auth_admin_username),
         "current_item": serialize_handoff(latest_active) if latest_active else None,
         "latest_at": rows[0].requested_at if rows else None,
         "items": [serialize_handoff(row) for row in rows],
         "latest": [serialize_handoff(row) for row in rows[:10]],
     }
+
+
+@router.delete("/integrations/dianxiaomi/handoffs/failed")
+def delete_failed_dianxiaomi_handoffs(
+    db: Session = Depends(get_db),
+    _admin=Depends(require_dianxiaomi_admin),
+) -> dict:
+    return {"deleted_count": delete_failed_handoffs(db)}
+
+
+@router.delete("/integrations/dianxiaomi/handoffs/{handoff_id}")
+def delete_failed_dianxiaomi_handoff(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+    _admin=Depends(require_dianxiaomi_admin),
+) -> dict:
+    handoff = db.scalar(
+        select(DianxiaomiHandoff)
+        .where(DianxiaomiHandoff.id == handoff_id)
+        .with_for_update()
+    )
+    if handoff is None:
+        raise HTTPException(status_code=404, detail="店小秘任务不存在")
+    if handoff.status != "FAILED":
+        raise HTTPException(status_code=409, detail="只能删除采集失败的店小秘任务")
+    db.delete(handoff)
+    db.commit()
+    return {"deleted_count": 1}
 
 
 @router.post("/integrations/dianxiaomi/queue/pause")
@@ -1219,18 +1339,13 @@ def claim_dianxiaomi_handoff(
     payload: DianxiaomiHandoffClaimRequest,
     db: Session = Depends(get_db),
 ) -> dict:
-    control = db.get(DianxiaomiQueueControl, 1)
-    if control and control.is_paused:
-        raise HTTPException(status_code=409, detail="店小秘采集队列已暂停")
-    row = _handoff_or_404(db, handoff_id)
-    if row.status != "QUEUED":
-        raise HTTPException(status_code=409, detail="该店小秘任务已被领取或已完成")
-    row.status = "CLAIMED"
-    row.claimed_at = datetime.now(timezone.utc)
-    row.worker_id = payload.worker_id
-    record_dianxiaomi_heartbeat(db, payload.worker_id)
-    db.commit()
-    db.refresh(row)
+    _handoff_or_404(db, handoff_id)
+    row = claim_handoff(db, handoff_id, payload.worker_id)
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail="任务未领取：请确认当前采集电脑已选中且在线、队列未暂停，且没有其他电脑的有效任务",
+        )
     return serialize_handoff(row)
 
 
@@ -1246,7 +1361,7 @@ def update_dianxiaomi_handoff_status(
     row = _handoff_or_404(db, handoff_id)
     if row.status not in ACTIVE_HANDOFF_STATUSES and payload.status != "CANCELED":
         raise HTTPException(status_code=409, detail="该店小秘任务已结束")
-    if row.worker_id and payload.worker_id and row.worker_id != payload.worker_id:
+    if not payload.worker_id or row.worker_id != payload.worker_id:
         raise HTTPException(status_code=409, detail="店小秘任务不属于当前扩展实例")
     return serialize_handoff(
         update_handoff(
@@ -1287,6 +1402,38 @@ def resume_dianxiaomi_handoff(
     try:
         return serialize_handoff(retry_handoff(db, row))
     except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/identity-review/confirm",
+    response_model=DianxiaomiHandoffRead,
+)
+def confirm_dianxiaomi_product_page_identity(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    try:
+        return serialize_handoff(confirm_product_page_identity(db, row))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/identity-review/reject",
+    response_model=DianxiaomiHandoffRead,
+)
+def reject_dianxiaomi_product_page_identity(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    try:
+        return serialize_handoff(reject_product_page_identity(db, row))
+    except ValueError as exc:
+        db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
@@ -1381,6 +1528,7 @@ def browser_collection_control(db: Session = Depends(get_db)) -> dict:
 )
 def browser_collection_create_pool_reset(
     payload: StorePoolResetCreateRequest,
+    _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -1405,6 +1553,7 @@ def browser_collection_latest_pool_reset(db: Session = Depends(get_db)) -> dict 
 )
 def browser_collection_start_pool_reset(
     batch_id: int,
+    _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -1419,6 +1568,7 @@ def browser_collection_start_pool_reset(
 )
 def browser_collection_cancel_pool_reset(
     batch_id: int,
+    _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -1577,6 +1727,7 @@ def browser_collection_pool_reset_resume(
 )
 def browser_collection_pool_reset_retry(
     task_id: int,
+    _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
@@ -1905,6 +2056,7 @@ def browser_collection_pause(
 )
 def browser_collection_cancel(
     run_id: int,
+    _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     run = db.get(BrowserCollectionRun, run_id)
@@ -1939,11 +2091,18 @@ def browser_collection_heartbeat(
 
 
 @router.patch("/stores/{store_id}", response_model=StoreRead)
-def update_store(store_id: int, payload: StoreUpdate, db: Session = Depends(get_db)) -> Store:
+def update_store(
+    store_id: int,
+    payload: StoreUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> Store:
     store = db.get(Store, store_id)
     if store is None:
         raise HTTPException(status_code=404, detail="Store not found")
     updates = payload.model_dump(exclude_unset=True)
+    if updates.get("status") == "inactive" and not is_configured_admin_session(request, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有管理员可以停用监控店铺")
     if "url" in updates:
         updates["url"] = normalize_aliexpress_url(updates["url"], "store")
     for field, value in updates.items():
@@ -1954,8 +2113,13 @@ def update_store(store_id: int, payload: StoreUpdate, db: Session = Depends(get_
 
 
 @router.post("/stores/{store_id}/deactivate", response_model=StoreRead)
-def deactivate_store(store_id: int, db: Session = Depends(get_db)) -> Store:
-    return update_store(store_id, StoreUpdate(status="inactive"), db)
+def deactivate_store(
+    store_id: int,
+    request: Request,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Store:
+    return update_store(store_id, StoreUpdate(status="inactive"), request, db)
 
 
 @router.post(
@@ -1964,6 +2128,7 @@ def deactivate_store(store_id: int, db: Session = Depends(get_db)) -> Store:
 )
 def discover_store(
     store_id: int,
+    request: Request,
     limit: int = Query(default=20, ge=1, le=500),
     db: Session = Depends(get_db),
     collector: StoreDiscoveryCollector = Depends(get_store_discovery_collector),
@@ -1973,7 +2138,13 @@ def discover_store(
         raise HTTPException(status_code=404, detail="Store not found")
     if store.status != "active":
         raise HTTPException(status_code=409, detail="Store monitoring is inactive")
-    return discover_store_products(db, store, collector, limit).to_dict()
+    return discover_store_products(
+        db,
+        store,
+        collector,
+        limit,
+        allow_deactivation=is_configured_admin_session(request, db),
+    ).to_dict()
 
 
 @router.get("/stores/{store_id}/discovery-snapshots", response_model=list[StoreSnapshotRead])
@@ -2003,9 +2174,7 @@ def get_store_top_products(
 ) -> dict:
     if db.get(Store, store_id) is None:
         raise HTTPException(status_code=404, detail="Store not found")
-    target_date = metric_date or (
-        datetime.now(ZoneInfo(get_settings().timezone)).date() - timedelta(days=1)
-    )
+    target_date = metric_date or (collection_window_end_date() - timedelta(days=1))
     rows = store_top_products(db, store_id, target_date, limit)
     return {
         "store_id": store_id,
@@ -2099,12 +2268,17 @@ def get_product(product_id: int, db: Session = Depends(get_db)) -> Product:
 
 @router.patch("/products/{product_id}", response_model=ProductRead)
 def update_product(
-    product_id: int, payload: ProductUpdate, db: Session = Depends(get_db)
+    product_id: int,
+    payload: ProductUpdate,
+    request: Request,
+    db: Session = Depends(get_db),
 ) -> Product:
     product = db.get(Product, product_id)
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
     values = payload.model_dump(exclude_unset=True)
+    if values.get("status") == "inactive" and not is_configured_admin_session(request, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="只有管理员可以停用商品监控")
     for field, value in values.items():
         setattr(product, field, value)
     if "status" in values:
@@ -2115,8 +2289,13 @@ def update_product(
 
 
 @router.post("/products/{product_id}/deactivate", response_model=ProductRead)
-def deactivate_product(product_id: int, db: Session = Depends(get_db)) -> Product:
-    return update_product(product_id, ProductUpdate(status="inactive"), db)
+def deactivate_product(
+    product_id: int,
+    request: Request,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Product:
+    return update_product(product_id, ProductUpdate(status="inactive"), request, db)
 
 
 @router.post(
@@ -2125,6 +2304,7 @@ def deactivate_product(product_id: int, db: Session = Depends(get_db)) -> Produc
 )
 def clear_active_monitored_products(
     payload: ProductMonitorClearRequest,
+    _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     active_store_ids = select(Store.id).where(Store.status == "active")

@@ -22,8 +22,8 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://monitor:monitor-local-only@postgres:5432/monitor}
       TIMEZONE: Asia/Shanghai
       SCHEDULER_ENABLED: "false"
-      SCHEDULER_HOUR: "2"
-      SCHEDULER_MINUTE: "0"
+      SCHEDULER_HOUR: ${SCHEDULER_HOUR:-15}
+      SCHEDULER_MINUTE: ${SCHEDULER_MINUTE:-15}
       FIRECRAWL_ENABLED: "true"
       FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
       FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-https://api.firecrawl.dev}
@@ -62,8 +62,8 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://monitor:monitor-local-only@postgres:5432/monitor}
       TIMEZONE: ${TIMEZONE:-Asia/Shanghai}
       SCHEDULER_ENABLED: "true"
-      SCHEDULER_HOUR: ${SCHEDULER_HOUR:-2}
-      SCHEDULER_MINUTE: ${SCHEDULER_MINUTE:-0}
+      SCHEDULER_HOUR: ${SCHEDULER_HOUR:-15}
+      SCHEDULER_MINUTE: ${SCHEDULER_MINUTE:-15}
       FIRECRAWL_ENABLED: ${FIRECRAWL_ENABLED:-true}
       FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
       FIRECRAWL_API_URL: ${FIRECRAWL_API_URL:-https://api.firecrawl.dev}
@@ -86,6 +86,7 @@ services:
       dockerfile: Dockerfile.frontend
     ports:
       - "${FRONTEND_BIND_HOST:-127.0.0.1}:${FRONTEND_PORT:-3000}:80"
+      - "127.0.0.1:3001:80" # Loopback-only upstream for private Tailscale Serve
     depends_on:
       backend:
         condition: service_healthy

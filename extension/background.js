@@ -7,7 +7,7 @@ const MAX_OPEN_COLLECTION_PAGES = 2;
 const AUTH_REQUIRED_NOTIFICATION_ID = "aliexpress-monitor-auth-required";
 const FIRST_PRODUCT_NOTIFICATION_ID = "aliexpress-monitor-first-product";
 const DIANXIAOMI_NOTIFICATION_ID = "aliexpress-monitor-dianxiaomi-confirmation";
-const DIANXIAOMI_URL = "https://www.dianxiaomi.com/web/productCrawl/dataAcquisition";
+const DIANXIAOMI_PRODUCT_OPERATION_KEY = "dianxiaomiProductOperation";
 const COLLECTION_RESPONSE_TIMEOUT_MS = 90 * 1000;
 const STORE_COLLECTION_RESPONSE_TIMEOUT_MS = 18 * 60 * 1000;
 const STORE_PAGE_RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -61,21 +61,15 @@ function isAliExpressPage(url) {
   }
 }
 
+function isAliExpressProductPage(url) {
+  return isAliExpressPage(url) && Boolean(productIdFromUrl(url));
+}
+
 function isAliExpressChallengePage(url) {
   try {
     const parsed = new URL(url);
     return /(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
       && /(?:^|\/)(?:punish|captcha|challenge|verification|verify|security-check)(?:\/|$)/i.test(parsed.pathname);
-  } catch {
-    return false;
-  }
-}
-
-function isDianxiaomiPage(url) {
-  try {
-    const parsed = new URL(url);
-    return /(?:^|\.)dianxiaomi\.com$/i.test(parsed.hostname)
-      && /\/web\/productCrawl\/dataAcquisition/i.test(parsed.pathname);
   } catch {
     return false;
   }
@@ -231,13 +225,13 @@ async function injectCollector(tabId) {
   }
 }
 
-async function injectDianxiaomiBridge(tabId) {
+async function injectDianxiaomiProductBridge(tabId) {
   try {
     const tab = await chrome.tabs.get(tabId);
-    if (!isDianxiaomiPage(tab.url)) return;
-    await chrome.scripting.executeScript({ target: { tabId }, files: ["dianxiaomi_bridge.js"] });
+    if (!isAliExpressProductPage(tab.url)) return;
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["dianxiaomi_product_bridge.js"] });
   } catch {
-    // The tab may still be loading; the next alarm retries without touching credentials.
+    // Navigation may still be replacing the document; the next poll retries.
   }
 }
 
@@ -245,7 +239,10 @@ async function injectOpenAliExpressTabs() {
   const tabs = await chrome.tabs.query({
     url: ["https://aliexpress.com/*", "https://*.aliexpress.com/*"],
   });
-  await Promise.all(tabs.map((tab) => injectCollector(tab.id)));
+  await Promise.all(tabs.map((tab) => Promise.all([
+    injectCollector(tab.id),
+    isAliExpressProductPage(tab.url) ? injectDianxiaomiProductBridge(tab.id) : Promise.resolve(),
+  ])));
 }
 
 async function automationState() {
@@ -261,6 +258,7 @@ async function automationState() {
     "automationItem",
     "automationClaimToken",
     "browserCollectionIsolatedProfileAuthorized",
+    "browserCollectionRemoteProfileEnabled",
     "automationItemPrefetched",
     "automationTaskKind",
     "prefetchedTabId",
@@ -284,6 +282,7 @@ async function browserCollectionWorkerIdentity() {
     "browserCollectionWorkerId",
     "browserCollectionLocalProfileEnabled",
     "browserCollectionRemoteProfileEnabled",
+    "browserCollectionWorkerLabel",
   ]);
   if (!state.browserCollectionWorkerId) {
     if (!workerIdentityInitialization) {
@@ -299,14 +298,33 @@ async function browserCollectionWorkerIdentity() {
     }
     state.browserCollectionWorkerId = await workerIdentityInitialization;
   }
-  const label = state.browserCollectionLocalProfileEnabled === true
+  const customLabel = typeof state.browserCollectionWorkerLabel === "string"
+    ? state.browserCollectionWorkerLabel.trim()
+    : "";
+  const label = customLabel || (state.browserCollectionLocalProfileEnabled === true
     ? "Galore主机"
-    : state.browserCollectionRemoteProfileEnabled === true ? "第二台电脑" : "Chrome采集器";
+    : state.browserCollectionRemoteProfileEnabled === true ? "第二台电脑" : "Chrome采集器");
   return { worker_id: state.browserCollectionWorkerId, worker_label: label };
+}
+
+function browserCollectionWorkerLabelFromUrl(url) {
+  try {
+    return (new URL(url).searchParams.get("browser_collection_name") || "")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim()
+      .slice(0, 128);
+  } catch {
+    return "";
+  }
 }
 
 async function ensureIdleAutomationTab(workerWindow, state) {
   if (!workerWindow?.id) return null;
+  const dashboardTab = state.automationDashboardTabId
+    ? await chrome.tabs.get(state.automationDashboardTabId).catch(() => null)
+    : null;
+  const sharedDashboardWindow = state.browserCollectionRemoteProfileEnabled === true
+    && dashboardTab?.windowId === workerWindow.id;
   const tabs = await chrome.tabs.query({ windowId: workerWindow.id }).catch(() => []);
   const protectedTabIds = new Set([
     state.automationTabId,
@@ -324,7 +342,7 @@ async function ensureIdleAutomationTab(workerWindow, state) {
     || await chrome.tabs.create({ windowId: workerWindow.id, url: "about:blank", active: false }).catch(() => null);
   await chrome.storage.local.set({
     automationWindowId: workerWindow.id,
-    automationWindowOwned: true,
+    automationWindowOwned: !sharedDashboardWindow,
     automationWindowBackground: true,
     ...(idleTab ? { idleAutomationTabId: idleTab.id } : {}),
   });
@@ -365,13 +383,17 @@ async function ensureAutomationWindow({ ensureIdle = true, focus = null } = {}) 
   const dashboardTab = state.automationDashboardTabId
     ? await chrome.tabs.get(state.automationDashboardTabId).catch(() => null)
     : null;
-  let workerWindow = state.automationWindowId && state.automationWindowBackground
-    ? await chrome.windows.get(state.automationWindowId).catch(() => null)
-    : null;
-  if (workerWindow?.id && workerWindow.id === dashboardTab?.windowId) workerWindow = null;
+  const reuseDashboardWindow = state.browserCollectionRemoteProfileEnabled === true;
+  if (reuseDashboardWindow && !dashboardTab?.windowId) return null;
+  let workerWindow = reuseDashboardWindow
+    ? await chrome.windows.get(dashboardTab.windowId).catch(() => null)
+    : state.automationWindowId && state.automationWindowBackground
+      ? await chrome.windows.get(state.automationWindowId).catch(() => null)
+      : null;
+  if (!reuseDashboardWindow && workerWindow?.id && workerWindow.id === dashboardTab?.windowId) workerWindow = null;
   if (workerWindow?.id) {
     await chrome.windows.update(workerWindow.id, { focused: foregroundCollection, state: windowState }).catch(() => undefined);
-  } else {
+  } else if (!reuseDashboardWindow) {
     workerWindow = await chrome.windows.create({
       focused: foregroundCollection,
       state: windowState,
@@ -383,11 +405,11 @@ async function ensureAutomationWindow({ ensureIdle = true, focus = null } = {}) 
 
   await chrome.storage.local.set({
     automationWindowId: workerWindow.id,
-    automationWindowOwned: true,
+    automationWindowOwned: !reuseDashboardWindow,
     automationWindowBackground: true,
     automationWindowFocusGuardUntil: Date.now() + 5000,
   });
-  if (ensureIdle) await ensureIdleAutomationTab(workerWindow, state);
+  if (ensureIdle && !reuseDashboardWindow) await ensureIdleAutomationTab(workerWindow, state);
   return workerWindow;
 }
 
@@ -399,8 +421,20 @@ async function migrateTrackedAutomationTabs(state) {
   const trackedTabIds = [state.automationTabId, state.prefetchedTabId, state.idleAutomationTabId]
     .filter((tabId) => Number.isInteger(tabId) && tabId !== dashboardTab.id);
   const trackedTabs = await Promise.all(trackedTabIds.map((tabId) => chrome.tabs.get(tabId).catch(() => null)));
-  const tabsToMove = trackedTabs.filter((tab) => tab?.windowId === dashboardTab.windowId);
-  if (!tabsToMove.length) return state;
+  const reuseDashboardWindow = state.browserCollectionRemoteProfileEnabled === true;
+  if (reuseDashboardWindow && !trackedTabs.some(Boolean)) {
+    await chrome.storage.local.set({
+      automationWindowId: dashboardTab.windowId,
+      automationWindowOwned: false,
+      automationWindowBackground: true,
+    });
+    return automationState();
+  }
+  const tabsToMove = trackedTabs.filter((tab) => tab
+    && (reuseDashboardWindow
+      ? tab.windowId !== dashboardTab.windowId
+      : tab.windowId === dashboardTab.windowId));
+  if (!tabsToMove.length && !reuseDashboardWindow) return state;
 
   const workerWindow = await ensureAutomationWindow({ ensureIdle: false });
   if (!workerWindow) return state;
@@ -408,7 +442,9 @@ async function migrateTrackedAutomationTabs(state) {
     await chrome.tabs.move(tab.id, { windowId: workerWindow.id, index: -1 });
     const movedTab = await chrome.tabs.get(tab.id).catch(() => null);
     if (movedTab?.windowId !== workerWindow.id) {
-      throw new Error("采集页未能迁移到独立采集窗口，暂不继续处理在途任务");
+      throw new Error(reuseDashboardWindow
+        ? "采集页未能迁移到监控台 Chrome 窗口，暂不继续处理在途任务"
+        : "采集页未能迁移到独立采集窗口，暂不继续处理在途任务");
     }
   }
 
@@ -422,7 +458,7 @@ async function migrateTrackedAutomationTabs(state) {
     await chrome.windows.update(workerWindow.id, { focused: true, state: "maximized" }).catch(() => undefined);
   }
   const migratedState = await automationState();
-  await ensureIdleAutomationTab(workerWindow, migratedState);
+  if (!reuseDashboardWindow) await ensureIdleAutomationTab(workerWindow, migratedState);
   return automationState();
 }
 
@@ -472,7 +508,7 @@ async function syncDedicatedWorkerMode() {
         && !isIsolatedBrowserCollectorUrl(url.href);
     } catch { return false; }
   });
-  const localDianxiaomiWorker = tabs.some((tab) => {
+  const localDianxiaomiDashboard = tabs.find((tab) => {
     try {
       const url = new URL(tab.url);
       return ["127.0.0.1", "localhost"].includes(url.hostname)
@@ -480,37 +516,35 @@ async function syncDedicatedWorkerMode() {
         && url.searchParams.get("dianxiaomi_local") === "1";
     } catch { return false; }
   });
-  const state = await chrome.storage.local.get([
-    "dianxiaomiLocalProfileEnabled",
-    "browserCollectionIsolatedProfileAuthorized",
-    "browserCollectionRemoteProfileEnabled",
-  ]);
-  const explicitNonLocalWorker = tabs.some((tab) => {
-    try {
-      const url = new URL(tab.url);
-      return url.searchParams.get("dianxiaomi_worker") === "1"
-        && url.searchParams.get("dianxiaomi_local") !== "1";
-    } catch { return false; }
-  });
-  const dianxiaomiEnabled = localDianxiaomiWorker
-    || (state.dianxiaomiLocalProfileEnabled === true && !explicitNonLocalWorker);
+  const dianxiaomiDashboard = isolatedLocalTab || remoteWorkerTab || localDianxiaomiDashboard;
   const isolatedLocalEnabled = Boolean(isolatedLocalTab);
   const remoteWorkerEnabled = Boolean(remoteWorkerTab);
+  const remoteWorkerLabel = browserCollectionWorkerLabelFromUrl(remoteWorkerTab?.url);
   await chrome.storage.local.set({
     browserCollectionWorkerMode: isolatedLocalEnabled || remoteWorkerEnabled,
     browserCollectionLocalProfileEnabled: isolatedLocalEnabled,
     browserCollectionIsolatedProfileAuthorized: isolatedLocalEnabled,
     browserCollectionRemoteProfileEnabled: remoteWorkerEnabled,
+    browserCollectionWorkerLabel: remoteWorkerLabel,
     ...((isolatedLocalTab || remoteWorkerTab)
       ? { automationDashboardTabId: (isolatedLocalTab || remoteWorkerTab).id }
       : {}),
-    dianxiaomiWorkerMode: dianxiaomiEnabled,
-    dianxiaomiLocalProfileEnabled: localDianxiaomiWorker
-      || (state.dianxiaomiLocalProfileEnabled === true && !explicitNonLocalWorker),
+    dianxiaomiWorkerMode: Boolean(dianxiaomiDashboard),
+    dianxiaomiLocalProfileEnabled: Boolean(localDianxiaomiDashboard),
+    ...(dianxiaomiDashboard ? {
+      dianxiaomiDashboardTabId: dianxiaomiDashboard.id,
+      dianxiaomiDashboardWindowId: dianxiaomiDashboard.windowId,
+    } : {}),
   });
+  if (!dianxiaomiDashboard) {
+    await chrome.storage.local.remove(["dianxiaomiDashboardTabId", "dianxiaomiDashboardWindowId"]);
+  }
   browserCollectionModeReady = true;
   dianxiaomiWorkerModeReady = true;
-  return { browserCollectionEnabled: isolatedLocalEnabled || remoteWorkerEnabled, localDianxiaomiWorker };
+  return {
+    browserCollectionEnabled: isolatedLocalEnabled || remoteWorkerEnabled,
+    localDianxiaomiWorker: Boolean(localDianxiaomiDashboard),
+  };
 }
 
 async function ensureWorkerModesInitialized() {
@@ -637,6 +671,8 @@ async function sendCollectMessage(
       claim_token: storeProgressContext.claimToken,
       monitored_products: storeProgressContext.monitoredProducts || [],
       expected_store_id: storeProgressContext.expectedStoreId,
+      expected_store_name: storeProgressContext.expectedStoreName || null,
+      identity_monitored_product_ids: storeProgressContext.identityMonitoredProductIds || [],
       verified_store_identity: storeProgressContext.verifiedStoreIdentity || null,
       approved_store_url_identities: storeProgressContext.approvedStoreUrlIdentities || [],
     } : {}),
@@ -656,6 +692,8 @@ async function sendStoreCandidateScanMessage(tabId, item, storeId, pageUrl, stor
     item_id: item.id,
     claim_token: (await automationState()).automationClaimToken,
     expectedStoreId: storeId,
+    expectedStoreName: item.title,
+    monitoredProductIds: item.monitored_product_ids || [],
     expectedPageUrl: pageUrl,
     verifiedStoreIdentity: storeIdentity || null,
     approvedStoreUrlIdentities: item.approved_store_url_identities || [],
@@ -700,18 +738,39 @@ function storeOrdersPageIdentity(url) {
 }
 
 function storeOrdersUrlIdentity(url) {
-  const page = storeOrdersPageIdentity(url);
-  if (!page) return null;
   try {
     const parsed = new URL(url);
-    if (parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) return null;
+    if (!/(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
+      || parsed.protocol !== "https:"
+      || parsed.username || parsed.password
+      || (parsed.port && parsed.port !== "443")) return null;
+    const routeStoreId = parsed.pathname.match(/^\/store\/(\d+)(?:\/pages\/all-items\.html)?$/)?.[1];
+    if (!routeStoreId) return null;
     return {
-      route_store_id: page.storeId,
-      normalized_page_identity: `${parsed.hostname.toLowerCase()}${parsed.pathname}`,
+      route_store_id: routeStoreId,
+      normalized_page_identity: `${parsed.hostname.toLowerCase()}/store/${routeStoreId}/pages/all-items.html`,
     };
   } catch {
     return null;
   }
+}
+
+function normalizedStoreOrdersPagePath(value) {
+  try {
+    const raw = String(value || "");
+    const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (!/(?:^|\.)aliexpress\.com$/i.test(parsed.hostname)
+      || parsed.username || parsed.password || (parsed.port && parsed.port !== "443")) return null;
+    const routeStoreId = parsed.pathname.match(/^\/store\/(\d+)\/pages\/all-items\.html$/)?.[1];
+    return routeStoreId ? `/store/${routeStoreId}/pages/all-items.html` : null;
+  } catch {
+    return null;
+  }
+}
+
+function sameStoreOrdersPageIdentity(left, right) {
+  const leftPath = normalizedStoreOrdersPagePath(left);
+  return Boolean(leftPath && leftPath === normalizedStoreOrdersPagePath(right));
 }
 
 function storeIdentityReviewTarget(url) {
@@ -741,9 +800,20 @@ function approvedStoreUrlIdentity(url, storeId, approvedIdentities = []) {
   if (!current || !Array.isArray(approvedIdentities)) return null;
   return approvedIdentities.find((identity) =>
     String(identity?.route_store_id || "") === current.route_store_id
-    && identity?.normalized_page_identity === current.normalized_page_identity
-    && String(storeId || "") !== current.route_store_id
+    && sameStoreOrdersPageIdentity(identity?.normalized_page_identity, current.normalized_page_identity)
   ) || null;
+}
+
+function storeOrdersListingUrlFromRoot(url, storeId, approvedIdentities = []) {
+  const identity = storeOrdersUrlIdentity(url);
+  if (!identity || !/^\/store\/\d+\/?$/.test(new URL(url).pathname)
+    || (identity.route_store_id !== String(storeId)
+      && !approvedStoreUrlIdentity(url, storeId, approvedIdentities))) return null;
+  const parsed = new URL(url);
+  parsed.pathname = `/store/${identity.route_store_id}/pages/all-items.html`;
+  parsed.searchParams.set("sortType", "bestmatch_sort");
+  parsed.searchParams.set("shop_sortType", "orders_desc");
+  return parsed.href;
 }
 
 function normalizedStoreName(value) {
@@ -752,53 +822,165 @@ function normalizedStoreName(value) {
     : "";
 }
 
-function storeIdentityProofHasConflict(proof, storeId) {
+function storeIdentityMatchedProductIds(proof, monitoredProductIds = []) {
+  const configuredIds = Array.isArray(monitoredProductIds) && monitoredProductIds.length
+    ? monitoredProductIds : proof?.matched_product_ids || [];
+  const targetIds = new Set(configuredIds.map(String));
+  const visibleIds = new Set((Array.isArray(proof?.visible_product_ids) ? proof.visible_product_ids : []).map(String));
+  return new Set((Array.isArray(proof?.matched_product_ids) ? proof.matched_product_ids : [])
+    .map(String)
+    .filter((productId) => targetIds.has(productId) && visibleIds.has(productId)));
+}
+
+function storeIdentityFingerprintIsVerified(
+  proof,
+  monitoredProductIds = [],
+  expectedStoreName = null,
+  approvedIdentities = [],
+) {
+  const matchedIds = storeIdentityMatchedProductIds(proof, monitoredProductIds);
+  if (matchedIds.size >= 2) return true;
+  if (matchedIds.size !== 1) return false;
+  const referenceNames = [expectedStoreName || proof?.expected_store_name,
+    ...(Array.isArray(approvedIdentities)
+      ? approvedIdentities.map((identity) => identity?.evidence?.ixspy_store_name)
+      : [])]
+    .map(normalizedStoreName)
+    .filter(Boolean);
+  const observedNames = [proof?.ixspy_store_name, proof?.matched_store_name,
+    ...(Array.isArray(proof?.observed_store_names) ? proof.observed_store_names : [])]
+    .map(normalizedStoreName)
+    .filter(Boolean);
+  return observedNames.some((name) => referenceNames.includes(name));
+}
+
+function storeIdentityProofHasConflict(
+  proof,
+  storeId,
+  monitoredProductIds = [],
+  expectedStoreName = null,
+  approvedIdentities = [],
+) {
+  if (storeIdentityFingerprintIsVerified(
+    proof, monitoredProductIds, expectedStoreName, approvedIdentities,
+  )) return false;
   const displayedIds = [proof?.heading_store_id, ...(proof?.labeled_store_ids || [])]
     .filter((value) => value != null).map(String);
   return displayedIds.some((id) => id !== String(storeId));
 }
 
-function storeRouteAliasIsVerified(url, storeId, approvedIdentities, proof) {
+function storeRouteAliasIsVerified(
+  url,
+  storeId,
+  approvedIdentities,
+  proof,
+  monitoredProductIds = [],
+  expectedStoreName = null,
+) {
   const page = storeOrdersPageIdentity(url);
-  if (!page || page.storeId === String(storeId) || !proof
+  const routeStoreId = page?.storeId || storeOrdersUrlIdentity(url)?.route_store_id;
+  if (!routeStoreId || routeStoreId === String(storeId) || !proof
     || proof.target_store_id !== String(storeId)
-    || String(proof.route_store_id) !== page.storeId
-    || storeIdentityProofHasConflict(proof, storeId)) return false;
+    || String(proof.route_store_id) !== routeStoreId
+    || storeIdentityProofHasConflict(
+      proof, storeId, monitoredProductIds, expectedStoreName, approvedIdentities,
+    )) return false;
+  const proofPage = storeOrdersUrlIdentity(proof.page_url);
+  const currentPage = storeOrdersUrlIdentity(url);
+  const sameRoutePage = proofPage?.route_store_id === currentPage?.route_store_id
+    && sameStoreOrdersPageIdentity(proofPage?.normalized_page_identity, currentPage?.normalized_page_identity);
+  const fingerprintVerified = storeIdentityFingerprintIsVerified(
+    proof, monitoredProductIds, expectedStoreName, approvedIdentities,
+  );
+  if (fingerprintVerified && sameRoutePage) return true;
   const matchingDisplayedId = String(proof.heading_store_id || "") === String(storeId)
     || (Array.isArray(proof.labeled_store_ids)
       && proof.labeled_store_ids.map(String).includes(String(storeId)));
   if (matchingDisplayedId) return true;
-  if (proof.page_url !== url) return false;
+  if (!sameRoutePage) return false;
 
   const approvedAlias = approvedStoreUrlIdentity(url, storeId, approvedIdentities);
   const savedName = approvedAlias?.evidence?.ixspy_store_name;
   const currentName = proof.ixspy_store_name;
   const namesConflict = Boolean(savedName && currentName
     && normalizedStoreName(savedName) !== normalizedStoreName(currentName));
-  const proofPage = storeOrdersUrlIdentity(proof.page_url);
-  const currentPage = storeOrdersUrlIdentity(url);
   return Boolean(approvedAlias
     && proof.identity_method === "backend_approved_url_alias"
     && proofPage?.route_store_id === currentPage?.route_store_id
-    && proofPage?.normalized_page_identity === currentPage?.normalized_page_identity
+    && sameStoreOrdersPageIdentity(proofPage?.normalized_page_identity, currentPage?.normalized_page_identity)
     && !namesConflict);
 }
 
-function storeOrdersUrlAllowedForTask(url, storeId, approvedIdentities = [], identityProof = null) {
+function storeOrdersUrlAllowedForTask(
+  url,
+  storeId,
+  approvedIdentities = [],
+  identityProof = null,
+  monitoredProductIds = [],
+  expectedStoreName = null,
+) {
   const page = storeOrdersPageIdentity(url);
-  if (!page) return false;
-  if (page.storeId === String(storeId)) return true;
-  if (approvedStoreUrlIdentity(url, storeId, approvedIdentities)) return true;
+  if (page && page.storeId === String(storeId)) return true;
+  if (page && approvedStoreUrlIdentity(url, storeId, approvedIdentities)) return true;
+  const currentIdentity = storeOrdersUrlIdentity(url);
+  const approvedIdentity = approvedStoreUrlIdentity(url, storeId, approvedIdentities);
   const proofPage = storeOrdersUrlIdentity(identityProof?.page_url);
-  const currentPage = storeOrdersUrlIdentity(url);
+  const expectedIdentityMethod = currentIdentity?.route_store_id === String(storeId)
+    ? "backend_approved_url_identity"
+    : "backend_approved_url_alias";
+  const savedName = approvedIdentity?.evidence?.ixspy_store_name;
+  const currentName = identityProof?.ixspy_store_name;
+  const namesConflict = Boolean(savedName && currentName
+    && normalizedStoreName(savedName) !== normalizedStoreName(currentName));
+  const isApprovedRootAlias = Boolean(page === null && currentIdentity && approvedIdentity && identityProof
+    && identityProof.target_store_id === String(storeId)
+    && String(identityProof.route_store_id) === currentIdentity.route_store_id
+    && identityProof.page_url === url
+    && identityProof.identity_method === expectedIdentityMethod
+    && proofPage?.route_store_id === currentIdentity.route_store_id
+    && sameStoreOrdersPageIdentity(proofPage?.normalized_page_identity, currentIdentity.normalized_page_identity)
+    && sameStoreOrdersPageIdentity(approvedIdentity.normalized_page_identity, currentIdentity.normalized_page_identity)
+    && !storeIdentityProofHasConflict(
+      identityProof, storeId, monitoredProductIds, expectedStoreName, approvedIdentities,
+    )
+    && !namesConflict);
+  if (isApprovedRootAlias) return true;
+
   const explicitIds = [identityProof?.heading_store_id, ...(identityProof?.labeled_store_ids || [])]
     .filter((value) => value != null).map(String);
-  return Boolean(identityProof
+  return Boolean(page && currentIdentity && identityProof
     && identityProof.target_store_id === String(storeId)
-    && proofPage?.route_store_id === currentPage?.route_store_id
-    && proofPage?.normalized_page_identity === currentPage?.normalized_page_identity
-    && explicitIds.includes(String(storeId))
-    && !storeIdentityProofHasConflict(identityProof, storeId));
+    && String(identityProof.route_store_id) === currentIdentity.route_store_id
+    && identityProof.page_url === url
+    && proofPage?.route_store_id === currentIdentity.route_store_id
+    && sameStoreOrdersPageIdentity(proofPage?.normalized_page_identity, currentIdentity.normalized_page_identity)
+    && ((explicitIds.includes(String(storeId))
+      && !storeIdentityProofHasConflict(
+        identityProof, storeId, monitoredProductIds, expectedStoreName, approvedIdentities,
+      ))
+      || storeIdentityFingerprintIsVerified(
+        identityProof, monitoredProductIds, expectedStoreName, approvedIdentities,
+      )));
+}
+
+const STORE_COLLECTION_START_URL_OVERRIDES = Object.freeze({
+  // Temporary workaround: AliExpress does not consistently initialize Orders sort on the generated URL.
+  "1105272224": "https://www.aliexpress.com/store/1105272224/pages/all-items.html?spm=a2g0o.store_pc_home.pcShopHead_2014623462415.1&shop_sortType=orders_desc",
+});
+
+function storeCollectionStartUrl(item) {
+  const targetPage = storeOrdersPageIdentity(item?.target_url);
+  const candidate = item?.collection_start_url;
+  if (targetPage && candidate
+    && storeOrdersUrlAllowedForTask(
+      candidate, targetPage.storeId, item.approved_store_url_identities || [],
+    )) return candidate;
+
+  const override = targetPage
+    ? STORE_COLLECTION_START_URL_OVERRIDES[targetPage.storeId]
+    : null;
+  if (override && safeStoreOrdersUrl(override, targetPage.storeId)) return override;
+  return item?.target_url || null;
 }
 
 function inferredNextStoreOrdersUrl(url, storeId, routeAliasId = null) {
@@ -1158,9 +1340,12 @@ async function waitForStorePage(
   timeoutMs = STORE_PAGE_NAVIGATION_TIMEOUT_MS,
   expectedStoreId = null,
   approvedStoreUrlIdentities = [],
+  monitoredProductIds = [],
+  expectedStoreName = null,
 ) {
   const expectedPage = storeOrdersPageIdentity(expectedUrl);
   const deadline = Date.now() + timeoutMs;
+  let rootListingRecoveryAttempted = false;
   while (Date.now() < deadline) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (tab && [tab.url, tab.pendingUrl].some(isAliExpressChallengePage)) {
@@ -1169,9 +1354,18 @@ async function waitForStorePage(
       throw error;
     }
     if (tab?.status === "complete" && !tab.pendingUrl) {
+      const targetStoreId = String(expectedStoreId || expectedPage?.storeId || "");
+      const rootListingUrl = !rootListingRecoveryAttempted
+        ? storeOrdersListingUrlFromRoot(tab.url, targetStoreId, approvedStoreUrlIdentities)
+        : null;
+      if (rootListingUrl) {
+        rootListingRecoveryAttempted = true;
+        await chrome.tabs.update(tabId, { url: rootListingUrl, active: true }).catch(() => null);
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
+      }
       const currentPage = storeOrdersPageIdentity(tab.url);
       if (expectedPage && currentPage && currentPage.page === expectedPage.page) {
-        const targetStoreId = String(expectedStoreId || expectedPage.storeId);
         if (currentPage.storeId === targetStoreId) {
           return {
             ...currentPage,
@@ -1186,6 +1380,8 @@ async function waitForStorePage(
         }
         const identity = await sendCollectMessage(tabId, "STORE_IDENTITY", null, undefined, {
           expectedStoreId: targetStoreId,
+          expectedStoreName,
+          identityMonitoredProductIds: monitoredProductIds,
           approvedStoreUrlIdentities,
         }).catch(() => null);
         const proof = identity?.store_identity;
@@ -1202,20 +1398,33 @@ async function waitForStorePage(
         const currentName = proof?.ixspy_store_name;
         const namesConflict = Boolean(savedName && currentName
           && normalizedStoreName(savedName) !== normalizedStoreName(currentName));
+        const expectedApprovedMethod = currentPage.storeId === targetStoreId
+          ? "backend_approved_url_identity"
+          : "backend_approved_url_alias";
         const backendAliasProof = Boolean(approvedAlias
           && identity?.state === "ready"
           && identity.platform_store_id === targetStoreId
-          && proof?.identity_method === "backend_approved_url_alias"
+          && proof?.identity_method === expectedApprovedMethod
           && proof?.target_store_id === targetStoreId
           && String(proof.route_store_id) === currentPage.storeId
           && proof.page_url === tab.url
-          && !storeIdentityProofHasConflict(proof, targetStoreId)
+          && !storeIdentityProofHasConflict(
+            proof, targetStoreId, monitoredProductIds, expectedStoreName, approvedStoreUrlIdentities,
+          )
           && !namesConflict);
+        const fingerprintProof = Boolean(identity?.state === "ready"
+          && identity.platform_store_id === targetStoreId
+          && proof?.target_store_id === targetStoreId
+          && String(proof.route_store_id) === currentPage.storeId
+          && proof.page_url === tab.url
+          && storeIdentityFingerprintIsVerified(
+            proof, monitoredProductIds, expectedStoreName, approvedStoreUrlIdentities,
+          ));
         if (identity?.state === "ready" && identity.platform_store_id === targetStoreId
           && proof?.target_store_id === targetStoreId
           && String(proof.route_store_id) === currentPage.storeId
           && proof.page_url === tab.url
-          && matchingDisplayedId && !headingMismatch && !labeledMismatch) {
+          && ((matchingDisplayedId && !headingMismatch && !labeledMismatch) || fingerprintProof)) {
           return { ...currentPage, store_identity: proof };
         }
         if (backendAliasProof) {
@@ -1294,7 +1503,7 @@ async function collectStorePages(tabId, item) {
         }
         const recoveryUrl = isPotentialAliasPage ? tab.url : item.target_url;
         const readyPage = await waitForStorePage(
-          tabId, recoveryUrl, recoveryBudgetMs, storeId, approvedStoreUrlIdentities,
+          tabId, recoveryUrl, recoveryBudgetMs, storeId, approvedStoreUrlIdentities, targets, item.title,
         );
         routeStoreId = readyPage.storeId;
         storeIdentity = readyPage.store_identity || storeIdentity;
@@ -1353,6 +1562,8 @@ async function collectStorePages(tabId, item) {
             claimToken: (await automationState()).automationClaimToken,
             monitoredProducts: item.monitored_products || [],
             expectedStoreId: storeId,
+            expectedStoreName: item.title,
+            identityMonitoredProductIds: targets,
             verifiedStoreIdentity: storeIdentity,
             approvedStoreUrlIdentities,
           }),
@@ -1395,7 +1606,8 @@ async function collectStorePages(tabId, item) {
       || (result.store_identity?.target_store_id && result.store_identity.target_store_id !== storeId)) {
       return { state: "failed", message: "店铺列表页与目标店铺不匹配" };
     }
-    const resultRouteId = storeOrdersPageIdentity(tab.url)?.storeId;
+    const resultRouteId = storeOrdersPageIdentity(tab.url)?.storeId
+      || storeOrdersUrlIdentity(tab.url)?.route_store_id;
     if (!resultRouteId || (routeStoreId !== storeId && routeStoreId !== resultRouteId)) {
       return { state: "failed", error_type: "store_identity_mismatch", message: "店铺路由别名在任务中发生变化" };
     }
@@ -1451,7 +1663,7 @@ async function collectStorePages(tabId, item) {
     }
     await chrome.tabs.update(tabId, { url: nextUrl, active: true });
     const readyPage = await waitForStorePage(
-      tabId, nextUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities,
+      tabId, nextUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities, targets, item.title,
     );
     routeStoreId = readyPage.storeId;
     storeIdentity = readyPage.store_identity || storeIdentity;
@@ -1497,7 +1709,7 @@ async function collectStorePages(tabId, item) {
               const navigationBudgetMs = Math.min(STORE_PAGE_NAVIGATION_TIMEOUT_MS, storeCollectionWorkRemaining(startedAt));
               if (navigationBudgetMs <= 0) throw new Error("店铺任务工作时间预算已用完");
               const readyPage = await waitForStorePage(
-                tabId, discoveryUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities,
+                tabId, discoveryUrl, navigationBudgetMs, storeId, approvedStoreUrlIdentities, targets, item.title,
               );
               routeStoreId = readyPage.storeId;
               storeIdentity = readyPage.store_identity || storeIdentity;
@@ -2270,9 +2482,17 @@ async function openAutomationItem(item, taskKind = "PRODUCT", knownKeys = [], { 
   let state = await automationState();
   if (prefetch && state.prefetchedItem) return;
   if (!prefetch && state.automationItem) return;
+  const startUrl = item.target_type === "STORE" ? storeCollectionStartUrl(item) : item.target_url;
   const singleProductCheck = !prefetch && item.target_key === `product:${item.product_id}:single`;
-  const workerWindow = await ensureAutomationWindow({ ensureIdle: !prefetch, focus: singleProductCheck ? false : null });
-  if (!workerWindow) throw new Error("请先在本机 Chrome 打开一个普通窗口，再继续后台采集");
+  const workerWindow = await ensureAutomationWindow({
+    ensureIdle: !prefetch && state.browserCollectionRemoteProfileEnabled !== true,
+    focus: singleProductCheck ? false : null,
+  });
+  if (!workerWindow) {
+    throw new Error(state.browserCollectionRemoteProfileEnabled === true
+      ? "请在当前采集 Chrome 窗口打开并保留监控台标签，再继续采集"
+      : "请先在本机 Chrome 打开一个普通窗口，再继续后台采集");
+  }
   if (!prefetch) await focusWindowForSingleProductTest(item, workerWindow.id, prefetch, { deferFocus: true });
   const currentState = await automationState();
   const idleTab = !prefetch && currentState.idleAutomationTabId
@@ -2283,10 +2503,10 @@ async function openAutomationItem(item, taskKind = "PRODUCT", knownKeys = [], { 
     ? idleTab
     : null;
   const tab = reusableIdleTab
-    ? await chrome.tabs.update(reusableIdleTab.id, { url: item.target_url, active: true })
+    ? await chrome.tabs.update(reusableIdleTab.id, { url: startUrl, active: true })
     : await chrome.tabs.create({
       windowId: workerWindow.id,
-      url: item.target_url,
+      url: startUrl,
       active: !prefetch,
     });
   if (reusableIdleTab) await chrome.storage.local.remove("idleAutomationTabId");
@@ -2727,7 +2947,12 @@ async function pollAutomation() {
         storeProbe ? "STORE_IDENTITY" : state.automationItem?.target_type,
         state.automationItem?.target_date,
         undefined,
-        storeProbe ? { expectedStoreId: storeId } : null,
+        storeProbe ? {
+          expectedStoreId: storeId,
+          expectedStoreName: state.automationItem?.title,
+          identityMonitoredProductIds: state.automationItem?.monitored_product_ids || [],
+          approvedStoreUrlIdentities: state.automationItem?.approved_store_url_identities || [],
+        } : null,
       );
       if (probe?.state === "challenge") return;
       if (probe?.state === "ixspy_login") return;
@@ -2788,104 +3013,287 @@ async function pollAutomation() {
   }
 }
 
-async function sendDianxiaomiMessage(tabId, urls, type = "dianxiaomi-submit-links") {
+async function sendDianxiaomiProductMessage(tabId, message) {
   let lastError;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
-      return await chrome.tabs.sendMessage(tabId, { type, urls });
+      return await chrome.tabs.sendMessage(tabId, message);
     } catch (error) {
       lastError = error;
-      await injectDianxiaomiBridge(tabId);
+      await injectDianxiaomiProductBridge(tabId);
       await new Promise((resolve) => setTimeout(resolve, 700));
     }
   }
-  throw lastError || new Error("店小秘页面尚未准备好");
+  throw lastError || new Error("AliExpress 商品页的店小秘助手桥接尚未准备好");
 }
 
-async function checkDianxiaomiReady(tabId) {
-  return sendDianxiaomiMessage(tabId, [], "dianxiaomi-check-ready");
-}
-
-async function waitForDianxiaomiTab(tabId) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+async function waitForDianxiaomiProductTab(tabId, expectedProductId) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (!tab) throw new Error("店小秘后台页面已关闭");
-    if (tab.status === "complete") return tab;
+    if (!tab) throw new Error("店小秘工作窗口的商品页已关闭");
+    if (tab.status === "complete" && productIdFromUrl(tab.url) === String(expectedProductId)) return tab;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  return chrome.tabs.get(tabId);
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const actualProductId = productIdFromUrl(tab?.url);
+  throw new Error(
+    `店小秘工作窗口未加载队列商品（目标商品 ID ${expectedProductId}，当前商品 ID ${actualProductId || "未识别"}）`,
+  );
 }
 
-async function ensureDianxiaomiTab() {
-  const stored = await chrome.storage.local.get([
-    "dianxiaomiTabId",
-    "dianxiaomiTabGroupId",
+function isDianxiaomiWorkerDashboardUrl(value) {
+  try {
+    const url = new URL(value);
+    const explicitLocalWorker = ["127.0.0.1", "localhost"].includes(url.hostname)
+      && url.searchParams.get("dianxiaomi_worker") === "1"
+      && url.searchParams.get("dianxiaomi_local") === "1";
+    const browserWorker = url.searchParams.get("browser_collection") === "1"
+      && (!isLoopbackMonitorDashboard(url.href) || isIsolatedBrowserCollectorUrl(url.href));
+    return explicitLocalWorker || browserWorker;
+  } catch {
+    return false;
+  }
+}
+
+async function dianxiaomiWorkerDashboardContext() {
+  await ensureWorkerModesInitialized();
+  const state = await chrome.storage.local.get([
+    "dianxiaomiWorkerMode",
     "dianxiaomiDashboardTabId",
     "dianxiaomiDashboardWindowId",
   ]);
+  if (state.dianxiaomiWorkerMode !== true
+    || !Number.isInteger(state.dianxiaomiDashboardTabId)
+    || !Number.isInteger(state.dianxiaomiDashboardWindowId)) return null;
+  const tab = await chrome.tabs.get(state.dianxiaomiDashboardTabId).catch(() => null);
+  if (!tab || tab.windowId !== state.dianxiaomiDashboardWindowId
+    || !isDianxiaomiWorkerDashboardUrl(tab.url)) return null;
+  const window = await chrome.windows.get(tab.windowId).catch(() => null);
+  return window?.id === tab.windowId ? { tab, windowId: window.id } : null;
+}
+
+async function ensureDianxiaomiProductTab(url, dashboardWindowId) {
+  const dashboard = await dianxiaomiWorkerDashboardContext();
+  if (!dashboard || dashboard.windowId !== dashboardWindowId) {
+    throw new Error("监控台采集窗口已关闭或失效；未创建独立 Chrome 窗口");
+  }
+  const stored = await chrome.storage.local.get(["dianxiaomiTabId", "dianxiaomiWindowId"]);
   let tab = stored.dianxiaomiTabId
     ? await chrome.tabs.get(stored.dianxiaomiTabId).catch(() => null)
     : null;
-  if (tab && !isDianxiaomiPage(tab.url)) tab = null;
-  if (!tab) {
-    const workerTabs = await chrome.tabs.query({
-      url: ["http://127.0.0.1:3000/*", "http://localhost:3000/*"],
-    });
-    const storedDashboard = stored.dianxiaomiDashboardTabId
-      ? await chrome.tabs.get(stored.dianxiaomiDashboardTabId).catch(() => null)
-      : null;
-    const workerTab = workerTabs.find((candidate) => {
-      try {
-        const url = new URL(candidate.url);
-        return url.searchParams.get("dianxiaomi_worker") === "1"
-          && url.searchParams.get("dianxiaomi_local") === "1";
-      } catch { return false; }
-    }) || (isLocalMonitorDashboard(storedDashboard?.url) ? storedDashboard : null)
-      || workerTabs.find((candidate) => isLocalMonitorDashboard(candidate.url))
-      || (Number.isInteger(stored.dianxiaomiDashboardWindowId)
-        ? { windowId: stored.dianxiaomiDashboardWindowId }
-        : null);
-    if (!workerTab?.windowId) throw new Error("请先在本机 Chrome 打开监控台，并确保店小秘已登录");
-    tab = await chrome.tabs.create({ windowId: workerTab.windowId, url: DIANXIAOMI_URL, active: false });
+  if (!tab || tab.windowId !== dashboardWindowId || tab.id === dashboard.tab.id) {
+    tab = await chrome.tabs.create({ windowId: dashboardWindowId, url, active: true });
+  } else if (productIdFromUrl(tab.url) !== productIdFromUrl(url)) {
+    tab = await chrome.tabs.update(tab.id, { url, active: true });
+  } else {
+    tab = await chrome.tabs.update(tab.id, { active: true });
   }
-  await waitForDianxiaomiTab(tab.id);
-  let groupId = stored.dianxiaomiTabGroupId;
-  try {
-    if (!groupId || !(await chrome.tabGroups.get(groupId).catch(() => null))) {
-      groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-      await chrome.storage.local.set({ dianxiaomiTabGroupId: groupId });
-    } else {
-      await chrome.tabs.group({ tabIds: [tab.id], groupId });
-    }
-    await chrome.tabGroups.update(groupId, { title: "监控后台任务", color: "blue", collapsed: true });
-  } catch {
-    // Tab grouping is a convenience; the background tab still works without it.
-  }
-  await chrome.storage.local.set({ dianxiaomiTabId: tab.id });
-  return { tab, windowId: tab.windowId };
+
+  tab = await waitForDianxiaomiProductTab(tab.id, productIdFromUrl(url));
+  await chrome.storage.local.set({
+    dianxiaomiDashboardTabId: dashboard.tab.id,
+    dianxiaomiDashboardWindowId: dashboardWindowId,
+    dianxiaomiWindowId: dashboardWindowId,
+    dianxiaomiTabId: tab.id,
+  });
+  return { tab, windowId: dashboardWindowId };
+}
+
+async function focusDianxiaomiProductTab(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab) return;
+  // Focus the tab without changing the user's current window size/state.
+  await chrome.windows.update(tab.windowId, { focused: true }).catch(() => undefined);
+  await chrome.tabs.update(tab.id, { active: true }).catch(() => undefined);
+}
+
+function isNonBlockingDianxiaomiProductMismatch(itemOrMessage) {
+  const errorType = typeof itemOrMessage === "string" ? null : itemOrMessage?.error_type;
+  const message = typeof itemOrMessage === "string"
+    ? itemOrMessage
+    : itemOrMessage?.error_message || itemOrMessage?.message || "";
+  return errorType === "product_page_mismatch"
+    || message.includes("店小秘工作窗口未加载队列商品")
+    || message.includes("工作商品页已切换，无法确认当前队列商品的采集结果");
 }
 
 async function updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, result = null) {
-  await Promise.all(handoffs.map((handoff) => api(`/api/integrations/dianxiaomi/handoffs/${handoff.id}/status`, {
+  const responses = await Promise.all(handoffs.map((handoff) => api(`/api/integrations/dianxiaomi/handoffs/${handoff.id}/status`, {
     method: "POST",
     body: JSON.stringify({
       status,
       worker_id: workerId,
-      error_type: status === "FAILED" ? "page_operation_failed" : status === "NEEDS_CONFIRMATION" ? "manual_confirmation_required" : null,
-      error_message: ["COLLECTING", "SUCCEEDED"].includes(status) ? null : result?.message || null,
+      error_type: status === "FAILED"
+        ? "page_operation_failed"
+        : status === "NEEDS_CONFIRMATION"
+          ? result?.error_type || (isNonBlockingDianxiaomiProductMismatch(result) ? "product_page_mismatch" : "manual_confirmation_required")
+          : null,
+      error_message: ["FAILED", "NEEDS_CONFIRMATION"].includes(status) ? result?.message || null : null,
     }),
-  }, baseUrl).catch(() => undefined)));
+  }, baseUrl).catch(() => null)));
+  return responses.every(Boolean);
+}
+
+async function clearDianxiaomiActiveHandoff(clearOperation = false) {
+  const keys = ["dianxiaomiActiveHandoffId", "dianxiaomiActiveTabId", "dianxiaomiProductFlowHandoffId"];
+  if (clearOperation) keys.push(DIANXIAOMI_PRODUCT_OPERATION_KEY);
+  await chrome.storage.local.remove(keys);
+}
+
+async function finishDianxiaomiHandoff(baseUrl, handoff, workerId, result, tabId) {
+  const status = result?.state === "succeeded"
+    ? "SUCCEEDED"
+    : result?.state === "collecting"
+      ? "COLLECTING"
+      : ["waiting_helper", "not_started"].includes(result?.state)
+        ? "OPENED"
+        : "NEEDS_CONFIRMATION";
+  const resultForUpdate = status === "NEEDS_CONFIRMATION" && !result?.message
+    ? { ...(result || {}), message: "店小秘助手未明确确认采集成功，请检查采集箱后再决定是否重新排队" }
+    : result;
+  const classifiedResult = status === "NEEDS_CONFIRMATION" && !resultForUpdate?.error_type
+    ? {
+      ...(resultForUpdate || {}),
+      error_type: isNonBlockingDianxiaomiProductMismatch(resultForUpdate)
+        ? "product_page_mismatch"
+        : "manual_confirmation_required",
+    }
+    : resultForUpdate;
+  const updated = await updateDianxiaomiHandoffs(baseUrl, [handoff], workerId, status, classifiedResult);
+  if (!updated) return;
+
+  if (status === "NEEDS_CONFIRMATION") {
+    await clearDianxiaomiActiveHandoff();
+    if (isNonBlockingDianxiaomiProductMismatch(classifiedResult)) {
+      setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
+      return;
+    }
+    await notifyDianxiaomiConfirmation(classifiedResult.message);
+    await focusDianxiaomiProductTab(tabId);
+    return;
+  }
+  if (["SUCCEEDED", "FAILED"].includes(status)) {
+    await clearDianxiaomiActiveHandoff(true);
+    await chrome.notifications.clear(DIANXIAOMI_NOTIFICATION_ID).catch(() => undefined);
+    setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
+    return;
+  }
+  setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 2000);
+}
+
+async function pauseDianxiaomiHandoff(baseUrl, handoff, workerId, message, tabId = null) {
+  const result = {
+    message,
+    error_type: isNonBlockingDianxiaomiProductMismatch(message)
+      ? "product_page_mismatch"
+      : "manual_confirmation_required",
+  };
+  const updated = await updateDianxiaomiHandoffs(baseUrl, [handoff], workerId, "NEEDS_CONFIRMATION", result);
+  if (!updated) return;
+  await clearDianxiaomiActiveHandoff();
+  if (isNonBlockingDianxiaomiProductMismatch(result)) {
+    setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
+    return;
+  }
+  await notifyDianxiaomiConfirmation(message);
+  if (tabId) await focusDianxiaomiProductTab(tabId);
+}
+
+async function processDianxiaomiHandoff(baseUrl, handoff, workerId, dashboardWindowId, justClaimed = false) {
+  const stored = await chrome.storage.local.get([
+    "dianxiaomiActiveHandoffId",
+    "dianxiaomiActiveTabId",
+    "dianxiaomiProductFlowHandoffId",
+  ]);
+  let tab = null;
+  let tabId = stored.dianxiaomiActiveTabId;
+
+  if (justClaimed || handoff.status === "CLAIMED") {
+    await chrome.storage.local.remove(DIANXIAOMI_PRODUCT_OPERATION_KEY);
+    await chrome.storage.local.set({
+      dianxiaomiActiveHandoffId: handoff.id,
+      dianxiaomiProductFlowHandoffId: handoff.id,
+    });
+    if (!isAliExpressProductPage(handoff.target_url)) {
+      await finishDianxiaomiHandoff(baseUrl, handoff, workerId, {
+        state: "failed",
+        message: "队列链接不是有效的 AliExpress 商品详情页",
+      }, null);
+      return;
+    }
+    const ensured = await ensureDianxiaomiProductTab(handoff.target_url, dashboardWindowId);
+    tab = ensured.tab;
+    tabId = tab.id;
+    await chrome.storage.local.set({ dianxiaomiActiveTabId: tabId });
+    const opened = await updateDianxiaomiHandoffs(baseUrl, [handoff], workerId, "OPENED");
+    if (!opened) return;
+    handoff.status = "OPENED";
+  } else {
+    if (!["OPENED", "FILLED", "COLLECTING"].includes(handoff.status)) return;
+    if (String(stored.dianxiaomiProductFlowHandoffId || "") !== String(handoff.id)) {
+      await pauseDianxiaomiHandoff(
+        baseUrl,
+        handoff,
+        workerId,
+        "此任务是在商品页助手流程启用前提交的旧采集任务。请先检查店小秘采集箱是否已有结果，再决定是否重新排队。",
+        tabId,
+      );
+      return;
+    }
+    if (!tabId) {
+      await pauseDianxiaomiHandoff(baseUrl, handoff, workerId, "工作商品页已关闭，无法确认助手采集结果；请检查店小秘后再重新排队");
+      return;
+    }
+    tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) {
+      await pauseDianxiaomiHandoff(baseUrl, handoff, workerId, "工作商品页已关闭，无法确认助手采集结果；请检查店小秘后再重新排队");
+      return;
+    }
+    if (productIdFromUrl(tab.url) !== productIdFromUrl(handoff.target_url)) {
+      await pauseDianxiaomiHandoff(baseUrl, handoff, workerId, "工作商品页已切换，无法确认当前队列商品的采集结果；请检查后再重新排队", tab.id);
+      return;
+    }
+  }
+
+  let result;
+  if (justClaimed || (handoff.status === "OPENED" && tab?.status === "complete")) {
+    result = await sendDianxiaomiProductMessage(tabId, {
+      type: "dianxiaomi-start-product",
+      handoff_id: handoff.id,
+      target_url: handoff.target_url,
+    });
+  } else {
+    result = await sendDianxiaomiProductMessage(tabId, {
+      type: "dianxiaomi-product-status",
+      handoff_id: handoff.id,
+    });
+    if (result?.state === "not_started" && handoff.status === "OPENED") {
+      result = await sendDianxiaomiProductMessage(tabId, {
+        type: "dianxiaomi-start-product",
+        handoff_id: handoff.id,
+        target_url: handoff.target_url,
+      });
+    } else if (result?.state === "not_started" && handoff.status === "COLLECTING") {
+      result = {
+        state: "needs_confirmation",
+        message: "店小秘助手的运行状态丢失，无法安全判断任务是否已提交；请检查采集箱后再重新排队",
+      };
+    }
+  }
+  await finishDianxiaomiHandoff(baseUrl, handoff, workerId, result, tabId);
 }
 
 async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
   await ensureWorkerModesInitialized();
   if (dianxiaomiBusy) return;
-  const workerState = await chrome.storage.local.get("dianxiaomiWorkerMode");
-  if (!dianxiaomiWorkerModeReady || !workerState.dianxiaomiWorkerMode) return;
+  if (!dianxiaomiWorkerModeReady) return;
+  const dashboard = await dianxiaomiWorkerDashboardContext();
+  if (!dashboard) return;
+  const identity = await browserCollectionWorkerIdentity();
   dianxiaomiBusy = true;
-  const workerId = `chrome-${chrome.runtime.id}`;
-  let baseUrl = requestedBaseUrl || (await chrome.storage.local.get("activeApiBase")).activeApiBase || API_BASE;
-  let handoffs = [];
+  const workerId = identity.worker_id;
+  const baseUrl = requestedBaseUrl || (await chrome.storage.local.get("activeApiBase")).activeApiBase || API_BASE;
+  let handoff = null;
   try {
     if (requestedBaseUrl) await chrome.storage.local.set({ activeApiBase: requestedBaseUrl });
     await refreshApiTokenFromDashboard(baseUrl);
@@ -2898,52 +3306,39 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
     } catch (error) {
       if (error.status !== 404) throw error;
     }
-    if (heartbeat?.paused && heartbeat.paused_reason !== "needs_confirmation") return;
+    if (heartbeat?.paused) return;
     const existing = await api("/api/integrations/dianxiaomi/handoffs?limit=500", {}, baseUrl);
-    if (existing.some((item) => item.status === "NEEDS_CONFIRMATION" && item.worker_id === workerId)) {
-      await chrome.storage.local.set({ dianxiaomiNeedsConfirmation: true });
+    if (existing.some((item) => item.status === "NEEDS_CONFIRMATION"
+      && item.worker_id === workerId
+      && !isNonBlockingDianxiaomiProductMismatch(item))) return;
+
+    const active = existing.find((item) => item.worker_id === workerId && ["CLAIMED", "OPENED", "FILLED", "COLLECTING"].includes(item.status));
+    if (active) {
+      handoff = active;
+      await processDianxiaomiHandoff(baseUrl, active, workerId, dashboard.windowId);
+      return;
     }
-    const workerStorage = await chrome.storage.local.get("dianxiaomiNeedsConfirmation");
-    let resumeConfirmed = false;
-    if (workerStorage.dianxiaomiNeedsConfirmation) {
-      const { tab } = await ensureDianxiaomiTab();
-      const ready = await checkDianxiaomiReady(tab.id);
-      if (ready?.state !== "ready") return;
-      resumeConfirmed = true;
-      await chrome.storage.local.remove("dianxiaomiNeedsConfirmation");
-    }
-    handoffs = await api("/api/integrations/dianxiaomi/handoffs/claim-batch", {
+
+    const localState = await chrome.storage.local.get("dianxiaomiActiveHandoffId");
+    if (localState.dianxiaomiActiveHandoffId) await clearDianxiaomiActiveHandoff(true);
+    const claimed = await api("/api/integrations/dianxiaomi/handoffs/claim-batch", {
       method: "POST",
-      body: JSON.stringify({ worker_id: workerId, limit: 1, resume_confirmed: resumeConfirmed }),
+      body: JSON.stringify({ worker_id: workerId, limit: 1 }),
     }, baseUrl);
-    if (!handoffs?.length) return;
-    const { tab } = await ensureDianxiaomiTab();
-    await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, "OPENED");
-    const result = await sendDianxiaomiMessage(tab.id, handoffs.map((handoff) => handoff.target_url));
-    const status = result?.state === "succeeded"
-      ? "SUCCEEDED"
-      : result?.state === "submitted"
-      ? "COLLECTING"
-      : result?.state === "needs_confirmation" ? "NEEDS_CONFIRMATION" : "FAILED";
-    await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, result);
-    if (result?.state === "submitted") {
-      await chrome.notifications.clear(DIANXIAOMI_NOTIFICATION_ID).catch(() => undefined);
-    }
-    if (result?.state === "needs_confirmation") {
-      await chrome.storage.local.set({ dianxiaomiNeedsConfirmation: true });
-      await notifyDianxiaomiConfirmation(result.message);
-      await chrome.windows.update(tab.windowId, { focused: true, state: "normal" }).catch(() => undefined);
-      await chrome.tabs.update(tab.id, { active: true }).catch(() => undefined);
-    } else if (["succeeded", "failed"].includes(result?.state)) {
-      setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
-    }
+    if (!claimed?.length) return;
+    handoff = claimed[0];
+    await processDianxiaomiHandoff(baseUrl, handoff, workerId, dashboard.windowId, true);
   } catch (error) {
-    if (handoffs.length) {
-      await updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, "FAILED", {
-        message: error.message || "店小秘后台窗口操作失败",
-      });
+    if (handoff) {
+      await pauseDianxiaomiHandoff(
+        baseUrl,
+        handoff,
+        workerId,
+        `${error.message || "店小秘助手页面操作失败"}。请检查商品页和店小秘采集箱后再决定是否重新排队。`,
+        (await chrome.storage.local.get("dianxiaomiActiveTabId")).dianxiaomiActiveTabId,
+      );
     }
-    // The dashboard may be offline; claimed tasks are also protected by a lease on the backend.
+    // The dashboard may be offline; claimed tasks remain protected by the backend lease.
   } finally {
     dianxiaomiBusy = false;
   }
@@ -2986,15 +3381,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       }
     });
   }
-  if (changeInfo.status === "complete" && isDianxiaomiPage(tab.url)) {
-    void injectDianxiaomiBridge(tabId);
+  if (changeInfo.status === "complete" && isAliExpressProductPage(tab.url)) {
+    void injectDianxiaomiProductBridge(tabId);
   }
 });
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (tab && isAliExpressPage(tab.url)) void injectCollector(tabId);
-  if (tab && isDianxiaomiPage(tab.url)) void injectDianxiaomiBridge(tabId);
+  if (tab && isAliExpressProductPage(tab.url)) void injectDianxiaomiProductBridge(tabId);
 });
 
 chrome.webNavigation.onCommitted.addListener(({ tabId, url }) => {
@@ -3057,16 +3452,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === "dashboard-context") {
     void (async () => {
-      const localDianxiaomiDashboard = message.dianxiaomi_local_dashboard === true
-        && isLocalMonitorDashboard(sender?.tab?.url);
-      if (localDianxiaomiDashboard) await ensureWorkerModesInitialized();
+      const dashboardUrl = sender?.tab?.url || "http://127.0.0.1";
+      const explicitLocalDianxiaomiWorker = message.worker_mode === true
+        && isLocalMonitorDashboard(dashboardUrl)
+        && (() => {
+          try {
+            const url = new URL(dashboardUrl);
+            return url.searchParams.get("dianxiaomi_worker") === "1"
+              && url.searchParams.get("dianxiaomi_local") === "1";
+          } catch { return false; }
+        })();
+      const dianxiaomiBrowserWorker = message.dianxiaomi_browser_worker_mode === true;
+      const dianxiaomiWorkerEnabled = dianxiaomiBrowserWorker || explicitLocalDianxiaomiWorker;
       const stored = await chrome.storage.local.get("apiAccessTokens");
       const workerMode = message.worker_mode === true;
       if (message.browser_collection_mode_explicit) {
-        const dashboardUrl = new URL(sender?.tab?.url || "http://127.0.0.1");
-        const loopbackDashboard = isLoopbackMonitorDashboard(dashboardUrl.href);
+        const parsedDashboardUrl = new URL(dashboardUrl);
+        const loopbackDashboard = isLoopbackMonitorDashboard(parsedDashboardUrl.href);
         const isolatedLocalEnabled = message.browser_collection_mode === true
-          && isIsolatedBrowserCollectorUrl(dashboardUrl.href);
+          && isIsolatedBrowserCollectorUrl(parsedDashboardUrl.href);
         const remoteWorkerEnabled = message.browser_collection_mode === true
           && !loopbackDashboard && !isolatedLocalEnabled;
         const workerEnabled = isolatedLocalEnabled || remoteWorkerEnabled;
@@ -3075,6 +3479,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           browserCollectionLocalProfileEnabled: isolatedLocalEnabled,
           browserCollectionIsolatedProfileAuthorized: isolatedLocalEnabled,
           browserCollectionRemoteProfileEnabled: remoteWorkerEnabled,
+          browserCollectionWorkerLabel: remoteWorkerEnabled
+            ? browserCollectionWorkerLabelFromUrl(dashboardUrl.href)
+            : "",
           ...(workerEnabled && Number.isInteger(sender?.tab?.id)
             ? { automationDashboardTabId: sender.tab.id }
             : {}),
@@ -3089,13 +3496,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         dianxiaomiWorkerModeReady = true;
       }
-      if (localDianxiaomiDashboard) {
+      if (dianxiaomiWorkerEnabled && Number.isInteger(sender?.tab?.id)
+        && Number.isInteger(sender?.tab?.windowId)) {
         await chrome.storage.local.set({
           dianxiaomiWorkerMode: true,
-          dianxiaomiLocalProfileEnabled: true,
+          dianxiaomiLocalProfileEnabled: explicitLocalDianxiaomiWorker,
           dianxiaomiDashboardTabId: sender.tab.id,
           dianxiaomiDashboardWindowId: sender.tab.windowId,
         });
+        dianxiaomiWorkerModeReady = true;
+      } else if (message.dianxiaomi_mode_explicit && !workerMode) {
+        const current = await chrome.storage.local.get("dianxiaomiDashboardTabId");
+        if (current.dianxiaomiDashboardTabId === sender?.tab?.id) {
+          await chrome.storage.local.remove(["dianxiaomiDashboardTabId", "dianxiaomiDashboardWindowId"]);
+        }
+        await chrome.storage.local.set({ dianxiaomiWorkerMode: false, dianxiaomiLocalProfileEnabled: false });
         dianxiaomiWorkerModeReady = true;
       }
       const nextState = {
@@ -3109,24 +3524,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         };
       }
       await chrome.storage.local.set(nextState);
-      if (workerMode || localDianxiaomiDashboard) await pollDianxiaomiHandoffs(message.api_base_url || null);
+      if (dianxiaomiWorkerEnabled) await pollDianxiaomiHandoffs(message.api_base_url || null);
     })();
     sendResponse({ ok: true });
     return false;
   }
   if (message?.type === "dianxiaomi-handoff-created") {
     void (async () => {
-      if (isLocalMonitorDashboard(sender?.tab?.url)) {
-        await ensureWorkerModesInitialized();
-        await chrome.storage.local.set({
-          dianxiaomiWorkerMode: true,
-          dianxiaomiLocalProfileEnabled: true,
-          dianxiaomiDashboardTabId: sender.tab.id,
-          dianxiaomiDashboardWindowId: sender.tab.windowId,
-          ...(message.api_base_url ? { activeApiBase: message.api_base_url } : {}),
-        });
-        dianxiaomiWorkerModeReady = true;
-      }
+      if (message.api_base_url) await chrome.storage.local.set({ activeApiBase: message.api_base_url });
       await pollDianxiaomiHandoffs(message.api_base_url || null);
     })();
     sendResponse({ ok: true });

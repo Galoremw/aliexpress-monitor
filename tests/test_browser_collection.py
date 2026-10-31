@@ -3305,6 +3305,10 @@ def test_confirm_store_identity_review_records_alias_without_resuming_current_it
     assert current["status"] == "SKIPPED"
     assert current["error_type"] == "store_identity_deferred"
     assert current["identity_review_decision"] == "confirmed"
+    assert current["collection_start_url"] == (
+        "https://www.aliexpress.com/store/1105179516/pages/all-items.html"
+        "?sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
     assert response.json()["status"] == "RUNNING"
     assert response.json()["paused_reason"] is None
     assert response.json()["dispatch_enabled"] is True
@@ -3419,6 +3423,10 @@ def test_store_collection_items_receive_only_their_store_approved_url_identities
         ),
         "evidence": {"ixspy_store_name": "AMZSTEM Pop Toys Store"},
     }]
+    assert store_items[first_store["id"]]["collection_start_url"] == (
+        "https://www.aliexpress.com/store/1105179516/pages/all-items.html"
+        "?sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
     assert store_items[second_store["id"]]["approved_store_url_identities"] == [{
         "route_store_id": "1105182474",
         "normalized_page_identity": (
@@ -3946,3 +3954,11 @@ def test_confirmed_deferred_item_can_reuse_an_existing_store_url_identity(
     item = db_session.get(BrowserCollectionItem, claim["item"]["id"])
     assert item.status == "PENDING"
     assert item.identity_review_evidence["identity_review_decision"] == "confirmed"
+    requeued_item = next(
+        queued for queued in requeued.json()["items"] if queued["id"] == item.id
+    )
+    assert requeued_item["collection_start_url"] == (
+        "https://www.aliexpress.com/store/1105179516/pages/all-items.html"
+        "?sortType=bestmatch_sort&shop_sortType=orders_desc"
+    )
+    assert "/store/990365/pages/all-items.html" in requeued_item["target_url"]
