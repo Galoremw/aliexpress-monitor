@@ -3,6 +3,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.db.models import (
+    BrowserCollectionControl,
     BrowserCollectionItem,
     BrowserCollectionRun,
     BrowserCollectionWorker,
@@ -450,6 +451,95 @@ def test_verification_resume_keeps_online_owner_or_requeues_offline_owner(
         assert item.status == "PENDING"
         assert item.claimed_worker_id is None
         assert item.claim_token is None
+
+
+def test_control_reports_active_claims_per_worker(client, db_session):
+    stores = [create_store(client, store_id) for store_id in ("990370", "990371")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099370{index}")
+    for worker_id in ("worker-first", "worker-second", "worker-idle"):
+        register_browser_worker(client, worker_id, "采集电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    second = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
+    ).json()
+    challenged = client.post(
+        f"/api/browser-collection/items/{first['item']['id']}/challenge",
+        json={
+            "worker_id": "worker-first",
+            "claim_token": first["claim_token"],
+            "error_message": "verification page",
+            "page_url": "https://www.aliexpress.com/punish",
+        },
+    )
+    assert challenged.status_code == 200
+
+    control = client.get("/api/browser-collection/control").json()
+    workers = {worker["worker_id"]: worker for worker in control["workers"]}
+    assert workers["worker-first"]["active_claim_count"] == 1
+    assert workers["worker-second"]["active_claim_count"] == 1
+    assert workers["worker-idle"]["active_claim_count"] == 0
+
+    second_item = db_session.get(BrowserCollectionItem, second["item"]["id"])
+    second_item.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db_session.commit()
+    control = client.get("/api/browser-collection/control").json()
+    workers = {worker["worker_id"]: worker for worker in control["workers"]}
+    assert workers["worker-second"]["active_claim_count"] == 0
+
+
+def test_control_can_start_while_another_worker_has_a_valid_claim(client):
+    stores = [create_store(client, store_id) for store_id in ("990372", "990373")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099372{index}")
+    register_browser_worker(client, "worker-first", "第一台电脑")
+    register_browser_worker(client, "worker-second", "第二台电脑")
+    assert select_browser_worker(client, "worker-first").status_code == 200
+    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
+    ).json()
+    assert first["item"] is not None
+    assert select_browser_worker(client, "worker-second").status_code == 200
+
+    control = client.get("/api/browser-collection/control").json()
+    started = client.post("/api/browser-collection/runs/start-today")
+
+    assert control["can_start"] is True
+    assert control["handoff_pending"] is False
+    assert control["draining_count"] == 0
+    assert started.status_code == 200, started.text
+
+
+def test_control_disambiguates_duplicate_worker_labels(client, db_session):
+    register_browser_worker(client, "worker-alpha-1234", "采集电脑")
+    register_browser_worker(client, "worker-beta-5678", "采集电脑")
+    assert select_browser_worker(client, "worker-alpha-1234").status_code == 200
+    control_row = db_session.get(BrowserCollectionControl, 1)
+    control_row.selected_worker_label = "Qx的computer"
+    db_session.commit()
+
+    control = client.get("/api/browser-collection/control").json()
+    workers = {worker["worker_id"]: worker for worker in control["workers"]}
+
+    assert control["selected_worker"]["label"] == "Qx的computer"
+    assert workers["worker-alpha-1234"]["display_label"] == "Qx的computer"
+    assert workers["worker-beta-5678"]["display_label"] == "采集电脑"
+    control_row.selected_worker_label = "采集电脑"
+    db_session.commit()
+    workers = {
+        worker["worker_id"]: worker
+        for worker in client.get("/api/browser-collection/control").json()["workers"]
+    }
+    assert workers["worker-alpha-1234"]["display_label"] == "采集电脑 · worker-a"
+    assert workers["worker-beta-5678"]["display_label"] == "采集电脑 · worker-b"
+    assert workers["worker-alpha-1234"]["display_label"] != workers["worker-beta-5678"]["display_label"]
+    assert db_session.get(BrowserCollectionWorker, "worker-alpha-1234").label == "采集电脑"
+    assert db_session.get(BrowserCollectionWorker, "worker-beta-5678").label == "采集电脑"
 
 
 def test_non_selected_heartbeat_cannot_change_owner(client):

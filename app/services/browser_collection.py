@@ -225,6 +225,20 @@ def _advance_run(db: Session, run: BrowserCollectionRun) -> None:
 def browser_collection_control_status(db: Session) -> dict:
     control = _browser_control_row(db)
     now = utcnow()
+    run = get_today_run(db)
+    active_claim_counts: dict[str, int] = {}
+    if run is not None:
+        for item in run.items:
+            lease_expires_at = _aware(item.lease_expires_at)
+            if (
+                item.status in {"RUNNING", "NEEDS_VERIFICATION"}
+                and item.claimed_worker_id
+                and lease_expires_at is not None
+                and lease_expires_at > now
+            ):
+                active_claim_counts[item.claimed_worker_id] = (
+                    active_claim_counts.get(item.claimed_worker_id, 0) + 1
+                )
     worker_records = list(db.scalars(
         select(BrowserCollectionWorker).order_by(
             BrowserCollectionWorker.label, BrowserCollectionWorker.worker_id
@@ -238,24 +252,26 @@ def browser_collection_control_status(db: Session) -> dict:
             "capabilities": worker.capabilities or [],
             "last_heartbeat_at": worker.last_heartbeat_at,
             "online": _worker_is_online(worker, now),
+            "active_claim_count": active_claim_counts.get(worker.worker_id, 0),
         }
         for worker in worker_records
     }
     selected = worker_rows.get(control.selected_worker_id)
     if selected is not None and control.selected_worker_label:
         selected["label"] = control.selected_worker_label
+    label_counts: dict[str, int] = {}
+    for worker in worker_rows.values():
+        label_counts[worker["label"]] = label_counts.get(worker["label"], 0) + 1
+    for worker in worker_rows.values():
+        worker["display_label"] = (
+            worker["label"]
+            if label_counts[worker["label"]] == 1
+            else f"{worker['label']} · {worker['worker_id'][:8]}"
+        )
     workers = sorted(
         worker_rows.values(),
-        key=lambda worker: (worker["label"], worker["worker_id"]),
+        key=lambda worker: (worker["display_label"], worker["worker_id"]),
     )
-    run = get_today_run(db)
-    draining_count = 0
-    if run is not None:
-        draining_count = sum(
-            item.status == "RUNNING"
-            and item.claimed_worker_id != control.selected_worker_id
-            for item in run.items
-        )
     has_work = run is None or any(
         item.status in {"PENDING", "RUNNING", "NEEDS_VERIFICATION"}
         for item in run.items
@@ -265,12 +281,11 @@ def browser_collection_control_status(db: Session) -> dict:
         "workers": workers,
         "dispatch_enabled": bool(run and run.dispatch_enabled),
         "run_status": run.status if run else None,
-        "handoff_pending": draining_count > 0,
-        "draining_count": draining_count,
+        "handoff_pending": False,
+        "draining_count": 0,
         "can_start": bool(
             selected
             and selected["online"]
-            and not draining_count
             and has_work
             and not (run and _is_manually_cancelled(run))
         ),
