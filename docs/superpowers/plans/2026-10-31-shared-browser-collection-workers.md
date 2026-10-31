@@ -101,27 +101,27 @@ git commit -m "feat: share browser collection claims across workers"
 - Keep `handoff_pending` and `draining_count` in the control response for compatibility, but return `false` and `0`.
 - Do not include foreign-worker claims in `can_start`; preserve the selected-online and remaining-work requirements.
 
-- [ ] **Step 1: Add the failing control-count test**
+- [x] **Step 1: Add the failing control-count test**
 
 Add `test_control_reports_active_claims_per_worker`, `test_control_can_start_while_another_worker_has_a_valid_claim`, and `test_control_disambiguates_duplicate_worker_labels`. Claim tasks as two workers and assert each worker's response count matches its own unexpired claimed items, a worker with none reports zero, a valid claim does not block a manual start by the selected online computer, and equal stored labels produce distinct display labels without changing the persisted labels.
 
-- [ ] **Step 2: Run the focused control-count test and confirm it fails**
+- [x] **Step 2: Run the focused control-count test and confirm it fails**
 
 Run: `pytest tests/test_browser_collection.py::test_control_reports_active_claims_per_worker tests/test_browser_collection.py::test_control_can_start_while_another_worker_has_a_valid_claim tests/test_browser_collection.py::test_control_disambiguates_duplicate_worker_labels -q`
 
 Expected: FAIL because worker records do not yet expose active claim counts and `can_start` still depends on the old drain count.
 
-- [ ] **Step 3: Implement computed worker counts**
+- [x] **Step 3: Implement computed worker counts**
 
 Compute counts and display labels in `browser_collection_control_status` without storing duplicate counters or names. Add `active_claim_count` and `display_label` to `BrowserCollectionWorkerRead`, keep the selected-label override, append the worker ID prefix only when labels collide, return compatibility handoff fields as `false` and `0`, and remove the old drain condition from `can_start`. Do not add a database migration.
 
-- [ ] **Step 4: Run the backend control tests**
+- [x] **Step 4: Run the backend control tests**
 
 Run: `pytest tests/test_browser_collection.py -q`
 
 Expected: PASS, including selected-worker start prerequisites and per-worker active counts.
 
-- [ ] **Step 5: Commit the control API change**
+- [x] **Step 5: Commit the control API change**
 
 ```bash
 git add app/services/browser_collection.py app/api/schemas.py tests/test_browser_collection.py
@@ -141,17 +141,17 @@ git commit -m "feat: report shared browser worker load"
 - Consume `BrowserCollectionControlRead.workers[*].active_claim_count` from Task 2.
 - Keep the existing worker selector, separate start/continue button, and `/api/browser-collection/control/worker` endpoint.
 
-- [ ] **Step 1: Add failing dashboard assertions**
+- [x] **Step 1: Add failing dashboard assertions**
 
 Add `test_dashboard_worker_switch_does_not_prompt_for_handoff` and `test_dashboard_shows_shared_claim_counts`. Assert the rendered panel explains that all online computers can claim after start, renders the server-provided disambiguated `display_label` and worker-load count, exposes a worker-load element, and the selection handler sends the new worker without showing a handoff confirmation or claiming that selection pauses dispatch. Update the static asset version assertion for the changed dashboard assets.
 
-- [ ] **Step 2: Run the focused dashboard tests and confirm they fail**
+- [x] **Step 2: Run the focused dashboard tests and confirm they fail**
 
 Run: `pytest tests/test_dashboard.py -q`
 
 Expected: the new tests fail against the exclusive-handoff text and selector handler.
 
-- [ ] **Step 3: Update the dashboard selection and worker-load display**
+- [x] **Step 3: Update the dashboard selection and worker-load display**
 
 In `dashboard.html`, replace exclusive-owner and drain messaging with start-authorization and shared-queue guidance, and add an element for worker loads. Use `display_label` in both the server-rendered selector and dynamic worker list. In `dashboard.js`, render each computer's online state and `active_claim_count`, remove the active-run confirmation, and keep selection changes separate from the start endpoint. Preserve the disabled start state when the selected computer is offline. Add only the CSS needed to keep the worker-load list readable at desktop and mobile widths. In `base.html`, update the dashboard asset query version so browsers fetch the new JavaScript and CSS.
 
@@ -161,7 +161,7 @@ Run: `pytest tests/test_dashboard.py tests/test_browser_collection.py -q`
 
 Expected: both suites pass, the manual start gate remains intact, and switching the selected computer does not alter dispatch.
 
-- [ ] **Step 5: Commit the dashboard change**
+- [x] **Step 5: Commit the dashboard change**
 
 ```bash
 git add app/templates/dashboard.html app/templates/base.html app/static/dashboard.js app/static/dashboard.css tests/test_dashboard.py
