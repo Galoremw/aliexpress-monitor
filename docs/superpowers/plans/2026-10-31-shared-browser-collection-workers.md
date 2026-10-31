@@ -185,7 +185,7 @@ Confirm the target app and branch/digest, current database head, current run sta
 
 Use the existing approved `monitor-nas` workflow to build and deploy Compose service `backend` only. Leave `frontend`, `scheduler`, `postgres`, dependencies, and persistent volumes untouched. Do not migrate, reset the queue, change monitored-store membership, or start/resume collection. Verify the deployed app revision and `/api/browser-collection/control` response.
 
-- [ ] **Step 3: Confirm both collector computers are online**
+- [x] **Step 3: Confirm both collector computers are online**
 
 Verify two distinct worker IDs have fresh heartbeats and the supported existing extension version. No extension reload is required unless a worker fails to advertise its ID or heartbeat after the app deploy.
 
@@ -198,6 +198,8 @@ After the user explicitly starts the held queue from the dashboard, observe at l
 Do not cancel, reset, or force-complete work. Leave normal dispatch behavior as configured by the user and report any platform challenge or login requirement for the user to handle in the browser.
 
 Deployment record (2026-10-31): the backend-only image sha256:fc71b916cebc76ee1612a86275c0144d069c4f77060164bfed9fa3a1e99006db is healthy. The NAS migration head stayed at 20261028_0017; run 41 remains PENDING / STORE_DISCOVERY, 27 items pending, dispatch disabled, and zero active claims. The selected worker's dashboard label is Qx的computer; two other registered workers are offline. Steps 3 and 4 remain open until another worker is online and the user manually starts the queue for live acceptance.
+
+Worker identity update (2026-10-31): after the user opened the isolated collector URL on the Galore host, worker 8f419bb6-0043-4ce4-a3f6-c2b7c5ab9717 reported Galore主机 and remained online across consecutive 30-second heartbeats; worker 17413d70-7a33-4cde-96f1-3fb415ef0f8b remained online as 第二台电脑. Both advertise extension 0.6.125. Step 3 is complete. Run 41 remains PENDING with 27 pending, dispatch disabled, and zero active claims; Step 4 awaits the user's manual start and observed concurrent claims.
 
 ## Implementation Method
 
