@@ -257,10 +257,11 @@ def browser_collection_control_status(db: Session) -> dict:
             BrowserCollectionWorker.label, BrowserCollectionWorker.worker_id
         )
     ))
+    worker_records_by_id = {worker.worker_id: worker for worker in worker_records}
     worker_rows = {
         worker.worker_id: {
             "worker_id": worker.worker_id,
-            "label": worker.label,
+            "label": worker.display_label_override or worker.label,
             "extension_version": worker.extension_version,
             "capabilities": worker.capabilities or [],
             "last_heartbeat_at": worker.last_heartbeat_at,
@@ -270,7 +271,13 @@ def browser_collection_control_status(db: Session) -> dict:
         for worker in worker_records
     }
     selected = worker_rows.get(control.selected_worker_id)
-    if selected is not None and control.selected_worker_label:
+    selected_record = worker_records_by_id.get(control.selected_worker_id)
+    if (
+        selected is not None
+        and selected_record is not None
+        and not selected_record.display_label_override
+        and control.selected_worker_label
+    ):
         selected["label"] = control.selected_worker_label
     label_counts: dict[str, int] = {}
     for worker in worker_rows.values():
@@ -314,7 +321,7 @@ def select_browser_collection_worker(
         raise ValueError("该采集电脑尚未连接监控台")
     if control.selected_worker_id != worker_id:
         control.selected_worker_id = worker.worker_id
-        control.selected_worker_label = worker.label
+        control.selected_worker_label = worker.display_label_override or worker.label
     db.commit()
     return browser_collection_control_status(db)
 

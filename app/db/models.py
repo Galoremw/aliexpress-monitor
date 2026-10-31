@@ -401,6 +401,7 @@ class BrowserCollectionWorker(Base):
 
     worker_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     label: Mapped[str] = mapped_column(String(128), nullable=False)
+    display_label_override: Mapped[str | None] = mapped_column(String(128))
     extension_version: Mapped[str | None] = mapped_column(String(64))
     capabilities: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

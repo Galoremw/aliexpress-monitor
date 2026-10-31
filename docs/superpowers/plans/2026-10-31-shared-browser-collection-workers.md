@@ -174,7 +174,7 @@ git commit -m "feat: show shared browser worker status"
 - No source files. Deployment and runtime state only.
 
 **Interfaces:**
-- Deploy the app version produced by Tasks 1, 2, and 3; no database migration and no extension protocol change are expected.
+- Deploy the app version produced by Tasks 1, 2, and 3; no database migration and no extension protocol change are expected for that rollout.
 - Read current NAS image, service, database revision, today's run, queue dispatch state, active claims, and worker heartbeats before changing the service.
 
 - [x] **Step 1: Record read-only NAS preflight evidence**
@@ -200,6 +200,14 @@ Do not cancel, reset, or force-complete work. Leave normal dispatch behavior as 
 Deployment record (2026-10-31): the backend-only image sha256:fc71b916cebc76ee1612a86275c0144d069c4f77060164bfed9fa3a1e99006db is healthy. The NAS migration head stayed at 20261028_0017; run 41 remains PENDING / STORE_DISCOVERY, 27 items pending, dispatch disabled, and zero active claims. The selected worker's dashboard label is Qx的computer; two other registered workers are offline. Steps 3 and 4 remain open until another worker is online and the user manually starts the queue for live acceptance.
 
 Worker identity update (2026-10-31): after the user opened the isolated collector URL on the Galore host, worker 8f419bb6-0043-4ce4-a3f6-c2b7c5ab9717 reported Galore主机 and remained online across consecutive 30-second heartbeats; worker 17413d70-7a33-4cde-96f1-3fb415ef0f8b remained online as 第二台电脑. Both advertise extension 0.6.125. Step 3 is complete. Run 41 remains PENDING with 27 pending, dispatch disabled, and zero active claims; Step 4 awaits the user's manual start and observed concurrent claims.
+
+Worker display-name correction (2026-10-31): the user identified worker 17413d70-7a33-4cde-96f1-3fb415ef0f8b as QX's computer, and confirmed they had not opened the dashboard on the other computer. The selected-worker-only alias was insufficient because heartbeats from an unselected worker still replaced its display name. Persist a per-worker override in migration 20261031_0018, set this worker to `Qx的computer`, and preserve Galore主机 on worker 8f419bb6-0043-4ce4-a3f6-c2b7c5ab9717. Do not start or otherwise alter run 41.
+
+Pre-deployment recheck for the display-name correction (2026-10-31): the NAS reports worker 17413d70-7a33-4cde-96f1-3fb415ef0f8b as 第二台电脑 and 8f419bb6-0043-4ce4-a3f6-c2b7c5ab9717 as Galore主机, both on extension 0.6.125 with fresh heartbeats. The latest database run is ID 9, PAUSED / PRODUCT_COLLECTION, 27 PENDING items, dispatch disabled, and no RUNNING or NEEDS_VERIFICATION items. NAS Alembic head is 20261028_0017; backend health is OK. The follow-up correction requires migration 20261031_0018 and setting only those two known worker display overrides. Do not alter the queue.
+
+- [ ] **Follow-up: deploy persistent worker display names**
+
+Build and recreate only the backend. Its startup applies additive migration `20261031_0018`; set worker 17413d70-7a33-4cde-96f1-3fb415ef0f8b to `Qx的computer` and worker 8f419bb6-0043-4ce4-a3f6-c2b7c5ab9717 to `Galore主机`. Verify both names after heartbeats and confirm run 9 remains paused with 27 pending items and dispatch disabled.
 
 ## Implementation Method
 

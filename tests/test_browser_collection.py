@@ -542,6 +542,29 @@ def test_control_disambiguates_duplicate_worker_labels(client, db_session):
     assert db_session.get(BrowserCollectionWorker, "worker-beta-5678").label == "采集电脑"
 
 
+def test_worker_display_name_override_survives_heartbeat_and_selection(client, db_session):
+    qx_worker_id = "17413d70-7a33-4cde-96f1-3fb415ef0f8b"
+    register_browser_worker(client, qx_worker_id, "第二台电脑")
+    qx_worker = db_session.get(BrowserCollectionWorker, qx_worker_id)
+    qx_worker.display_label_override = "Qx的computer"
+    db_session.commit()
+
+    register_browser_worker(client, "worker-galore", "Galore主机")
+    assert select_browser_worker(client, "worker-galore").status_code == 200
+    register_browser_worker(client, qx_worker_id, "第二台电脑")
+
+    control = client.get("/api/browser-collection/control").json()
+    workers = {worker["worker_id"]: worker for worker in control["workers"]}
+
+    assert control["selected_worker"]["worker_id"] == "worker-galore"
+    assert workers[qx_worker_id]["label"] == "Qx的computer"
+    assert workers[qx_worker_id]["display_label"] == "Qx的computer"
+
+    assert select_browser_worker(client, qx_worker_id).status_code == 200
+    selected_control = client.get("/api/browser-collection/control").json()
+    assert selected_control["selected_worker"]["label"] == "Qx的computer"
+
+
 def test_non_selected_heartbeat_cannot_change_owner(client):
     register_browser_worker(client, "worker-galore", "Galore主机")
     register_browser_worker(client, "worker-second", "第二台电脑")
