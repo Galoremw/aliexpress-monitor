@@ -44,7 +44,7 @@ No new queue, worker partition, database migration, or extension protocol is exp
 - Keep the computer selector and separate `开始采集` / `继续采集` button.
 - Explain that selecting a computer authorizes the manual start; all online computers can collect after start.
 - Remove the active-run handoff confirmation and old-worker drain state from selector changes.
-- Show each online/offline worker and its current claimed-task count. Keep the selected label override behavior intact.
+- Show each online/offline worker and its current claimed-task count. Keep the selected label override behavior intact; when worker labels collide, append a short worker ID prefix to the display label without changing the stored label.
 - Keep the global pause, verification, pending, completion, and failure indicators.
 
 ## Scope and Non-Goals

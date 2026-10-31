@@ -25,10 +25,12 @@
 
 - Missing or stale worker heartbeats must not claim new work; the selected computer must still be online for manual start. Pin with `test_start_requires_selected_online_worker` and `test_stale_or_missing_worker_cannot_claim_shared_queue` in Task 1.
 - Two workers claiming while another store task is still running must receive different item IDs and tokens. Pin with `test_both_online_workers_claim_distinct_store_items` in Task 1.
+- If only one worker is online, it must be able to claim each task as it becomes available until the queue is drained. Pin with `test_single_online_worker_can_drain_entire_shared_queue` in Task 1.
 - Moving the selected start computer during dispatch must not pause the run or block the other worker. Pin with `test_selecting_start_worker_does_not_pause_shared_dispatch` in Task 1 and `test_dashboard_worker_switch_does_not_prompt_for_handoff` in Task 3.
 - Finishing one of several store tasks must not advance the phase while another store task remains pending or running. Pin with `test_parallel_store_items_keep_store_phase_until_all_terminal` in Task 1.
 - A platform-verification task must remain bound to its online browser owner, then be requeued if that owner is offline at resume. Pin with `test_verification_resume_keeps_online_owner_or_requeues_offline_owner` in Task 1.
 - Worker load and start availability must reflect shared claims, not an obsolete handoff count. Pin with `test_control_reports_active_claims_per_worker` and `test_control_can_start_while_another_worker_has_a_valid_claim` in Task 2.
+- Duplicate worker labels must remain distinguishable without rewriting persisted computer names. Pin with `test_control_disambiguates_duplicate_worker_labels` in Task 2.
 
 ---
 
@@ -44,7 +46,7 @@
 - `start_browser_collection_run(db: Session, run: BrowserCollectionRun | None = None) -> BrowserCollectionRun` still requires the selected computer to be online, but does not wait for claims from other workers to drain.
 - [ ] **Step 1: Add failing multi-worker claim tests**
 
-Add `test_both_online_workers_claim_distinct_store_items`, `test_one_worker_can_claim_multiple_store_items`, `test_selected_worker_offline_after_start_does_not_block_other_online_claims`, `test_stale_or_missing_worker_cannot_claim_shared_queue`, and `test_expired_claim_can_be_reclaimed_by_another_online_worker`. With dispatch started by a selected online computer, assert that both registered online workers can claim separate store items, a single worker can claim another store while its earlier task remains `RUNNING`, an already-started run continues when the selected worker goes offline, stale or absent worker identity gets no item, and an expired item's old token cannot write after a second worker reclaims it.
+Add `test_both_online_workers_claim_distinct_store_items`, `test_one_worker_can_claim_multiple_store_items`, `test_single_online_worker_can_drain_entire_shared_queue`, `test_selected_worker_offline_after_start_does_not_block_other_online_claims`, `test_stale_or_missing_worker_cannot_claim_shared_queue`, and `test_expired_claim_can_be_reclaimed_by_another_online_worker`. With dispatch started by a selected online computer, assert that both registered online workers can claim separate store items, a single worker can claim another store while its earlier task remains `RUNNING`, one worker can finish and claim all queued stores in turn, an already-started run continues when the selected worker goes offline, stale or absent worker identity gets no item, and an expired item's old token cannot write after a second worker reclaims it.
 
 - [ ] **Step 2: Add failing run-control and phase tests**
 
@@ -86,23 +88,24 @@ git commit -m "feat: share browser collection claims across workers"
 
 **Interfaces:**
 - `BrowserCollectionWorkerRead` adds `active_claim_count: int = 0`.
+- `BrowserCollectionWorkerRead` adds `display_label: str`; use the stored/selected-overridden label when unique, otherwise append ` · <first 8 worker ID characters>`.
 - Count `RUNNING` and `NEEDS_VERIFICATION` items assigned to the worker with an unexpired lease.
 - Keep `handoff_pending` and `draining_count` in the control response for compatibility, but return `false` and `0`.
 - Do not include foreign-worker claims in `can_start`; preserve the selected-online and remaining-work requirements.
 
 - [ ] **Step 1: Add the failing control-count test**
 
-Add `test_control_reports_active_claims_per_worker` and `test_control_can_start_while_another_worker_has_a_valid_claim`. Claim tasks as two workers and assert each worker's response count matches its own unexpired claimed items, a worker with none reports zero, and a valid claim does not block a manual start by the selected online computer.
+Add `test_control_reports_active_claims_per_worker`, `test_control_can_start_while_another_worker_has_a_valid_claim`, and `test_control_disambiguates_duplicate_worker_labels`. Claim tasks as two workers and assert each worker's response count matches its own unexpired claimed items, a worker with none reports zero, a valid claim does not block a manual start by the selected online computer, and equal stored labels produce distinct display labels without changing the persisted labels.
 
 - [ ] **Step 2: Run the focused control-count test and confirm it fails**
 
-Run: `pytest tests/test_browser_collection.py::test_control_reports_active_claims_per_worker tests/test_browser_collection.py::test_control_can_start_while_another_worker_has_a_valid_claim -q`
+Run: `pytest tests/test_browser_collection.py::test_control_reports_active_claims_per_worker tests/test_browser_collection.py::test_control_can_start_while_another_worker_has_a_valid_claim tests/test_browser_collection.py::test_control_disambiguates_duplicate_worker_labels -q`
 
 Expected: FAIL because worker records do not yet expose active claim counts and `can_start` still depends on the old drain count.
 
 - [ ] **Step 3: Implement computed worker counts**
 
-Compute the counts in `browser_collection_control_status` without storing a duplicate counter. Add `active_claim_count` to `BrowserCollectionWorkerRead`, keep the selected-label override, return compatibility handoff fields as `false` and `0`, and remove the old drain condition from `can_start`. Do not add a database migration.
+Compute counts and display labels in `browser_collection_control_status` without storing duplicate counters or names. Add `active_claim_count` and `display_label` to `BrowserCollectionWorkerRead`, keep the selected-label override, append the worker ID prefix only when labels collide, return compatibility handoff fields as `false` and `0`, and remove the old drain condition from `can_start`. Do not add a database migration.
 
 - [ ] **Step 4: Run the backend control tests**
 
@@ -132,7 +135,7 @@ git commit -m "feat: report shared browser worker load"
 
 - [ ] **Step 1: Add failing dashboard assertions**
 
-Add `test_dashboard_worker_switch_does_not_prompt_for_handoff` and `test_dashboard_shows_shared_claim_counts`. Assert the rendered panel explains that all online computers can claim after start, exposes a worker-load element, and the selection handler sends the new worker without showing a handoff confirmation or claiming that selection pauses dispatch. Update the static asset version assertion for the changed dashboard assets.
+Add `test_dashboard_worker_switch_does_not_prompt_for_handoff` and `test_dashboard_shows_shared_claim_counts`. Assert the rendered panel explains that all online computers can claim after start, renders the server-provided disambiguated `display_label` and worker-load count, exposes a worker-load element, and the selection handler sends the new worker without showing a handoff confirmation or claiming that selection pauses dispatch. Update the static asset version assertion for the changed dashboard assets.
 
 - [ ] **Step 2: Run the focused dashboard tests and confirm they fail**
 
@@ -142,7 +145,7 @@ Expected: the new tests fail against the exclusive-handoff text and selector han
 
 - [ ] **Step 3: Update the dashboard selection and worker-load display**
 
-In `dashboard.html`, replace exclusive-owner and drain messaging with start-authorization and shared-queue guidance, and add an element for worker loads. In `dashboard.js`, render each computer's online state and `active_claim_count`, remove the active-run confirmation, and keep selection changes separate from the start endpoint. Preserve the disabled start state when the selected computer is offline. Add only the CSS needed to keep the worker-load list readable at desktop and mobile widths. In `base.html`, update the dashboard asset query version so browsers fetch the new JavaScript and CSS.
+In `dashboard.html`, replace exclusive-owner and drain messaging with start-authorization and shared-queue guidance, and add an element for worker loads. Use `display_label` in both the server-rendered selector and dynamic worker list. In `dashboard.js`, render each computer's online state and `active_claim_count`, remove the active-run confirmation, and keep selection changes separate from the start endpoint. Preserve the disabled start state when the selected computer is offline. Add only the CSS needed to keep the worker-load list readable at desktop and mobile widths. In `base.html`, update the dashboard asset query version so browsers fetch the new JavaScript and CSS.
 
 - [ ] **Step 4: Run dashboard and related browser-collection tests**
 
