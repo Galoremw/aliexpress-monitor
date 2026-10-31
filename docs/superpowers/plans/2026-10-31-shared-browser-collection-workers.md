@@ -205,9 +205,11 @@ Worker display-name correction (2026-10-31): the user identified worker 17413d70
 
 Pre-deployment recheck for the display-name correction (2026-10-31): the NAS reports worker 17413d70-7a33-4cde-96f1-3fb415ef0f8b as 第二台电脑 and 8f419bb6-0043-4ce4-a3f6-c2b7c5ab9717 as Galore主机, both on extension 0.6.125 with fresh heartbeats. The latest database run is ID 9, PAUSED / PRODUCT_COLLECTION, 27 PENDING items, dispatch disabled, and no RUNNING or NEEDS_VERIFICATION items. NAS Alembic head is 20261028_0017; backend health is OK. The follow-up correction requires migration 20261031_0018 and setting only those two known worker display overrides. Do not alter the queue.
 
-- [ ] **Follow-up: deploy persistent worker display names**
+- [x] **Follow-up: deploy persistent worker display names**
 
 Build and recreate only the backend. Its startup applies additive migration `20261031_0018`; set worker 17413d70-7a33-4cde-96f1-3fb415ef0f8b to `Qx的computer` and worker 8f419bb6-0043-4ce4-a3f6-c2b7c5ab9717 to `Galore主机`. Verify both names after heartbeats and confirm run 9 remains paused with 27 pending items and dispatch disabled.
+
+Deployment verification (2026-10-31): the NAS registry mirror returned 401 while resolving `python:3.12-slim`, so the backend was built as a targeted overlay from the existing healthy image. Rollback tag `aliexpress-monitor-backend:rollback-worker-display-name-20261031` retains the prior image (`sha256:fc71b916...`). New backend image `sha256:beb99bb4595ffae9d04bc0d93b2de14e6c1a48c58a710bfbcad14f51b55c1363` is healthy, `/health` returns OK, and Alembic is at `20261031_0018`. Database overrides are set for the two identified worker IDs; after another heartbeat, the dashboard showed Galore主机 and Qx的computer online with 0 claims each. Run 9 remains PAUSED / PRODUCT_COLLECTION with 27 PENDING items, dispatch disabled, and no active claims. The queue was not started.
 
 ## Implementation Method
 
