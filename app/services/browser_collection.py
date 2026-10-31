@@ -29,7 +29,6 @@ from app.services.store_identity import normalize_store_orders_identity
 
 
 ITEM_TERMINAL_STATUSES = {"SUCCEEDED", "PARTIAL", "FAILED", "SKIPPED"}
-RUN_ACTIVE_STATUSES = {"PENDING", "RUNNING", "NEEDS_VERIFICATION"}
 LEASE_DURATION = timedelta(minutes=5)
 MAX_ITEM_RUNTIME = timedelta(minutes=5)
 MAX_STORE_ITEM_RUNTIME = timedelta(minutes=20)
@@ -285,21 +284,9 @@ def select_browser_collection_worker(
     worker = db.get(BrowserCollectionWorker, worker_id)
     if worker is None:
         raise ValueError("该采集电脑尚未连接监控台")
-    run = db.scalar(
-        select(BrowserCollectionRun)
-        .where(BrowserCollectionRun.target_date == _target_date())
-        .with_for_update()
-    )
-    changed = control.selected_worker_id != worker_id
-    if changed and control.selected_worker_id and run is not None:
-        active = run.status in RUN_ACTIVE_STATUSES or run.dispatch_enabled
-        if active and not confirm_handoff:
-            raise ValueError("切换采集电脑会暂停新任务领取，请确认交接")
-    if changed:
+    if control.selected_worker_id != worker_id:
         control.selected_worker_id = worker.worker_id
         control.selected_worker_label = worker.label
-        if run is not None:
-            run.dispatch_enabled = False
     db.commit()
     return browser_collection_control_status(db)
 
@@ -682,11 +669,11 @@ def start_browser_collection_run(
 
     for item in run.items:
         if item.status == "NEEDS_VERIFICATION":
-            same_worker_claim = (
-                item.claimed_worker_id == control.selected_worker_id
-                and bool(item.claim_token)
+            original_worker = db.get(BrowserCollectionWorker, item.claimed_worker_id)
+            original_worker_online = (
+                bool(item.claim_token) and _worker_is_online(original_worker, now)
             )
-            if same_worker_claim:
+            if original_worker_online:
                 item.status = "RUNNING"
                 item.claimed_at = now
                 item.lease_expires_at = now + LEASE_DURATION
@@ -699,15 +686,6 @@ def start_browser_collection_run(
                 item.completed_at = None
             item.error_type = None
             item.error_message = None
-
-    draining = [
-        item for item in run.items
-        if item.status == "RUNNING" and item.claimed_worker_id != control.selected_worker_id
-    ]
-    if draining:
-        run.dispatch_enabled = False
-        db.commit()
-        raise ValueError("仍有旧采集电脑的任务在运行，请等待其结束或租约过期")
 
     if not any(item.status in {"PENDING", "RUNNING"} for item in run.items):
         _advance_run(db, run)
@@ -738,12 +716,11 @@ def claim_next_item(
         select(BrowserCollectionRun).where(BrowserCollectionRun.id == run.id).with_for_update()
     )
     now = utcnow()
-    if not worker_id or control.selected_worker_id != worker_id:
+    if not worker_id:
         db.commit()
         return run, None
-    selected_worker = db.get(BrowserCollectionWorker, control.selected_worker_id)
-    if not _worker_is_online(selected_worker, now):
-        run.dispatch_enabled = False
+    worker = db.get(BrowserCollectionWorker, worker_id)
+    if not _worker_is_online(worker, now):
         db.commit()
         return run, None
     if not run.dispatch_enabled:
@@ -751,18 +728,6 @@ def claim_next_item(
         return run, None
 
     _release_unresponsive_items(run, now)
-    if any(
-        item.status == "RUNNING" and item.claimed_worker_id != worker_id
-        for item in run.items
-    ):
-        db.commit()
-        return run, None
-    if run.phase == "STORE_DISCOVERY" and any(
-        item.target_type == "STORE" and item.status == "RUNNING"
-        for item in run.items
-    ):
-        db.commit()
-        return run, None
     if run.status == "PAUSED" and run.paused_reason in {"manual_pause", MANUAL_CANCEL_REASON}:
         db.commit()
         return run, None

@@ -2,7 +2,7 @@
 
 **Status:** Approved for implementation
 **Date:** 2026-10-31
-**Supersedes if approved:** `2026-10-10-exclusive-browser-collector-ownership.md`
+**Supersedes:** `2026-10-10-exclusive-browser-collector-ownership.md`
 
 ## Context
 

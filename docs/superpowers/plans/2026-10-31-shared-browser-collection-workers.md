@@ -44,35 +44,43 @@
 - `claim_next_item(db: Session, worker_id: str | None) -> tuple[BrowserCollectionRun | None, BrowserCollectionItem | None]` admits a registered online requester whenever dispatch is enabled, regardless of `selected_worker_id` or other workers' running tasks.
 - `select_browser_collection_worker(db: Session, worker_id: str, *, confirm_handoff: bool = False) -> dict` changes the computer required for a future manual start without closing the dispatch gate; retain the optional argument for older dashboard clients and ignore it.
 - `start_browser_collection_run(db: Session, run: BrowserCollectionRun | None = None) -> BrowserCollectionRun` still requires the selected computer to be online, but does not wait for claims from other workers to drain.
-- [ ] **Step 1: Add failing multi-worker claim tests**
+- [x] **Step 1: Add failing multi-worker claim tests**
 
 Add `test_both_online_workers_claim_distinct_store_items`, `test_one_worker_can_claim_multiple_store_items`, `test_single_online_worker_can_drain_entire_shared_queue`, `test_selected_worker_offline_after_start_does_not_block_other_online_claims`, `test_stale_or_missing_worker_cannot_claim_shared_queue`, and `test_expired_claim_can_be_reclaimed_by_another_online_worker`. With dispatch started by a selected online computer, assert that both registered online workers can claim separate store items, a single worker can claim another store while its earlier task remains `RUNNING`, one worker can finish and claim all queued stores in turn, an already-started run continues when the selected worker goes offline, stale or absent worker identity gets no item, and an expired item's old token cannot write after a second worker reclaims it.
 
-- [ ] **Step 2: Add failing run-control and phase tests**
+- [x] **Step 2: Add failing run-control and phase tests**
 
 Add `test_selecting_start_worker_does_not_pause_shared_dispatch`, `test_start_does_not_wait_for_other_worker_claims`, `test_parallel_store_items_keep_store_phase_until_all_terminal`, and `test_verification_resume_keeps_online_owner_or_requeues_offline_owner`. Assert selection leaves `dispatch_enabled` true, start/resume succeeds with another worker's valid running claim, the run stays in `STORE_DISCOVERY` until all store items are terminal, and verification resumes with the original online worker or returns to `PENDING` if it is offline.
 
-- [ ] **Step 3: Run the focused backend tests and confirm the new tests fail for the old behavior**
+- [x] **Step 3: Run the focused backend tests and confirm the new tests fail for the old behavior**
 
 Run: `pytest tests/test_browser_collection.py -q`
 
 Expected: the new shared-claim and selection tests fail because claims are restricted to the selected worker, concurrent store tasks are blocked, and selector changes begin a handoff.
 
-- [ ] **Step 4: Implement shared worker eligibility, start, and selection behavior**
+- [x] **Step 4: Rewrite existing ownership tests to the shared-queue contract**
 
-In `claim_next_item`, require a registered worker with a heartbeat no older than two minutes, enabled dispatch, and the existing row locks. Remove the selected-worker comparison, foreign-running-item guard, and one-running-store guard. Keep the run lock around claim assignment and keep unique worker IDs and random claim tokens on every item. In `start_browser_collection_run`, retain the selected-online prerequisite but remove the foreign-claim drain rejection. In `select_browser_collection_worker`, update the selected worker and label without setting `dispatch_enabled = False`; keep the legacy `confirm_handoff` parameter accepted.
-
-- [ ] **Step 5: Implement queue-wide verification resume ownership**
-
-In `start_browser_collection_run`, retain the challenge claim for its original worker if that worker is online; if the original worker is offline, clear its claim and return the item to `PENDING` for shared dispatch. Preserve the queue-wide verification gate.
-
-- [ ] **Step 6: Run backend tests and check the acceptance cases**
+Before changing production code, rewrite the existing exclusive-ownership cases as `test_any_online_worker_can_claim_shared_queue`, `test_selected_worker_offline_does_not_block_shared_claims`, `test_selecting_start_worker_keeps_dispatch_open_with_old_claims`, `test_selection_preserves_active_claim_and_rejects_stale_result`, `test_concurrent_store_claim_is_allowed_while_current_store_runs`, and `test_store_discovery_claim_allows_multiple_running_stores_per_run`. Keep stale-token rejection assertions while changing ownership and parallel-claim assertions to the approved shared-queue contract.
 
 Run: `pytest tests/test_browser_collection.py -q`
 
-Expected: all tests pass. Rewrite `test_only_selected_online_worker_can_claim`, `test_selected_worker_offline_does_not_fail_over`, `test_handoff_disables_dispatch_until_old_claims_drain`, `test_handoff_drains_old_claim_and_rejects_stale_result`, `test_concurrent_store_claim_is_deferred_until_current_store_finishes`, and `test_store_discovery_claim_allows_only_one_running_store_per_run` to assert shared-queue behavior while retaining stale-token rejection and queue-wide pause behavior; distinct workers can hold distinct `RUNNING` store items at once.
+Expected: the suite remains red only on the not-yet-implemented shared claim, selector, start, or verification-resume behavior; test setup and assertions themselves run without errors.
 
-- [ ] **Step 7: Commit the backend change**
+- [x] **Step 5: Implement shared worker eligibility, start, and selection behavior**
+
+In `claim_next_item`, require a registered worker with a heartbeat no older than two minutes, enabled dispatch, and the existing row locks. Remove the selected-worker comparison, foreign-running-item guard, and one-running-store guard. Keep the run lock around claim assignment and keep unique worker IDs and random claim tokens on every item. In `start_browser_collection_run`, retain the selected-online prerequisite but remove the foreign-claim drain rejection. In `select_browser_collection_worker`, update the selected worker and label without setting `dispatch_enabled = False`; keep the legacy `confirm_handoff` parameter accepted.
+
+- [x] **Step 6: Implement queue-wide verification resume ownership**
+
+In `start_browser_collection_run`, retain the challenge claim for its original worker if that worker is online; if the original worker is offline, clear its claim and return the item to `PENDING` for shared dispatch. Preserve the queue-wide verification gate.
+
+- [x] **Step 7: Run backend tests and check the acceptance cases**
+
+Run: `pytest tests/test_browser_collection.py -q`
+
+Expected: all tests pass, including the rewritten ownership and handoff tests; stale-token rejection and queue-wide pause behavior remain intact, and distinct workers can hold distinct `RUNNING` store items at once.
+
+- [x] **Step 8: Commit the backend change**
 
 ```bash
 git add app/services/browser_collection.py tests/test_browser_collection.py
@@ -191,4 +199,4 @@ Do not cancel, reset, or force-complete work. Leave normal dispatch behavior as 
 
 ## Implementation Method
 
-Use native execution in this session. The backend, API response, and dashboard changes share interfaces and should be reviewed together; multi-agent execution is unavailable in the current collaboration mode. Request user review of this plan before beginning Task 1.
+Use native execution in this session. The backend, API response, and dashboard changes share interfaces and should be reviewed together; multi-agent execution is unavailable in the current collaboration mode. The user approved the plan before implementation.
