@@ -1,6 +1,6 @@
 # Shared Browser Collection Workers
 
-**Status:** Draft for user review
+**Status:** Approved for implementation
 **Date:** 2026-10-31
 **Supersedes if approved:** `2026-10-10-exclusive-browser-collector-ownership.md`
 
@@ -69,4 +69,4 @@ No new queue, worker partition, database migration, or extension protocol is exp
 
 ## Rollout Notes
 
-Implementation should preserve the current NAS queue state. Before deployment, inspect the running daily run and outstanding claims. After the backend update, reload the supported collector extension on both computers and confirm fresh heartbeats. Live acceptance should use a small controlled queue and verify both worker IDs and distinct item IDs in the dashboard/API before allowing the normal queue to continue.
+Implementation should preserve the current NAS queue state. Before deployment, inspect the running daily run and outstanding claims. After the backend update, confirm both computers report fresh heartbeats; reload an extension only if it fails to advertise its worker ID or heartbeat. Live acceptance should use the held daily queue, inspect the first concurrent claims, and verify both worker IDs and distinct item IDs in the dashboard/API before allowing normal collection to continue.

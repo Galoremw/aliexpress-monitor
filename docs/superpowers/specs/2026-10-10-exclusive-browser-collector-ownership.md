@@ -1,6 +1,6 @@
 # Exclusive Browser Collector Ownership
 
-**Status:** Approved for implementation  
+**Status:** Superseded by the approved shared-worker design in `2026-10-31-shared-browser-collection-workers.md`; retained as the historical exclusive-ownership decision.
 **Date:** 2026-10-10
 
 ## Context
