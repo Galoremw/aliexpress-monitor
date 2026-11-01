@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
+    Column,
     Date,
     DateTime,
     ForeignKey,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Table,
     Text,
     UniqueConstraint,
     text,
@@ -407,6 +409,22 @@ class BrowserCollectionWorker(Base):
     last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+browser_collection_run_helpers = Table(
+    "browser_collection_run_helpers",
+    Base.metadata,
+    Column(
+        "run_id",
+        ForeignKey("browser_collection_runs.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "worker_id",
+        ForeignKey("browser_collection_workers.worker_id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
 class StorePoolResetBatch(Base):
     __tablename__ = "store_pool_reset_batches"
     __table_args__ = (
@@ -522,9 +540,16 @@ class BrowserCollectionRun(Base):
     dispatch_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=text("false"), nullable=False
     )
+    primary_worker_id: Mapped[str | None] = mapped_column(
+        ForeignKey("browser_collection_workers.worker_id")
+    )
 
     items: Mapped[list[BrowserCollectionItem]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
+    )
+    helper_workers: Mapped[list[BrowserCollectionWorker]] = relationship(
+        secondary=browser_collection_run_helpers,
+        order_by=BrowserCollectionWorker.worker_id,
     )
 
 

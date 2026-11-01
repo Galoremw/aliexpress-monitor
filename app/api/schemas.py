@@ -272,6 +272,14 @@ class BrowserCollectionRunEnsureRequest(BaseModel):
     trigger: str = Field(default="MANUAL", pattern="^(SCHEDULED|MANUAL|CATCH_UP)$")
 
 
+class BrowserCollectionRunStartRequest(BaseModel):
+    helper_worker_ids: list[str] | None = Field(default=None, max_length=32)
+
+
+class BrowserCollectionRunResumeRequest(BaseModel):
+    helper_worker_ids: list[str] | None = Field(default=None, max_length=32)
+
+
 class BrowserCollectionFailureRequest(BaseModel):
     worker_id: str | None = Field(default=None, min_length=1, max_length=128, exclude=True)
     claim_token: str | None = Field(default=None, min_length=1, max_length=128, exclude=True)
@@ -466,6 +474,8 @@ class BrowserCollectionRunRead(BaseModel):
     id: int
     target_date: date
     latest_data_date: date
+    primary_worker_id: str | None = None
+    helper_worker_ids: list[str] = Field(default_factory=list)
     trigger: str
     status: str
     phase: str

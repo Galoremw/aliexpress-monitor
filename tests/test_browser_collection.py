@@ -15,7 +15,10 @@ from app.db.models import (
     StoreSnapshot,
     StoreUrlIdentity,
 )
-from app.services.browser_collection import _products_with_recent_history_for_date
+from app.services.browser_collection import (
+    _products_with_recent_history_for_date,
+    serialize_run,
+)
 from app.services.metrics import calculate_product_daily_metrics
 from app.services.store_page_discovery import (
     advance_store_page_cursor,
@@ -108,6 +111,48 @@ def test_scheduled_run_is_created_held(client):
     assert response.json()["pending_count"] == 1
 
 
+def test_run_roles_are_serialized_from_saved_ids_not_global_selection(db_session):
+    primary = BrowserCollectionWorker(
+        worker_id="run-primary",
+        label="Primary",
+        last_heartbeat_at=datetime.now(timezone.utc),
+    )
+    helpers = [
+        BrowserCollectionWorker(
+            worker_id=worker_id,
+            label=worker_id,
+            last_heartbeat_at=datetime.now(timezone.utc),
+        )
+        for worker_id in ("run-helper-b", "run-helper-a")
+    ]
+    next_primary = BrowserCollectionWorker(
+        worker_id="next-run-primary",
+        label="Next primary",
+        last_heartbeat_at=datetime.now(timezone.utc),
+    )
+    run = BrowserCollectionRun(
+        target_date=date.today(),
+    )
+    assert hasattr(run, "primary_worker_id")
+    assert hasattr(run, "helper_workers")
+    run.primary_worker_id = primary.worker_id
+    run.helper_workers = helpers
+    control = BrowserCollectionControl(
+        id=1,
+        selected_worker_id=next_primary.worker_id,
+        selected_worker_label=next_primary.label,
+    )
+    db_session.add_all([primary, *helpers, next_primary, run, control])
+    db_session.commit()
+    db_session.expire_all()
+
+    saved_run = db_session.get(BrowserCollectionRun, run.id)
+    payload = serialize_run(saved_run)
+
+    assert payload["primary_worker_id"] == "run-primary"
+    assert payload["helper_worker_ids"] == ["run-helper-a", "run-helper-b"]
+
+
 def test_held_run_rejects_legacy_and_unselected_claims(client):
     store = create_store(client, "990202")
     create_product(client, store["id"], "1005009920201")
@@ -144,28 +189,281 @@ def test_start_requires_selected_online_worker(client, monkeypatch):
     assert offline.status_code == 409
 
 
-def test_any_online_worker_can_claim_shared_queue(client):
+@pytest.mark.parametrize(
+    "helper_worker_ids",
+    [
+        ["unknown-worker"],
+        ["worker-primary", "worker-helper"],
+        ["worker-helper", "worker-helper"],
+    ],
+)
+def test_start_rejects_invalid_helper_worker_ids(client, helper_worker_ids):
+    store = create_store(client, "990299")
+    create_product(client, store["id"], "1005009929901")
+    register_browser_worker(client, "worker-primary", "主机")
+    register_browser_worker(client, "worker-helper", "辅助机")
+    assert select_browser_worker(client, "worker-primary").status_code == 200
+
+    response = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": helper_worker_ids},
+    )
+    today = client.get("/api/browser-collection/runs/today").json()
+
+    assert response.status_code == 409
+    assert today["dispatch_enabled"] is False
+    assert today["primary_worker_id"] is None
+
+
+def test_multiple_helpers_claim_distinct_items_and_unselected_worker_cannot_claim(
+    client, db_session
+):
+    stores = [create_store(client, store_id) for store_id in ("990298", "990297", "990296", "990295")]
+    for index, store in enumerate(stores, start=1):
+        create_product(client, store["id"], f"10050099298{index}")
+    workers = {
+        worker_id: register_browser_worker(client, worker_id, label)
+        for worker_id, label in (
+            ("worker-primary", "主机"),
+            ("worker-helper-a", "辅助机 A"),
+            ("worker-helper-b", "辅助机 B"),
+            ("worker-helper-offline", "离线辅助机"),
+            ("worker-unselected", "未启用电脑"),
+        )
+    }
+    assert all(response.status_code == 200 for response in workers.values())
+    assert select_browser_worker(client, "worker-primary").status_code == 200
+
+    offline_helper = db_session.get(BrowserCollectionWorker, "worker-helper-offline")
+    offline_helper.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    db_session.commit()
+
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={
+            "helper_worker_ids": [
+                "worker-helper-a",
+                "worker-helper-b",
+                "worker-helper-offline",
+            ]
+        },
+    )
+    assert started.status_code == 200, started.text
+    assert started.json()["primary_worker_id"] == "worker-primary"
+    assert started.json()["helper_worker_ids"] == [
+        "worker-helper-a",
+        "worker-helper-b",
+        "worker-helper-offline",
+    ]
+
+    claims = {
+        worker_id: client.post(
+            "/api/browser-collection/items/claim", json={"worker_id": worker_id}
+        ).json()
+        for worker_id in ("worker-primary", "worker-helper-a", "worker-helper-b")
+    }
+    offline = client.post(
+        "/api/browser-collection/items/claim",
+        json={"worker_id": "worker-helper-offline"},
+    ).json()
+    unselected = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-unselected"}
+    ).json()
+
+    assert all(claim["item"] is not None for claim in claims.values())
+    assert len({claim["item"]["id"] for claim in claims.values()}) == 3
+    assert all(claim["claim_token"] for claim in claims.values())
+    assert offline["item"] is None
+    assert offline["claim_token"] is None
+    assert unselected["item"] is None
+    assert unselected["claim_token"] is None
+
+
+def test_locked_run_roles_do_not_follow_global_primary_selection(client):
+    store = create_store(client, "990294")
+    create_product(client, store["id"], "1005009929401")
+    register_browser_worker(client, "worker-primary", "主机")
+    register_browser_worker(client, "worker-helper", "辅助机")
+    register_browser_worker(client, "worker-next", "下一轮主机")
+    assert select_browser_worker(client, "worker-primary").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-helper"]},
+    )
+    assert started.status_code == 200, started.text
+
+    assert select_browser_worker(client, "worker-next").status_code == 200
+    changed = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-next"]},
+    )
+    unselected = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-next"}
+    ).json()
+    current = client.get("/api/browser-collection/runs/today").json()
+
+    assert changed.status_code == 409
+    assert current["primary_worker_id"] == "worker-primary"
+    assert current["helper_worker_ids"] == ["worker-helper"]
+    assert unselected["item"] is None
+    assert unselected["claim_token"] is None
+
+
+def test_legacy_resume_assigns_roles_without_changing_existing_claim(client, db_session):
+    now = datetime.now(timezone.utc)
+    primary = BrowserCollectionWorker(
+        worker_id="legacy-primary", label="QX", last_heartbeat_at=now
+    )
+    helper = BrowserCollectionWorker(
+        worker_id="legacy-helper", label="Helper", last_heartbeat_at=now
+    )
+    original_owner = BrowserCollectionWorker(
+        worker_id="legacy-owner", label="Old owner", last_heartbeat_at=now
+    )
+    run = BrowserCollectionRun(
+        target_date=date.today(), status="PAUSED", phase="STORE_DISCOVERY",
+        total_count=1, started_at=now,
+    )
+    item = BrowserCollectionItem(
+        run=run,
+        target_type="STORE",
+        target_key="store:legacy",
+        target_url="https://www.aliexpress.com/store/legacy/pages/all-items.html",
+        position=1,
+        status="RUNNING",
+        claimed_at=now,
+        lease_expires_at=now + timedelta(minutes=5),
+        claimed_worker_id=original_owner.worker_id,
+        claim_token="legacy-valid-token",
+    )
+    control = BrowserCollectionControl(
+        id=1, selected_worker_id=primary.worker_id, selected_worker_label=primary.label
+    )
+    db_session.add_all([primary, helper, original_owner, run, item, control])
+    db_session.commit()
+
+    resumed = client.post(
+        f"/api/browser-collection/runs/{run.id}/resume",
+        json={"helper_worker_ids": [helper.worker_id]},
+    )
+
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["primary_worker_id"] == primary.worker_id
+    assert resumed.json()["helper_worker_ids"] == [helper.worker_id]
+    db_session.refresh(item)
+    assert item.claimed_worker_id == original_owner.worker_id
+    assert item.claim_token == "legacy-valid-token"
+
+    accepted = client.post(
+        f"/api/browser-collection/items/{item.id}/failure",
+        json={
+            "worker_id": original_owner.worker_id,
+            "claim_token": "legacy-valid-token",
+            "error_type": "test-result",
+            "error_message": "existing owner may finish",
+        },
+    )
+    assert accepted.status_code == 200, accepted.text
+
+
+def test_resume_requires_an_authorized_worker_online(client, db_session):
+    now = datetime.now(timezone.utc)
+    primary = BrowserCollectionWorker(
+        worker_id="offline-primary", label="Primary", last_heartbeat_at=now - timedelta(minutes=3)
+    )
+    helper = BrowserCollectionWorker(
+        worker_id="offline-helper", label="Helper", last_heartbeat_at=now - timedelta(minutes=3)
+    )
+    unselected = BrowserCollectionWorker(
+        worker_id="online-unselected", label="Unselected", last_heartbeat_at=now
+    )
+    run = BrowserCollectionRun(
+        target_date=date.today(), status="PAUSED", phase="STORE_DISCOVERY", total_count=1,
+        primary_worker_id=primary.worker_id, helper_workers=[helper],
+    )
+    item = BrowserCollectionItem(
+        run=run, target_type="STORE", target_key="store:pending",
+        target_url="https://www.aliexpress.com/store/pending/pages/all-items.html",
+        position=1, status="PENDING",
+    )
+    control = BrowserCollectionControl(
+        id=1, selected_worker_id=unselected.worker_id, selected_worker_label=unselected.label
+    )
+    db_session.add_all([primary, helper, unselected, run, item, control])
+    db_session.commit()
+
+    resumed = client.post(f"/api/browser-collection/runs/{run.id}/resume")
+
+    assert resumed.status_code == 409
+    db_session.refresh(run)
+    assert run.dispatch_enabled is False
+
+
+def test_expired_claim_can_only_be_reclaimed_by_run_member(client, db_session):
+    store = create_store(client, "990293")
+    create_product(client, store["id"], "1005009929301")
+    for worker_id in ("worker-primary", "worker-helper", "worker-unselected"):
+        register_browser_worker(client, worker_id, worker_id)
+    assert select_browser_worker(client, "worker-primary").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-helper"]},
+    )
+    assert started.status_code == 200, started.text
+    first = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-primary"}
+    ).json()
+    item = db_session.get(BrowserCollectionItem, first["item"]["id"])
+    item.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db_session.commit()
+
+    unselected = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-unselected"}
+    ).json()
+    helper = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-helper"}
+    ).json()
+
+    assert unselected["item"] is None
+    assert unselected["claim_token"] is None
+    assert helper["item"]["id"] == item.id
+    assert helper["claim_token"] != first["claim_token"]
+
+
+def test_only_primary_and_explicit_helper_can_claim_shared_queue(client):
     first_store = create_store(client, "990203")
     create_product(client, first_store["id"], "1005009920301")
     second_store = create_store(client, "990202")
     create_product(client, second_store["id"], "1005009920201")
+    third_store = create_store(client, "990204")
+    create_product(client, third_store["id"], "1005009920401")
     register_browser_worker(client, "worker-galore", "Galore主机")
     register_browser_worker(client, "worker-second", "第二台电脑")
+    register_browser_worker(client, "worker-unselected", "未启用电脑")
     assert select_browser_worker(client, "worker-galore").status_code == 200
-    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    )
+    assert started.status_code == 200, started.text
 
-    first = client.post(
+    helper = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
     )
-    second = client.post(
+    primary = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-galore"}
     )
+    unselected = client.post(
+        "/api/browser-collection/items/claim", json={"worker_id": "worker-unselected"}
+    )
 
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert first.json()["item"]["target_type"] == "STORE"
-    assert second.json()["item"]["target_type"] == "STORE"
-    assert first.json()["item"]["store_id"] != second.json()["item"]["store_id"]
+    assert helper.status_code == 200
+    assert primary.status_code == 200
+    assert helper.json()["item"]["target_type"] == "STORE"
+    assert primary.json()["item"]["target_type"] == "STORE"
+    assert helper.json()["item"]["store_id"] != primary.json()["item"]["store_id"]
+    assert unselected.json()["item"] is None
+    assert unselected.json()["claim_token"] is None
 
 
 def test_both_online_workers_claim_distinct_store_items(client):
@@ -176,7 +474,11 @@ def test_both_online_workers_claim_distinct_store_items(client):
     register_browser_worker(client, "worker-first", "采集电脑")
     register_browser_worker(client, "worker-second", "采集电脑")
     assert select_browser_worker(client, "worker-first").status_code == 200
-    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    )
+    assert started.status_code == 200, started.text
 
     legacy = client.post("/api/browser-collection/items/claim", json={}).json()
     unknown = client.post(
@@ -258,7 +560,11 @@ def test_selected_worker_offline_after_start_does_not_block_other_online_claims(
     register_browser_worker(client, "worker-first", "第一台电脑")
     register_browser_worker(client, "worker-second", "第二台电脑")
     assert select_browser_worker(client, "worker-first").status_code == 200
-    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    )
+    assert started.status_code == 200, started.text
     worker = db_session.get(BrowserCollectionWorker, "worker-first")
     worker.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=3)
     db_session.commit()
@@ -301,7 +607,11 @@ def test_expired_claim_can_be_reclaimed_by_another_online_worker(client, db_sess
     register_browser_worker(client, "worker-first", "第一台电脑")
     register_browser_worker(client, "worker-second", "第二台电脑")
     assert select_browser_worker(client, "worker-first").status_code == 200
-    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    )
+    assert started.status_code == 200, started.text
     first = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
     ).json()
@@ -330,7 +640,7 @@ def test_expired_claim_can_be_reclaimed_by_another_online_worker(client, db_sess
     assert item.claimed_worker_id == "worker-second"
 
 
-def test_selecting_start_worker_does_not_pause_shared_dispatch(client):
+def test_selecting_start_worker_does_not_expand_locked_run_membership(client):
     stores = [create_store(client, store_id) for store_id in ("990363", "990364")]
     for index, store in enumerate(stores, start=1):
         create_product(client, store["id"], f"10050099363{index}")
@@ -343,14 +653,14 @@ def test_selecting_start_worker_does_not_pause_shared_dispatch(client):
     ).json()
 
     switched = select_browser_worker(client, "worker-second")
-    second = client.post(
+    unselected = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
     ).json()
 
     assert switched.status_code == 200
     assert switched.json()["dispatch_enabled"] is True
-    assert second["item"] is not None
-    assert second["item"]["id"] != first["item"]["id"]
+    assert unselected["item"] is None
+    assert unselected["claim_token"] is None
 
 
 def test_start_does_not_wait_for_other_worker_claims(client):
@@ -384,7 +694,11 @@ def test_parallel_store_items_keep_store_phase_until_all_terminal(client, db_ses
     register_browser_worker(client, "worker-first", "第一台电脑")
     register_browser_worker(client, "worker-second", "第二台电脑")
     assert select_browser_worker(client, "worker-first").status_code == 200
-    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    )
+    assert started.status_code == 200, started.text
     first = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
     ).json()
@@ -416,7 +730,10 @@ def test_verification_resume_keeps_online_owner_or_requeues_offline_owner(
     register_browser_worker(client, "worker-first", "第一台电脑")
     register_browser_worker(client, "worker-second", "第二台电脑")
     assert select_browser_worker(client, "worker-first").status_code == 200
-    run = client.post("/api/browser-collection/runs/start-today").json()
+    run = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    ).json()
     claim = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
     ).json()
@@ -460,7 +777,11 @@ def test_control_reports_active_claims_per_worker(client, db_session):
     for worker_id in ("worker-first", "worker-second", "worker-idle"):
         register_browser_worker(client, worker_id, "采集电脑")
     assert select_browser_worker(client, "worker-first").status_code == 200
-    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    )
+    assert started.status_code == 200, started.text
     first = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-first"}
     ).json()
@@ -490,6 +811,36 @@ def test_control_reports_active_claims_per_worker(client, db_session):
     control = client.get("/api/browser-collection/control").json()
     workers = {worker["worker_id"]: worker for worker in control["workers"]}
     assert workers["worker-second"]["active_claim_count"] == 0
+
+
+def test_control_can_resume_locked_run_when_only_helper_is_online(client, db_session):
+    now = datetime.now(timezone.utc)
+    primary = BrowserCollectionWorker(
+        worker_id="control-primary", label="Primary",
+        last_heartbeat_at=now - timedelta(minutes=3),
+    )
+    helper = BrowserCollectionWorker(
+        worker_id="control-helper", label="Helper", last_heartbeat_at=now,
+    )
+    run = BrowserCollectionRun(
+        target_date=date.today(), status="PAUSED", phase="STORE_DISCOVERY", total_count=1,
+        primary_worker_id=primary.worker_id, helper_workers=[helper],
+    )
+    item = BrowserCollectionItem(
+        run=run, target_type="STORE", target_key="store:control",
+        target_url="https://www.aliexpress.com/store/control/pages/all-items.html",
+        position=1, status="PENDING",
+    )
+    control = BrowserCollectionControl(
+        id=1, selected_worker_id=primary.worker_id, selected_worker_label=primary.label
+    )
+    db_session.add_all([primary, helper, run, item, control])
+    db_session.commit()
+
+    response = client.get("/api/browser-collection/control")
+
+    assert response.status_code == 200
+    assert response.json()["can_start"] is True
 
 
 def test_control_can_start_while_another_worker_has_a_valid_claim(client):
@@ -583,7 +934,10 @@ def test_selected_worker_offline_does_not_block_shared_claims(client, db_session
     register_browser_worker(client, "worker-galore", "Galore主机")
     assert select_browser_worker(client, "worker-galore").status_code == 200
     register_browser_worker(client, "worker-second", "第二台电脑")
-    started = client.post("/api/browser-collection/runs/start-today")
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    )
     assert started.status_code == 200, started.text
     selected = db_session.get(BrowserCollectionWorker, "worker-galore")
     selected.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=3)
@@ -598,7 +952,7 @@ def test_selected_worker_offline_does_not_block_shared_claims(client, db_session
     assert control.json()["selected_worker"]["worker_id"] == "worker-galore"
 
 
-def test_selecting_start_worker_keeps_dispatch_open_with_old_claims(client, db_session):
+def test_selecting_next_primary_does_not_expand_locked_run_membership(client, db_session):
     stores = [create_store(client, store_id) for store_id in ("990204", "990205")]
     for index, store in enumerate(stores):
         create_product(client, store["id"], f"10050099204{index}")
@@ -612,15 +966,15 @@ def test_selecting_start_worker_keeps_dispatch_open_with_old_claims(client, db_s
 
     switched = select_browser_worker(client, "worker-second", confirm_handoff=True)
     started = client.post("/api/browser-collection/runs/start-today")
-    next_claim = client.post(
+    unselected = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-second"}
     )
     assert switched.status_code == 200
     assert switched.json()["dispatch_enabled"] is True
     assert started.status_code == 200
-    assert next_claim.status_code == 200
-    assert next_claim.json()["item"] is not None
-    assert next_claim.json()["item"]["id"] != first["id"]
+    assert unselected.status_code == 200
+    assert unselected.json()["item"] is None
+    assert unselected.json()["claim_token"] is None
 
 
 
@@ -685,7 +1039,11 @@ def test_selection_preserves_active_claim_and_rejects_stale_result(client, db_se
     register_browser_worker(client, "worker-galore", "Galore主机")
     register_browser_worker(client, "worker-second", "第二台电脑")
     assert select_browser_worker(client, "worker-galore").status_code == 200
-    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-second"]},
+    )
+    assert started.status_code == 200, started.text
     first_response = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-galore"}
     )

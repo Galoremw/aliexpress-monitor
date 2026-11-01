@@ -4,6 +4,8 @@ from zoneinfo import ZoneInfo
 
 from app.db.models import (
     BrowserCollectionControl,
+    BrowserCollectionItem,
+    BrowserCollectionRun,
     BrowserCollectionWorker,
     Product,
     ProductDailyMetric,
@@ -73,6 +75,90 @@ def test_dashboard_renders_worker_selector_and_separate_start_button(client):
     assert '"/api/browser-collection/runs/start-today"' in script
 
 
+def test_dashboard_renders_helper_selector_and_locked_active_roles(client, db_session):
+    store = client.post(
+        "/api/stores",
+        json={"name": "Role UI Store", "url": "https://www.aliexpress.com/store/991001"},
+    ).json()
+    client.post(
+        "/api/products",
+        json={"store_id": store["id"], "aliexpress_product_id": "1005009910011"},
+    )
+    for worker_id, label in (("ui-primary", "QX电脑"), ("ui-helper", "Galore主机")):
+        assert client.post(
+            "/api/browser-collection/heartbeat",
+            json={"worker_id": worker_id, "worker_label": label},
+        ).status_code == 200
+    helper = db_session.get(BrowserCollectionWorker, "ui-helper")
+    helper.last_heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+    db_session.commit()
+    assert client.post(
+        "/api/browser-collection/control/worker", json={"worker_id": "ui-primary"}
+    ).status_code == 200
+    started = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["ui-helper"]},
+    )
+    assert started.status_code == 200, started.text
+
+    dashboard = client.get("/").text
+    helper_options = dashboard.split('id="browser-helper-collectors-select"', 1)[1].split(
+        "</select>", 1
+    )[0]
+
+    assert 'id="browser-helper-collectors-select" multiple' in dashboard
+    assert "辅助采集电脑" in dashboard
+    assert "ui-primary" not in helper_options
+    assert "ui-helper" in helper_options
+    assert "· 离线" in helper_options
+    assert 'id="browser-run-locked-roles"' in dashboard
+    assert 'data-primary-worker-id="ui-primary"' in dashboard
+    assert "ui-primary" in dashboard.split('id="browser-run-locked-roles"', 1)[1].split("</div>", 1)[0]
+    assert "ui-helper" in dashboard.split('id="browser-run-locked-roles"', 1)[1].split("</div>", 1)[0]
+
+
+def test_dashboard_sends_helper_ids_for_first_start_and_legacy_resume(client):
+    script = client.get("/static/dashboard.js").text
+    start_handler = script.split('document.querySelector("#browser-run-start")?.addEventListener', 1)[1].split(
+        'document.querySelector("#browser-run-now")', 1
+    )[0]
+
+    assert 'document.querySelector("#browser-helper-collectors-select")' in start_handler
+    assert "helper_worker_ids" in start_handler
+    assert "browserCollectionRun?.primary_worker_id" in start_handler
+    assert 'jsonRequest(`/api/browser-collection/runs/${browserCollectionRun.id}/resume`' in start_handler
+    assert 'jsonRequest("/api/browser-collection/runs/start-today"' in start_handler
+
+
+def test_dashboard_enables_resume_when_authorized_helper_is_online(client, db_session):
+    now = datetime.now(timezone.utc)
+    primary = BrowserCollectionWorker(
+        worker_id="dashboard-offline-primary", label="Primary",
+        last_heartbeat_at=now - timedelta(minutes=3),
+    )
+    helper = BrowserCollectionWorker(
+        worker_id="dashboard-online-helper", label="Helper", last_heartbeat_at=now,
+    )
+    run = BrowserCollectionRun(
+        target_date=datetime.now().date(), status="PAUSED", phase="STORE_DISCOVERY",
+        total_count=1, primary_worker_id=primary.worker_id, helper_workers=[helper],
+    )
+    item = BrowserCollectionItem(
+        run=run, target_type="STORE", target_key="store:ui-resume",
+        target_url="https://www.aliexpress.com/store/ui-resume/pages/all-items.html",
+        position=1, status="PENDING",
+    )
+    control = BrowserCollectionControl(
+        id=1, selected_worker_id=primary.worker_id, selected_worker_label=primary.label
+    )
+    db_session.add_all([primary, helper, run, item, control])
+    db_session.commit()
+
+    dashboard = client.get("/").text
+
+    assert 'id="browser-run-start" class="button primary" type="button">继续采集</button>' in dashboard
+
+
 def test_dashboard_disables_start_for_offline_worker(client, db_session):
     client.post(
         "/api/browser-collection/heartbeat",
@@ -118,13 +204,13 @@ def test_dashboard_worker_switch_does_not_prompt_for_handoff(client):
         'document.querySelector("#browser-collector-select")?.addEventListener', 1
     )[1].split('document.querySelector("#browser-run-start")', 1)[0]
 
-    assert "启动后，所有在线电脑都可以领取今日队列任务" in dashboard
+    assert "只有这些电脑可以领取新任务" in dashboard
     assert "等待旧采集任务结束" not in dashboard
     assert "电脑切换需要等待旧任务结束" not in dashboard
     assert "window.confirm" not in selection_handler
     assert "confirm_handoff" not in selection_handler
-    assert 'dashboard.css?v=shared-workers-20261031' in dashboard
-    assert 'dashboard.js?v=shared-workers-20261031' in dashboard
+    assert 'dashboard.css?v=primary-helpers-20261101' in dashboard
+    assert 'dashboard.js?v=primary-helpers-20261101' in dashboard
 
 
 def test_dashboard_shows_shared_claim_counts(client):
@@ -149,7 +235,10 @@ def test_dashboard_shows_shared_claim_counts(client):
     assert client.post(
         "/api/browser-collection/control/worker", json={"worker_id": "worker-alpha-1234"}
     ).status_code == 200
-    assert client.post("/api/browser-collection/runs/start-today").status_code == 200
+    assert client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": ["worker-beta-5678"]},
+    ).status_code == 200
     first = client.post(
         "/api/browser-collection/items/claim", json={"worker_id": "worker-alpha-1234"}
     ).json()

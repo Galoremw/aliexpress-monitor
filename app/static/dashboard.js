@@ -941,6 +941,8 @@ function browserWorkerState(run) {
 
 function updateBrowserCollection(run) {
   browserCollectionRun = run;
+  if (browserCollectionControl) updateBrowserCollectionControl(browserCollectionControl);
+  else renderBrowserRunLockedRoles();
   const online = document.querySelector("#browser-online");
   const phase = document.querySelector("#browser-run-phase");
   const date = document.querySelector("#browser-run-date");
@@ -1024,12 +1026,17 @@ function updateBrowserCollection(run) {
 function updateBrowserCollectionControl(control) {
   browserCollectionControl = control;
   const selector = document.querySelector("#browser-collector-select");
+  const helperSelector = document.querySelector("#browser-helper-collectors-select");
   const selectedState = document.querySelector("#browser-selected-worker-state");
   const workerLoads = document.querySelector("#browser-worker-loads");
   const start = document.querySelector("#browser-run-start");
   if (!selector || !start || !control) return;
 
   const selected = control.selected_worker;
+  const pendingHelperIds = new Set(
+    Array.from(helperSelector?.selectedOptions || []).map((option) => option.value),
+  );
+  const rolesLocked = Boolean(browserCollectionRun?.primary_worker_id);
   selector.replaceChildren(new Option("请选择在线采集电脑", ""));
   for (const worker of control.workers || []) {
     const option = new Option(`${worker.display_label || worker.label} · ${worker.online ? "在线" : "离线"}`, worker.worker_id);
@@ -1038,11 +1045,26 @@ function updateBrowserCollectionControl(control) {
   selector.value = selected?.worker_id || "";
   selector.disabled = !(control.workers || []).length;
 
+  if (helperSelector) {
+    helperSelector.replaceChildren();
+    for (const worker of control.workers || []) {
+      if (worker.worker_id === selected?.worker_id) continue;
+      const option = new Option(
+        `${worker.display_label || worker.label} · ${worker.online ? "在线" : "离线"}`,
+        worker.worker_id,
+      );
+      option.selected = !rolesLocked && pendingHelperIds.has(worker.worker_id);
+      helperSelector.add(option);
+    }
+    helperSelector.disabled = rolesLocked || !(control.workers || []).length;
+  }
+
   if (selectedState) {
     selectedState.textContent = selected
-      ? `手动启动授权电脑：${selected.display_label || selected.label} · ${selected.online ? "在线" : "离线"}`
-      : "尚未选择手动启动电脑";
+      ? `${rolesLocked ? "下轮主采集电脑" : "手动启动主采集电脑"}：${selected.display_label || selected.label} · ${selected.online ? "在线" : "离线"}`
+      : "尚未选择主采集电脑";
   }
+  renderBrowserRunLockedRoles();
   if (workerLoads) {
     workerLoads.replaceChildren();
     const workers = control.workers || [];
@@ -1080,6 +1102,27 @@ function updateBrowserCollectionControl(control) {
   start.disabled = !control.can_start || control.dispatch_enabled;
 }
 
+function renderBrowserRunLockedRoles() {
+  const roles = document.querySelector("#browser-run-locked-roles");
+  if (!roles) return;
+  const primaryWorkerId = browserCollectionRun?.primary_worker_id || "";
+  const helperWorkerIds = browserCollectionRun?.helper_worker_ids || [];
+  roles.hidden = !primaryWorkerId;
+  roles.dataset.primaryWorkerId = primaryWorkerId;
+  const workers = browserCollectionControl?.workers || [];
+  const workerById = new Map(workers.map((worker) => [worker.worker_id, worker]));
+  const describe = (workerId) => {
+    const worker = workerById.get(workerId);
+    return worker ? `${worker.display_label || worker.label}（${workerId}）` : workerId;
+  };
+  const primaryLabel = document.querySelector("#browser-run-primary-label");
+  const helperLabels = document.querySelector("#browser-run-helper-labels");
+  if (primaryLabel) primaryLabel.textContent = primaryWorkerId ? describe(primaryWorkerId) : "";
+  if (helperLabels) helperLabels.textContent = primaryWorkerId
+    ? helperWorkerIds.map(describe).join("、") || "无"
+    : "尚未锁定";
+}
+
 async function refreshBrowserCollectionControl() {
   try {
     updateBrowserCollectionControl(await jsonRequest("/api/browser-collection/control"));
@@ -1115,7 +1158,7 @@ document.querySelector("#browser-collector-select")?.addEventListener("change", 
     });
     updateBrowserCollectionControl(control);
     await refreshBrowserCollection();
-    notify("已选择手动启动电脑；开始后所有在线电脑都可以领取队列任务。");
+    notify("已设置下轮主采集电脑；本轮已锁定的主辅角色不会改变。");
   } catch (error) {
     selector.value = currentWorkerId;
     notify(error.message, true);
@@ -1129,16 +1172,24 @@ document.querySelector("#browser-run-start")?.addEventListener("click", async (e
   const button = event.currentTarget;
   button.disabled = true;
   try {
+    const rolesLocked = Boolean(browserCollectionRun?.primary_worker_id);
+    const helperSelector = document.querySelector("#browser-helper-collectors-select");
+    const requestOptions = { method: "POST" };
+    if (!rolesLocked) {
+      requestOptions.body = JSON.stringify({
+        helper_worker_ids: Array.from(helperSelector?.selectedOptions || []).map((option) => option.value),
+      });
+    }
     const resuming = ["PAUSED", "NEEDS_VERIFICATION"].includes(browserCollectionRun?.status)
       && browserCollectionRun?.id;
     const run = resuming
-      ? await jsonRequest(`/api/browser-collection/runs/${browserCollectionRun.id}/resume`, { method: "POST" })
-      : await jsonRequest("/api/browser-collection/runs/start-today", { method: "POST" });
+      ? await jsonRequest(`/api/browser-collection/runs/${browserCollectionRun.id}/resume`, requestOptions)
+      : await jsonRequest("/api/browser-collection/runs/start-today", requestOptions);
     updateBrowserCollection(run);
     await refreshBrowserCollectionControl();
     if (run.dispatch_enabled) {
       window.dispatchEvent(new Event("aliexpress-monitor:browser-run-requested"));
-      notify(resuming ? "队列已恢复，在线电脑可继续领取任务" : "采集已开始，所有在线电脑都可领取队列任务");
+      notify(resuming ? "队列已恢复，本轮主采集电脑和辅助电脑可继续领取任务" : "采集已开始，本轮主采集电脑和已启用辅助电脑可领取任务");
     } else {
       notify("队列仍未启动，请确认所选电脑在线并重试。", true);
     }

@@ -53,19 +53,19 @@
 - Add start/resume request schemas carrying `helper_worker_ids`; allow the body to be omitted for older callers. A missing helper list on an unassigned legacy run means an empty helper list.
 - `serialize_run(run)` includes the saved primary/helper IDs.
 
-- [ ] **Step 1: Pin the response and persistence contract**
+- [x] **Step 1: Pin the response and persistence contract**
 
 Add schema/service tests asserting an unassigned run serializes as `primary_worker_id is None` and `helper_worker_ids == []`, and an assigned run returns its persisted worker IDs regardless of a later change to `BrowserCollectionControl.selected_worker_id`. Add model relationship coverage for multiple helpers and duplicate-association rejection.
 
-- [ ] **Step 2: Add the additive model and migration**
+- [x] **Step 2: Add the additive model and migration**
 
 Add nullable `primary_worker_id` and the helper association table. Create revision `20261101_0019`, down revision `20261031_0018`; add only these structures and implement a matching downgrade. Leave all existing run and item fields untouched.
 
-- [ ] **Step 3: Add run API schemas and serialization**
+- [x] **Step 3: Add run API schemas and serialization**
 
 Define request models for `start-today` and `/{run_id}/resume`, with optional request bodies for compatibility. Add `primary_worker_id` and `helper_worker_ids` to `BrowserCollectionRunRead` and `serialize_run`. Keep control selection APIs and worker heartbeat payloads backward compatible.
 
-- [ ] **Step 4: Review and verify the persistence boundary**
+- [x] **Step 4: Review and verify the persistence boundary**
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests/test_schema.py tests/test_browser_collection.py -q`
 
@@ -84,23 +84,23 @@ Inspect the migration revision chain and its SQLAlchemy/Alembic operations. Conf
 - `resume_run(db, run, helper_worker_ids=None)` assigns roles once only for an unassigned legacy run; otherwise it preserves the saved roles and rejects attempted substitutions.
 - `claim_next_item(db, worker_id)` returns no item and no token when the requester is not the saved primary/helper, even if the requester is online.
 
-- [ ] **Step 1: Add failing run-role tests**
+- [x] **Step 1: Add failing run-role tests**
 
 Cover initial primary assignment, multiple helpers, rejection of unknown/duplicate/helper-equals-primary IDs, lock after start, and a later global primary selection not changing the active run. Include a legacy run with no roles and verify its first resume assigns the selected primary plus submitted helpers exactly once.
 
-- [ ] **Step 2: Add failing ownership and claim tests**
+- [x] **Step 2: Add failing ownership and claim tests**
 
 Add `test_unselected_online_worker_cannot_claim_new_item`, `test_multiple_helpers_claim_distinct_items`, `test_expired_claim_can_only_be_reclaimed_by_run_member`, `test_existing_claim_owner_can_finish_after_run_role_assignment`, and `test_resume_requires_an_authorized_worker_online`. Assert unselected workers get neither an item nor a token; valid current claims retain the same owner/token; expired items return to the queue and only an authorized worker can reclaim them.
 
-- [ ] **Step 3: Assign and lock roles in the start/resume transaction**
+- [x] **Step 3: Assign and lock roles in the start/resume transaction**
 
 Validate worker IDs against registered records, reject duplicate IDs and primary/helper overlap, and allow offline helpers to remain assigned. Require an online selected primary on first assignment. Save the role set before enabling dispatch in the same transaction. For a role-locked run, preserve its saved roles and reject a different submitted helper list; do not let current global selection replace its primary.
 
-- [ ] **Step 4: Gate only new claims by run membership**
+- [x] **Step 4: Gate only new claims by run membership**
 
 In `claim_next_item`, after validating the worker heartbeat and run state, check membership before assigning a pending item. Leave `finish_item`, challenge/result submission, heartbeat lease renewal, row locks, and claim-token fencing based on the item's recorded owner unchanged. Ensure expired claims are cleared using existing logic and become claimable only by current run members.
 
-- [ ] **Step 5: Resume based on authorized online workers and verify backend behavior**
+- [x] **Step 5: Resume based on authorized online workers and verify backend behavior**
 
 For a role-locked run, allow resume when the primary or at least one helper is online; fail closed with dispatch disabled when none are online. Preserve the current online challenge owner and existing claim credentials, including when that owner is no longer a run member. Requeue an expired/offline claim only through the existing lease path.
 
@@ -116,19 +116,19 @@ Run: `.\.venv\Scripts\python.exe -m pytest tests/test_browser_collection.py -q`
 - Test: `tests/test_dashboard.py`
 - Test: `tests/test_browser_collection.py`
 
-- [ ] **Step 1: Add dashboard behavior assertions**
+- [x] **Step 1: Add dashboard behavior assertions**
 
 Assert the page has a primary selector and a multiple helper selector, helper choices exclude the selected primary, offline helpers are visibly marked, locked current-run roles are rendered separately from the next-run primary choice, and the start/resume request sends the helper IDs only when a run has not yet locked roles.
 
-- [ ] **Step 2: Render primary, helper, and active-run states**
+- [x] **Step 2: Render primary, helper, and active-run states**
 
 Rename the existing selector to “主采集电脑” and add “辅助采集电脑” as a multi-select. Show the active run's saved primary and helper set as locked. Label the global selected primary as the default for the next run after current roles lock. Keep offline helpers visible and explain that they cannot claim until their heartbeat is fresh.
 
-- [ ] **Step 3: Wire role selection and start/resume payloads**
+- [x] **Step 3: Wire role selection and start/resume payloads**
 
 Update `updateBrowserCollectionControl` and the run start handler in `dashboard.js` to exclude the chosen primary from helper options, preserve pending helper choices across control refreshes, send `helper_worker_ids` to first start or first legacy resume, and avoid sending a replacement role list for an already locked run. Keep selector changes from starting or resuming the queue.
 
-- [ ] **Step 4: Reflect run-aware start availability and verify UI behavior**
+- [x] **Step 4: Reflect run-aware start availability and verify UI behavior**
 
 Update the control status calculation so a locked run can resume when any authorized worker is online, even if the globally selected next-run primary is offline. Keep first start disabled unless its selected primary is online. Update help text to state that only the saved primary and enabled helpers can claim new tasks.
 
@@ -140,7 +140,7 @@ Run: `.\.venv\Scripts\python.exe -m pytest tests/test_dashboard.py tests/test_br
 - Modify as needed: `tests/test_browser_collection.py`, `tests/test_dashboard.py`, `tests/test_schema.py`
 - Reference: `docs/nas-monitor-deploy-operations.md`
 
-- [ ] **Step 1: Run the focused and full source checks**
+- [x] **Step 1: Run the focused and full source checks**
 
 Run:
 
@@ -152,7 +152,7 @@ git diff --check
 
 Confirm the extension protocol remains unchanged, run-role reads are stable, the main/helper/unselected cases pass, and no test starts a live queue.
 
-- [ ] **Step 2: Recheck NAS and deployment preconditions**
+- [x] **Step 2: Recheck NAS and deployment preconditions**
 
 Using the documented read-only commands, record the NAS app/revision, Alembic head, latest run, dispatch flag, item counts/statuses, and worker heartbeat IDs. Do not proceed if any queue item is `RUNNING` or `NEEDS_VERIFICATION`; do not pause/resume the queue to create a deployment window. If the gate is not met, leave the migration undeployed and report the blocking item state.
 

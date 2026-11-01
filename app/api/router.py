@@ -24,7 +24,9 @@ from app.api.schemas import (
     StorePoolResetPageRequest,
     StorePoolResetResumeRequest,
     BrowserCollectionRunEnsureRequest,
+    BrowserCollectionRunResumeRequest,
     BrowserCollectionRunRead,
+    BrowserCollectionRunStartRequest,
     BrowserCollectionWorkerSelectRequest,
     BrowserExtensionCollectionRequest,
     DianxiaomiHandoffBatchRead,
@@ -1754,9 +1756,17 @@ def browser_collection_select_worker(
     "/browser-collection/runs/start-today",
     response_model=BrowserCollectionRunRead,
 )
-def browser_collection_start_today(db: Session = Depends(get_db)) -> dict:
+def browser_collection_start_today(
+    payload: BrowserCollectionRunStartRequest | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
     try:
-        return serialize_run(start_browser_collection_run(db))
+        return serialize_run(
+            start_browser_collection_run(
+                db,
+                helper_worker_ids=payload.helper_worker_ids if payload else None,
+            )
+        )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -2020,6 +2030,7 @@ def browser_collection_identity_review_reject(
 )
 def browser_collection_resume(
     run_id: int,
+    payload: BrowserCollectionRunResumeRequest | None = None,
     db: Session = Depends(get_db),
 ) -> dict:
     run = db.get(BrowserCollectionRun, run_id)
@@ -2028,7 +2039,13 @@ def browser_collection_resume(
     if run.status not in {"NEEDS_VERIFICATION", "PAUSED"}:
         raise HTTPException(status_code=409, detail="Browser collection run is not paused")
     try:
-        return serialize_run(resume_run(db, run))
+        return serialize_run(
+            resume_run(
+                db,
+                run,
+                payload.helper_worker_ids if payload else None,
+            )
+        )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 

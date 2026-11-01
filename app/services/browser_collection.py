@@ -296,6 +296,10 @@ def browser_collection_control_status(db: Session) -> dict:
         item.status in {"PENDING", "RUNNING", "NEEDS_VERIFICATION"}
         for item in run.items
     )
+    if run is not None and run.primary_worker_id:
+        eligible_worker_online = _run_has_online_worker(db, run, now)
+    else:
+        eligible_worker_online = bool(selected and selected["online"])
     return {
         "selected_worker": selected,
         "workers": workers,
@@ -304,8 +308,7 @@ def browser_collection_control_status(db: Session) -> dict:
         "handoff_pending": False,
         "draining_count": 0,
         "can_start": bool(
-            selected
-            and selected["online"]
+            eligible_worker_online
             and has_work
             and not (run and _is_manually_cancelled(run))
         ),
@@ -733,8 +736,70 @@ def _release_unresponsive_items(
             item.error_message = "浏览器页面长时间未返回，任务已自动退回队列重试"
 
 
+def _validated_run_helpers(
+    db: Session, primary_worker_id: str, helper_worker_ids: list[str] | None
+) -> list[BrowserCollectionWorker]:
+    worker_ids = helper_worker_ids or []
+    if len(worker_ids) != len(set(worker_ids)):
+        raise ValueError("辅助采集电脑不能重复")
+    if primary_worker_id in worker_ids:
+        raise ValueError("主采集电脑不能同时作为辅助采集电脑")
+    workers = [db.get(BrowserCollectionWorker, worker_id) for worker_id in worker_ids]
+    if any(worker is None for worker in workers):
+        raise ValueError("辅助采集电脑未登记，请刷新电脑列表后重试")
+    return [worker for worker in workers if worker is not None]
+
+
+def _run_has_online_worker(
+    db: Session, run: BrowserCollectionRun, now: datetime
+) -> bool:
+    worker_ids = [run.primary_worker_id, *(worker.worker_id for worker in run.helper_workers)]
+    return any(
+        _worker_is_online(db.get(BrowserCollectionWorker, worker_id), now)
+        for worker_id in worker_ids
+        if worker_id
+    )
+
+
+def _prepare_run_worker_roles(
+    db: Session,
+    run: BrowserCollectionRun,
+    selected_worker_id: str | None,
+    helper_worker_ids: list[str] | None,
+    now: datetime,
+) -> tuple[str | None, list[BrowserCollectionWorker] | None]:
+    if run.primary_worker_id is None:
+        if not selected_worker_id:
+            raise ValueError("请先选择主采集电脑")
+        primary = db.get(BrowserCollectionWorker, selected_worker_id)
+        if not _worker_is_online(primary, now):
+            run.dispatch_enabled = False
+            db.commit()
+            raise ValueError("所选主采集电脑当前离线，请先连接监控台")
+        return primary.worker_id, _validated_run_helpers(
+            db, primary.worker_id, helper_worker_ids
+        )
+
+    if helper_worker_ids is not None:
+        requested_helpers = _validated_run_helpers(
+            db, run.primary_worker_id, helper_worker_ids
+        )
+        saved_ids = {worker.worker_id for worker in run.helper_workers}
+        requested_ids = {worker.worker_id for worker in requested_helpers}
+        if requested_ids != saved_ids:
+            raise ValueError("本轮主辅采集电脑已锁定，不能更改")
+
+    if not _run_has_online_worker(db, run, now):
+        run.dispatch_enabled = False
+        db.commit()
+        raise ValueError("本轮主采集电脑和辅助采集电脑均离线，暂不能恢复队列")
+    return None, None
+
+
 def start_browser_collection_run(
-    db: Session, run: BrowserCollectionRun | None = None
+    db: Session,
+    run: BrowserCollectionRun | None = None,
+    helper_worker_ids: list[str] | None = None,
 ) -> BrowserCollectionRun:
     control = _browser_control_row(db, lock=True)
     if _pool_reset_owns_browser(db):
@@ -746,14 +811,14 @@ def start_browser_collection_run(
     )
     if run is None:
         raise ValueError("Browser collection run not found")
-    if not control.selected_worker_id:
-        raise ValueError("请先选择采集电脑")
-    worker = db.get(BrowserCollectionWorker, control.selected_worker_id)
     now = utcnow()
-    if not _worker_is_online(worker, now):
-        run.dispatch_enabled = False
-        db.commit()
-        raise ValueError("所选采集电脑当前离线，请先连接监控台")
+    primary_worker_id, helper_workers = _prepare_run_worker_roles(
+        db,
+        run,
+        control.selected_worker_id,
+        helper_worker_ids,
+        now,
+    )
 
     _release_unresponsive_items(run, now)
     if _is_manually_cancelled(run):
@@ -787,6 +852,9 @@ def start_browser_collection_run(
         db.commit()
         raise ValueError("今日队列没有待采集任务")
 
+    if primary_worker_id is not None:
+        run.primary_worker_id = primary_worker_id
+        run.helper_workers = helper_workers or []
     run.dispatch_enabled = True
     run.started_at = run.started_at or now
     run.completed_at = None
@@ -819,6 +887,12 @@ def claim_next_item(
         db.commit()
         return run, None
     if not run.dispatch_enabled:
+        db.commit()
+        return run, None
+    if run.primary_worker_id is None or (
+        worker_id != run.primary_worker_id
+        and worker_id not in {helper.worker_id for helper in run.helper_workers}
+    ):
         db.commit()
         return run, None
 
@@ -1255,7 +1329,11 @@ def cancel_run(db: Session, run: BrowserCollectionRun) -> BrowserCollectionRun:
     return run
 
 
-def resume_run(db: Session, run: BrowserCollectionRun) -> BrowserCollectionRun:
+def resume_run(
+    db: Session,
+    run: BrowserCollectionRun,
+    helper_worker_ids: list[str] | None = None,
+) -> BrowserCollectionRun:
     if _is_manually_cancelled(run):
         raise ValueError("此队列已取消，不能整体恢复；请从店铺列表单独启动店铺页采集")
     if run.status not in {"NEEDS_VERIFICATION", "PAUSED"}:
@@ -1271,7 +1349,7 @@ def resume_run(db: Session, run: BrowserCollectionRun) -> BrowserCollectionRun:
         db.commit()
         db.refresh(run)
         return run
-    return start_browser_collection_run(db, run)
+    return start_browser_collection_run(db, run, helper_worker_ids)
 
 
 def retry_item(db: Session, item: BrowserCollectionItem) -> BrowserCollectionRun:
@@ -1543,6 +1621,8 @@ def serialize_run(run: BrowserCollectionRun) -> dict:
         "id": run.id,
         "target_date": run.target_date,
         "latest_data_date": run.target_date - timedelta(days=1),
+        "primary_worker_id": run.primary_worker_id,
+        "helper_worker_ids": sorted(worker.worker_id for worker in run.helper_workers),
         "trigger": run.trigger,
         "status": run.status,
         "phase": run.phase,

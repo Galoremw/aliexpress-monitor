@@ -1,11 +1,14 @@
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect
+from sqlalchemy.exc import IntegrityError
+import pytest
 
 from app.db.models import (
+    BrowserCollectionWorker,
     BrowserCollectionItem,
     BrowserCollectionRun,
     Product,
@@ -28,6 +31,8 @@ def test_all_tables_are_created(db_session):
         "store_snapshots",
         "browser_collection_runs",
         "browser_collection_items",
+        "browser_collection_workers",
+        "browser_collection_run_helpers",
         "product_reviews",
         "review_collection_tasks",
     } <= tables
@@ -113,12 +118,20 @@ def test_browser_control_migration_upgrades_and_downgrades_on_disposable_sqlite(
             "SELECT id, run_id, target_key, status FROM browser_collection_items"
         )).one()
         tables = set(inspect(connection).get_table_names())
+        run_columns = {column["name"] for column in inspect(connection).get_columns("browser_collection_runs")}
+        run_primary_worker_id = (
+            connection.execute(text("SELECT primary_worker_id FROM browser_collection_runs")).scalar()
+            if "primary_worker_id" in run_columns
+            else "missing"
+        )
     assert run.id == 1
     assert run.dispatch_enabled in (0, False)
     assert (item.id, item.run_id, item.target_key, item.status) == (
         1, 1, "store:preserved", "PENDING"
     )
-    assert {"browser_collection_controls", "browser_collection_workers"} <= tables
+    assert {"browser_collection_controls", "browser_collection_workers", "browser_collection_run_helpers"} <= tables
+    assert "primary_worker_id" in run_columns
+    assert run_primary_worker_id is None
     engine.dispose()
 
     command.downgrade(config, "20260927_0009")
@@ -197,3 +210,55 @@ def test_browser_collection_relationships(db_session):
 
     assert run.items[0].product.aliexpress_product_id == "100500900001"
     assert item.store.name == "Browser Store"
+
+
+def test_browser_collection_run_persists_primary_and_multiple_helpers(db_session):
+    primary = BrowserCollectionWorker(
+        worker_id="primary-worker",
+        label="Primary",
+        last_heartbeat_at=datetime.now().astimezone(),
+    )
+    helpers = [
+        BrowserCollectionWorker(
+            worker_id=f"helper-{suffix}",
+            label=f"Helper {suffix}",
+            last_heartbeat_at=datetime.now().astimezone(),
+        )
+        for suffix in ("a", "b")
+    ]
+    run = BrowserCollectionRun(
+        target_date=date(2026, 11, 1),
+    )
+
+    assert hasattr(run, "primary_worker_id")
+    assert hasattr(run, "helper_workers")
+    run.primary_worker_id = primary.worker_id
+    run.helper_workers.extend(helpers)
+    db_session.add_all([primary, *helpers, run])
+    db_session.commit()
+    db_session.expire_all()
+
+    saved_run = db_session.get(BrowserCollectionRun, run.id)
+    assert saved_run.primary_worker_id == primary.worker_id
+    assert {worker.worker_id for worker in saved_run.helper_workers} == {
+        "helper-a",
+        "helper-b",
+    }
+
+
+def test_duplicate_browser_collection_run_helper_is_rejected(db_session):
+    worker = BrowserCollectionWorker(
+        worker_id="helper-only",
+        label="Helper",
+        last_heartbeat_at=datetime.now().astimezone(),
+    )
+    run = BrowserCollectionRun(target_date=date(2026, 11, 1))
+
+    assert hasattr(run, "helper_workers")
+    run.helper_workers.extend([worker, worker])
+    db_session.add_all([worker, run])
+
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+
+    db_session.rollback()
