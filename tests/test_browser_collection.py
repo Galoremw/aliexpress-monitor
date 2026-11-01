@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from sqlalchemy.orm import Session
 import pytest
 
 from app.db.models import (
@@ -18,6 +19,7 @@ from app.db.models import (
 from app.services.browser_collection import (
     _products_with_recent_history_for_date,
     serialize_run,
+    start_browser_collection_run,
 )
 from app.services.metrics import calculate_product_daily_metrics
 from app.services.store_page_discovery import (
@@ -364,6 +366,98 @@ def test_legacy_resume_assigns_roles_without_changing_existing_claim(client, db_
         },
     )
     assert accepted.status_code == 200, accepted.text
+
+
+def test_stale_run_instance_cannot_overwrite_roles_assigned_before_resume(db_session):
+    now = datetime.now(timezone.utc)
+    primary = BrowserCollectionWorker(
+        worker_id="stale-primary", label="Primary", last_heartbeat_at=now
+    )
+    saved_helper = BrowserCollectionWorker(
+        worker_id="stale-saved-helper", label="Saved helper", last_heartbeat_at=now
+    )
+    replacement_helper = BrowserCollectionWorker(
+        worker_id="stale-replacement-helper", label="Replacement helper", last_heartbeat_at=now
+    )
+    run = BrowserCollectionRun(
+        target_date=date.today(), status="PAUSED", phase="STORE_DISCOVERY", total_count=1,
+    )
+    item = BrowserCollectionItem(
+        run=run,
+        target_type="STORE",
+        target_key="store:stale-role-lock",
+        target_url="https://www.aliexpress.com/store/stale-role-lock/pages/all-items.html",
+        position=1,
+        status="PENDING",
+    )
+    control = BrowserCollectionControl(
+        id=1, selected_worker_id=primary.worker_id, selected_worker_label=primary.label
+    )
+    db_session.add_all([primary, saved_helper, replacement_helper, run, item, control])
+    db_session.commit()
+
+    db_session.expire(run)
+    stale_run = db_session.get(BrowserCollectionRun, run.id)
+    assert stale_run.primary_worker_id is None
+    assert stale_run.helper_workers == []
+    assert "primary_worker_id" in stale_run.__dict__
+    db_session.commit()
+    with Session(
+        bind=db_session.get_bind(), autoflush=False, expire_on_commit=False
+    ) as first_resume_session:
+        assigned_run = first_resume_session.get(BrowserCollectionRun, run.id)
+        assigned_run.primary_worker_id = primary.worker_id
+        assigned_run.helper_workers = [
+            first_resume_session.get(BrowserCollectionWorker, saved_helper.worker_id)
+        ]
+        first_resume_session.commit()
+
+    with pytest.raises(ValueError, match="本轮主辅采集电脑已锁定"):
+        start_browser_collection_run(
+            db_session, stale_run, helper_worker_ids=[replacement_helper.worker_id]
+        )
+
+    db_session.refresh(stale_run)
+    assert stale_run.primary_worker_id == primary.worker_id
+    assert [worker.worker_id for worker in stale_run.helper_workers] == [saved_helper.worker_id]
+    assert stale_run.dispatch_enabled is False
+
+
+def test_manual_start_assigns_roles_to_dispatched_legacy_run(client, db_session):
+    now = datetime.now(timezone.utc)
+    primary = BrowserCollectionWorker(
+        worker_id="dispatched-legacy-primary", label="Primary", last_heartbeat_at=now
+    )
+    helper = BrowserCollectionWorker(
+        worker_id="dispatched-legacy-helper", label="Helper", last_heartbeat_at=now
+    )
+    run = BrowserCollectionRun(
+        target_date=date.today(), status="RUNNING", phase="STORE_DISCOVERY",
+        total_count=1, dispatch_enabled=True,
+    )
+    item = BrowserCollectionItem(
+        run=run,
+        target_type="STORE",
+        target_key="store:dispatched-legacy",
+        target_url="https://www.aliexpress.com/store/dispatched-legacy/pages/all-items.html",
+        position=1,
+        status="PENDING",
+    )
+    control = BrowserCollectionControl(
+        id=1, selected_worker_id=primary.worker_id, selected_worker_label=primary.label
+    )
+    db_session.add_all([primary, helper, run, item, control])
+    db_session.commit()
+
+    response = client.post(
+        "/api/browser-collection/runs/start-today",
+        json={"helper_worker_ids": [helper.worker_id]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["primary_worker_id"] == primary.worker_id
+    assert response.json()["helper_worker_ids"] == [helper.worker_id]
+    assert response.json()["dispatch_enabled"] is True
 
 
 def test_resume_requires_an_authorized_worker_online(client, db_session):

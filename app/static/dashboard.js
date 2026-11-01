@@ -1095,11 +1095,11 @@ function updateBrowserCollectionControl(control) {
   const terminal = ["COMPLETED", "PARTIAL", "FAILED"].includes(status)
     && Number(browserCollectionRun?.pending_count) === 0;
   start.textContent = control.dispatch_enabled
-    ? "采集中"
+    ? rolesLocked ? "采集中" : "锁定本轮主辅电脑"
     : ["PAUSED", "NEEDS_VERIFICATION"].includes(status) ? "继续采集"
       : terminal ? "今日已完成" : "开始采集";
   start.dataset.runId = browserCollectionRun?.id || "";
-  start.disabled = !control.can_start || control.dispatch_enabled;
+  start.disabled = !control.can_start || (control.dispatch_enabled && rolesLocked);
 }
 
 function renderBrowserRunLockedRoles() {

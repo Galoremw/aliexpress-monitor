@@ -159,6 +159,34 @@ def test_dashboard_enables_resume_when_authorized_helper_is_online(client, db_se
     assert 'id="browser-run-start" class="button primary" type="button">继续采集</button>' in dashboard
 
 
+def test_dashboard_offers_manual_role_assignment_for_legacy_dispatched_run(client, db_session):
+    now = datetime.now(timezone.utc)
+    primary = BrowserCollectionWorker(
+        worker_id="legacy-dispatch-primary", label="Primary", last_heartbeat_at=now
+    )
+    run = BrowserCollectionRun(
+        target_date=datetime.now().date(), status="RUNNING", phase="STORE_DISCOVERY",
+        total_count=1, dispatch_enabled=True,
+    )
+    item = BrowserCollectionItem(
+        run=run,
+        target_type="STORE",
+        target_key="store:legacy-dispatch",
+        target_url="https://www.aliexpress.com/store/legacy-dispatch/pages/all-items.html",
+        position=1,
+        status="PENDING",
+    )
+    control = BrowserCollectionControl(
+        id=1, selected_worker_id=primary.worker_id, selected_worker_label=primary.label
+    )
+    db_session.add_all([primary, run, item, control])
+    db_session.commit()
+
+    dashboard = client.get("/").text
+
+    assert 'id="browser-run-start" class="button primary" type="button">锁定本轮主辅电脑</button>' in dashboard
+
+
 def test_dashboard_disables_start_for_offline_worker(client, db_session):
     client.post(
         "/api/browser-collection/heartbeat",

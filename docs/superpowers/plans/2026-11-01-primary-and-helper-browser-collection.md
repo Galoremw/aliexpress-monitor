@@ -130,7 +130,7 @@ Update `updateBrowserCollectionControl` and the run start handler in `dashboard.
 
 - [x] **Step 4: Reflect run-aware start availability and verify UI behavior**
 
-Update the control status calculation so a locked run can resume when any authorized worker is online, even if the globally selected next-run primary is offline. Keep first start disabled unless its selected primary is online. Update help text to state that only the saved primary and enabled helpers can claim new tasks.
+Update the control status calculation so a locked run can resume when any authorized worker is online, even if the globally selected next-run primary is offline. Keep first start disabled unless its selected primary is online. For a legacy run whose dispatch is already enabled but whose roles are still empty, offer a manual “锁定本轮主辅电脑” action when the selected primary is online; preserve the existing dispatch flag and do not assign roles automatically. Update help text to state that only the saved primary and enabled helpers can claim new tasks.
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests/test_dashboard.py tests/test_browser_collection.py -q`
 

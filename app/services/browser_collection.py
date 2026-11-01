@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload, object_session
+from sqlalchemy.orm import Session, joinedload, object_session, selectinload
 
 from app.core.config import get_settings
 from app.db.models import (
@@ -807,7 +807,11 @@ def start_browser_collection_run(
     if run is None:
         run = ensure_browser_collection_run(db, trigger="MANUAL")
     run = db.scalar(
-        select(BrowserCollectionRun).where(BrowserCollectionRun.id == run.id).with_for_update()
+        select(BrowserCollectionRun)
+        .where(BrowserCollectionRun.id == run.id)
+        .options(selectinload(BrowserCollectionRun.helper_workers))
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if run is None:
         raise ValueError("Browser collection run not found")

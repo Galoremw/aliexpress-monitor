@@ -110,7 +110,7 @@
         <p class="muted-value">尚无采集电脑心跳</p>
         {% endfor %}
       </div>
-      <button id="browser-run-start" class="button primary" type="button"{% if not browser_collection_control.can_start or browser_collection_control.dispatch_enabled %} disabled{% endif %}>{% if browser_collection_control.dispatch_enabled %}采集中{% elif browser_collection_control.run_status in ["NEEDS_VERIFICATION", "PAUSED"] %}继续采集{% elif browser_collection_run and browser_collection_run.status in ["COMPLETED", "PARTIAL", "FAILED"] and not browser_collection_control.can_start %}今日已完成{% else %}开始采集{% endif %}</button>
+      <button id="browser-run-start" class="button primary" type="button"{% if not browser_collection_control.can_start or (browser_collection_control.dispatch_enabled and browser_collection_run and browser_collection_run.primary_worker_id) %} disabled{% endif %}>{% if browser_collection_control.dispatch_enabled and browser_collection_run and not browser_collection_run.primary_worker_id %}锁定本轮主辅电脑{% elif browser_collection_control.dispatch_enabled %}采集中{% elif browser_collection_control.run_status in ["NEEDS_VERIFICATION", "PAUSED"] %}继续采集{% elif browser_collection_run and browser_collection_run.status in ["COMPLETED", "PARTIAL", "FAILED"] and not browser_collection_control.can_start %}今日已完成{% else %}开始采集{% endif %}</button>
       <button id="browser-run-now" class="button" type="button"{% if browser_collection_run and browser_collection_run.paused_reason == "manual_cancel" %} hidden{% endif %}>重新检查今日任务</button>
       <div class="browser-run-secondary-actions">
         <button id="browser-run-pause" class="button" type="button" data-run-id="{{ browser_collection_run.id if browser_collection_run else '' }}"{% if not browser_collection_run or browser_collection_run.status not in ["PENDING", "RUNNING"] %} hidden{% endif %}>暂停采集队列</button>
@@ -118,7 +118,7 @@
       </div>
     </div>
   </div>
-  <p class="browser-run-help">任务会先排队并保持待启动；选择在线主采集电脑和可选辅助电脑后，再手动点击“开始采集”或“继续采集”。开始后本轮主辅电脑会锁定，只有这些电脑可以领取新任务；全局主机选择仅作为下轮默认值。离线辅助电脑上线后即可参与。平台登录或验证仍需由你本人完成。</p>
+  <p class="browser-run-help">任务会先排队并保持待启动；选择在线主采集电脑和可选辅助电脑后，再手动点击“开始采集”或“继续采集”。开始后本轮主辅电脑会锁定，只有这些电脑可以领取新任务；全局主机选择仅作为下轮默认值。旧队列若已开启派发但还没有锁定角色，可手动点击“锁定本轮主辅电脑”完成首次授权。离线辅助电脑上线后即可参与。平台登录或验证仍需由你本人完成。</p>
   <div class="browser-queue-content">
     <div class="browser-filter-grid" role="tablist" aria-label="按状态查看浏览器采集任务">
       <button class="browser-filter active" type="button" role="tab" aria-selected="true" data-browser-filter="pending"><small>待处理</small><b data-browser-filter-value="pending">0</b></button>
