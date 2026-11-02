@@ -818,6 +818,28 @@ function isIdentityDeferred(item) {
   return ["store_identity_deferred", "store_identity_review"].includes(item.error_type);
 }
 
+function isBrowserCollectionBulkRetryable(item) {
+  if (isIdentityDeferred(item)) return false;
+  return item.status === "FAILED"
+    || (item.status === "SKIPPED" && item.error_type === "queue_cancelled");
+}
+
+function updateBrowserCollectionRetryButton(run) {
+  const button = document.querySelector("#browser-run-retry-failed");
+  if (!button) return;
+  const items = run?.items || [];
+  const count = items.filter(isBrowserCollectionBulkRetryable).length;
+  const hasActiveItems = items.some((item) => ["RUNNING", "NEEDS_VERIFICATION"].includes(item.status));
+  button.hidden = !run || count === 0;
+  button.disabled = Boolean(run?.dispatch_enabled || hasActiveItems);
+  button.dataset.runId = run?.id || "";
+  button.dataset.retryableCount = String(count);
+  button.textContent = `失败/已取消项重排（${count}）`;
+  button.title = button.disabled
+    ? "请先暂停队列并处理活动任务或平台验证；重排后仍需手动继续"
+    : "将失败和因取消队列跳过的任务放回待处理；不会自动开始采集";
+}
+
 function renderBrowserCollectionItem(item) {
   const identityDeferred = isIdentityDeferred(item);
   const identityEvidence = item.identity_review_evidence || {};
@@ -973,6 +995,7 @@ function updateBrowserCollection(run) {
     if (recheck) recheck.hidden = false;
     if (pause) pause.hidden = true;
     if (cancel) cancel.hidden = true;
+    updateBrowserCollectionRetryButton(null);
     return;
   }
 
@@ -993,6 +1016,7 @@ function updateBrowserCollection(run) {
   }
   if (heartbeat) heartbeat.textContent = formatBrowserTime(run.last_heartbeat_at);
   browserCollectionItems = run.items || [];
+  updateBrowserCollectionRetryButton(run);
   renderBrowserCollectionFilter();
   ["total_count", "succeeded_count", "partial_count", "failed_count", "pending_count"].forEach((key) => {
     const target = document.querySelector(`[data-browser-value="${key}"]`);
@@ -1213,6 +1237,31 @@ document.querySelector("#browser-run-now")?.addEventListener("click", async (eve
     updateBrowserCollection(run);
     await refreshBrowserCollectionControl();
     notify("今日任务已重新检查并保持待启动；不会自动开始采集。");
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector("#browser-run-retry-failed")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const runId = button.dataset.runId;
+  const retryableCount = Number(button.dataset.retryableCount || 0);
+  if (!runId || retryableCount <= 0) return;
+  const confirmed = window.confirm(
+    `将 ${retryableCount} 个失败或已取消任务重新放入待处理？部分数据与身份审核任务不受影响；队列会保持暂停，需你手动继续。`
+  );
+  if (!confirmed) return;
+
+  button.disabled = true;
+  try {
+    const result = await jsonRequest(`/api/browser-collection/runs/${runId}/retry-failed`, {
+      method: "POST",
+    });
+    updateBrowserCollection(result.run);
+    await refreshBrowserCollectionControl();
+    notify(`已将 ${result.requeued_count} 个失败/已取消任务放回待处理；队列仍暂停。`);
   } catch (error) {
     notify(error.message, true);
   } finally {

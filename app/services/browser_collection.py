@@ -1410,6 +1410,68 @@ def retry_item(db: Session, item: BrowserCollectionItem) -> BrowserCollectionRun
     return run
 
 
+def retry_failed_run_items(
+    db: Session, run_id: int
+) -> tuple[BrowserCollectionRun, int]:
+    run = db.scalar(
+        select(BrowserCollectionRun)
+        .where(BrowserCollectionRun.id == run_id)
+        .options(
+            selectinload(BrowserCollectionRun.items).selectinload(
+                BrowserCollectionItem.store
+            ),
+            selectinload(BrowserCollectionRun.helper_workers),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if run is None:
+        raise ValueError("Browser collection run not found")
+    if run.dispatch_enabled:
+        raise ValueError("请先暂停采集队列，再批量重新排队")
+    if any(
+        item.status in {"RUNNING", "NEEDS_VERIFICATION"}
+        for item in run.items
+    ):
+        raise ValueError("当前仍有采集中或待验证任务，请处理后再批量重新排队")
+
+    retryable_items = [
+        item
+        for item in run.items
+        if (
+            item.status == "FAILED"
+            and item.error_type not in {"store_identity_deferred", "store_identity_review"}
+        )
+        or (item.status == "SKIPPED" and item.error_type == "queue_cancelled")
+    ]
+    if not retryable_items:
+        raise ValueError("当前队列没有可批量重新排队的失败或已取消任务")
+
+    for item in retryable_items:
+        if item.target_type == "STORE" and item.store is not None:
+            if item.store.status != "active":
+                raise ValueError("失败任务中包含已停用店铺，未执行批量重新排队")
+            item.target_url = _store_collection_url(item.store)
+        _reset_item(item)
+
+    run.completed_at = None
+    run.status = "PAUSED"
+    run.paused_reason = "manual_pause"
+    run.dispatch_enabled = False
+    run.phase = (
+        "STORE_DISCOVERY"
+        if any(
+            item.status == "PENDING" and item.target_type == "STORE"
+            for item in run.items
+        )
+        else "PRODUCT_COLLECTION"
+    )
+    _refresh_counts(run)
+    db.commit()
+    db.refresh(run)
+    return run, len(retryable_items)
+
+
 def validate_browser_collection_claim(
     db: Session,
     item_id: int,

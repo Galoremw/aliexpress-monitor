@@ -139,6 +139,7 @@ from app.services.browser_collection import (
     reject_store_identity_review,
     resume_run,
     retry_item,
+    retry_failed_run_items,
     select_browser_collection_worker,
     serialize_item,
     serialize_run,
@@ -1952,6 +1953,22 @@ def browser_collection_retry(item_id: int, db: Session = Depends(get_db)) -> dic
         return serialize_run(retry_item(db, item))
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post("/browser-collection/runs/{run_id}/retry-failed")
+def browser_collection_retry_failed(
+    run_id: int,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        run, requeued_count = retry_failed_run_items(db, run_id)
+    except ValueError as error:
+        db.rollback()
+        if str(error) == "Browser collection run not found":
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {"run": serialize_run(run), "requeued_count": requeued_count}
 
 
 @router.post(

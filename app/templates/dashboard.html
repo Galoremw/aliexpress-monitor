@@ -75,50 +75,59 @@
       <span><small>待处理</small><b data-browser-value="pending_count">{{ browser_collection_run.pending_count if browser_collection_run else 0 }}</b></span>
     </div>
     <div class="browser-run-actions">
-      <label for="browser-collector-select">主采集电脑
-        <select id="browser-collector-select" aria-label="选择采集电脑">
-          <option value="">请选择在线采集电脑</option>
-          {% for worker in browser_collection_control.workers %}
-          <option value="{{ worker.worker_id }}"{% if browser_collection_control.selected_worker and browser_collection_control.selected_worker.worker_id == worker.worker_id %} selected{% endif %}>{{ worker.display_label }} · {{ "在线" if worker.online else "离线" }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <p id="browser-selected-worker-state" class="browser-selected-worker-state" role="status" aria-live="polite">{% if browser_collection_control.selected_worker %}{% if browser_collection_run and browser_collection_run.primary_worker_id %}下轮主采集电脑：{% else %}手动启动主采集电脑：{% endif %}{{ browser_collection_control.selected_worker.display_label }} · {{ "在线" if browser_collection_control.selected_worker.online else "离线" }}{% else %}尚未选择主采集电脑{% endif %}</p>
-      <label for="browser-helper-collectors-select">辅助采集电脑
-        <select id="browser-helper-collectors-select" multiple size="3" aria-label="选择辅助采集电脑"{% if browser_collection_run and browser_collection_run.primary_worker_id %} disabled{% endif %}>
-          {% for worker in browser_collection_control.workers %}
-          {% if not browser_collection_control.selected_worker or worker.worker_id != browser_collection_control.selected_worker.worker_id %}
-          <option value="{{ worker.worker_id }}">{{ worker.display_label }} · {{ "在线" if worker.online else "离线" }}</option>
-          {% endif %}
-          {% endfor %}
-        </select>
-      </label>
-      <p class="browser-helper-hint">可同时启用多台辅助电脑；离线电脑恢复心跳后才能领取任务。</p>
-      <div id="browser-run-locked-roles" class="browser-run-locked-roles" data-primary-worker-id="{{ browser_collection_run.primary_worker_id if browser_collection_run else '' }}"{% if not browser_collection_run or not browser_collection_run.primary_worker_id %} hidden{% endif %}>
-        <strong>本轮主采集电脑（已锁定）</strong>
-        <span id="browser-run-primary-label">{% if browser_collection_run and browser_collection_run.primary_worker_id %}{% for worker in browser_collection_control.workers %}{% if worker.worker_id == browser_collection_run.primary_worker_id %}{{ worker.display_label }}（{{ worker.worker_id }}）{% endif %}{% endfor %}{% endif %}</span>
-        <strong>本轮辅助采集电脑（已锁定）</strong>
-        <span id="browser-run-helper-labels">{% if browser_collection_run and browser_collection_run.primary_worker_id %}{% for helper_id in browser_collection_run.helper_worker_ids %}{% if not loop.first %}、{% endif %}{% set matched = namespace(value=false) %}{% for worker in browser_collection_control.workers %}{% if worker.worker_id == helper_id %}{{ worker.display_label }}（{{ helper_id }}）{% set matched.value = true %}{% endif %}{% endfor %}{% if not matched.value %}{{ helper_id }}{% endif %}{% else %}无{% endfor %}{% else %}尚未锁定{% endif %}</span>
+      <div class="browser-collector-selectors">
+        <label for="browser-collector-select">主采集电脑
+          <select id="browser-collector-select" aria-label="选择采集电脑">
+            <option value="">请选择在线采集电脑</option>
+            {% for worker in browser_collection_control.workers %}
+            <option value="{{ worker.worker_id }}"{% if browser_collection_control.selected_worker and browser_collection_control.selected_worker.worker_id == worker.worker_id %} selected{% endif %}>{{ worker.display_label }} · {{ "在线" if worker.online else "离线" }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label for="browser-helper-collectors-select">辅助采集电脑
+          <select id="browser-helper-collectors-select" multiple size="2" aria-label="选择辅助采集电脑"{% if browser_collection_run and browser_collection_run.primary_worker_id %} disabled{% endif %}>
+            {% for worker in browser_collection_control.workers %}
+            {% if not browser_collection_control.selected_worker or worker.worker_id != browser_collection_control.selected_worker.worker_id %}
+            <option value="{{ worker.worker_id }}">{{ worker.display_label }} · {{ "在线" if worker.online else "离线" }}</option>
+            {% endif %}
+            {% endfor %}
+          </select>
+        </label>
       </div>
-      <div id="browser-worker-loads" class="browser-worker-loads" aria-label="在线采集电脑任务状态" aria-live="polite">
-        {% for worker in browser_collection_control.workers %}
-        <div class="browser-worker-load" data-worker-id="{{ worker.worker_id }}" data-worker-claim-count="{{ worker.active_claim_count }}">
-          <span class="browser-worker-load-name">{{ worker.display_label }}</span>
-          <span class="browser-worker-load-state">{{ "在线" if worker.online else "离线" }} · 领取 {{ worker.active_claim_count }} 项</span>
+      <div class="browser-selection-guidance">
+        <p id="browser-selected-worker-state" class="browser-selected-worker-state" role="status" aria-live="polite">{% if browser_collection_control.selected_worker %}{% if browser_collection_run and browser_collection_run.primary_worker_id %}下轮主采集电脑：{% else %}手动启动主采集电脑：{% endif %}{{ browser_collection_control.selected_worker.display_label }} · {{ "在线" if browser_collection_control.selected_worker.online else "离线" }}{% else %}尚未选择主采集电脑{% endif %}</p>
+        <p class="browser-helper-hint">可多选辅助电脑；离线电脑上线后可领取任务。</p>
+      </div>
+      <div class="browser-computer-state-grid">
+        <div id="browser-run-locked-roles" class="browser-run-locked-roles" data-primary-worker-id="{{ browser_collection_run.primary_worker_id if browser_collection_run else '' }}"{% if not browser_collection_run or not browser_collection_run.primary_worker_id %} hidden{% endif %}>
+          <strong>本轮主机</strong>
+          <span id="browser-run-primary-label">{% if browser_collection_run and browser_collection_run.primary_worker_id %}{% for worker in browser_collection_control.workers %}{% if worker.worker_id == browser_collection_run.primary_worker_id %}{{ worker.display_label }}（{{ worker.worker_id }}）{% endif %}{% endfor %}{% endif %}</span>
+          <strong>本轮辅助机</strong>
+          <span id="browser-run-helper-labels">{% if browser_collection_run and browser_collection_run.primary_worker_id %}{% for helper_id in browser_collection_run.helper_worker_ids %}{% if not loop.first %}、{% endif %}{% set matched = namespace(value=false) %}{% for worker in browser_collection_control.workers %}{% if worker.worker_id == helper_id %}{{ worker.display_label }}（{{ helper_id }}）{% set matched.value = true %}{% endif %}{% endfor %}{% if not matched.value %}{{ helper_id }}{% endif %}{% else %}无{% endfor %}{% else %}尚未锁定{% endif %}</span>
         </div>
-        {% else %}
-        <p class="muted-value">尚无采集电脑心跳</p>
-        {% endfor %}
+        <div id="browser-worker-loads" class="browser-worker-loads" aria-label="在线采集电脑任务状态" aria-live="polite">
+          {% for worker in browser_collection_control.workers %}
+          <div class="browser-worker-load" data-worker-id="{{ worker.worker_id }}" data-worker-claim-count="{{ worker.active_claim_count }}">
+            <span class="browser-worker-load-name">{{ worker.display_label }}</span>
+            <span class="browser-worker-load-state">{{ "在线" if worker.online else "离线" }} · 领取 {{ worker.active_claim_count }} 项</span>
+          </div>
+          {% else %}
+          <p class="muted-value">暂无采集电脑</p>
+          {% endfor %}
+        </div>
       </div>
-      <button id="browser-run-start" class="button primary" type="button"{% if not browser_collection_control.can_start or (browser_collection_control.dispatch_enabled and browser_collection_run and browser_collection_run.primary_worker_id) %} disabled{% endif %}>{% if browser_collection_control.dispatch_enabled and browser_collection_run and not browser_collection_run.primary_worker_id %}锁定本轮主辅电脑{% elif browser_collection_control.dispatch_enabled %}采集中{% elif browser_collection_control.run_status in ["NEEDS_VERIFICATION", "PAUSED"] %}继续采集{% elif browser_collection_run and browser_collection_run.status in ["COMPLETED", "PARTIAL", "FAILED"] and not browser_collection_control.can_start %}今日已完成{% else %}开始采集{% endif %}</button>
-      <button id="browser-run-now" class="button" type="button"{% if browser_collection_run and browser_collection_run.paused_reason == "manual_cancel" %} hidden{% endif %}>重新检查今日任务</button>
+      <div class="browser-run-main-actions">
+        <button id="browser-run-start" class="button primary" type="button"{% if not browser_collection_control.can_start or (browser_collection_control.dispatch_enabled and browser_collection_run and browser_collection_run.primary_worker_id) %} disabled{% endif %}>{% if browser_collection_control.dispatch_enabled and browser_collection_run and not browser_collection_run.primary_worker_id %}锁定本轮主辅电脑{% elif browser_collection_control.dispatch_enabled %}采集中{% elif browser_collection_control.run_status in ["NEEDS_VERIFICATION", "PAUSED"] %}继续采集{% elif browser_collection_run and browser_collection_run.status in ["COMPLETED", "PARTIAL", "FAILED"] and not browser_collection_control.can_start %}今日已完成{% else %}开始采集{% endif %}</button>
+        {% if is_admin %}<button id="browser-run-retry-failed" class="button" type="button" hidden>失败/已取消项重排</button>{% endif %}
+      </div>
       <div class="browser-run-secondary-actions">
+        <button id="browser-run-now" class="button" type="button"{% if browser_collection_run and browser_collection_run.paused_reason == "manual_cancel" %} hidden{% endif %}>重新检查今日任务</button>
         <button id="browser-run-pause" class="button" type="button" data-run-id="{{ browser_collection_run.id if browser_collection_run else '' }}"{% if not browser_collection_run or browser_collection_run.status not in ["PENDING", "RUNNING"] %} hidden{% endif %}>暂停采集队列</button>
         {% if is_admin %}<button id="browser-run-cancel" class="button danger" type="button" data-run-id="{{ browser_collection_run.id if browser_collection_run else '' }}"{% if not browser_collection_run or browser_collection_run.status not in ["PENDING", "RUNNING", "NEEDS_VERIFICATION", "PAUSED"] or (browser_collection_run.status == "PAUSED" and browser_collection_run.paused_reason == "manual_cancel") %} hidden{% endif %}>取消剩余队列</button>{% endif %}
       </div>
     </div>
   </div>
-  <p class="browser-run-help">任务会先排队并保持待启动；选择在线主采集电脑和可选辅助电脑后，再手动点击“开始采集”或“继续采集”。开始后本轮主辅电脑会锁定，只有这些电脑可以领取新任务；全局主机选择仅作为下轮默认值。旧队列若已开启派发但还没有锁定角色，可手动点击“锁定本轮主辅电脑”完成首次授权。离线辅助电脑上线后即可参与。平台登录或验证仍需由你本人完成。</p>
+  <p class="browser-run-help">选择主机和可选辅助机后手动启动；本轮角色会锁定，只有已授权电脑可领取新任务。</p>
   <div class="browser-queue-content">
     <div class="browser-filter-grid" role="tablist" aria-label="按状态查看浏览器采集任务">
       <button class="browser-filter active" type="button" role="tab" aria-selected="true" data-browser-filter="pending"><small>待处理</small><b data-browser-filter-value="pending">0</b></button>
@@ -222,7 +231,6 @@
     <h2>监控商品库</h2>
     <div class="section-heading-actions">
       <span>不属于店小秘队列 · 按店铺展开查看</span>
-      {% if is_admin %}<button id="clear-active-monitored-products" class="button danger" type="button">清空监控商品</button>{% endif %}
     </div>
   </div>
   <div class="store-accordion">
