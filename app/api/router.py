@@ -1958,7 +1958,6 @@ def browser_collection_retry(item_id: int, db: Session = Depends(get_db)) -> dic
 @router.post("/browser-collection/runs/{run_id}/retry-failed")
 def browser_collection_retry_failed(
     run_id: int,
-    _admin=Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> dict:
     try:
