@@ -16,3 +16,10 @@ frontend/node_modules/
 frontend/dist/
 frontend/.env.local
 .gh-config/
+# Generated local pytest/build output.
+.pytest-*/
+.test-run-*/
+/build/
+# Pytest temporary directories using underscore names and test snapshots.
+.pytest_tmp_*/
+.test-tmp/

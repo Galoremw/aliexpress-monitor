@@ -46,10 +46,28 @@
   }
 
   function helperButton() {
-    const candidates = [...document.querySelectorAll(".dxmCurrentPag")].filter(visible);
-    return candidates.find((node) => /本页采集|采集成功|重复采集/.test(node.innerText || node.textContent || ""))
-      || candidates[0]
-      || null;
+    const labelOf = (node) => (node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
+    const expectedLabel = /本页采集|开始采集|采集成功|重复采集/;
+    const visibleControls = [...document.querySelectorAll("button, [role='button']")].filter(visible);
+    const startAction = visibleControls.find((node) => labelOf(node) === "开始采集");
+    if (startAction) return startAction;
+
+    const currentPageControls = [...document.querySelectorAll(
+      ".dxmCurrentPag button, .dxmCurrentPag [role='button'], button.dxmCurrentPag, [role='button'].dxmCurrentPag",
+    )].filter(visible);
+    const directControl = currentPageControls.find((node) => expectedLabel.test(labelOf(node)));
+    if (directControl) return directControl;
+
+    const currentPageNodes = [...document.querySelectorAll(".dxmCurrentPag")].filter(visible);
+    const currentPage = currentPageNodes.find((node) => expectedLabel.test(labelOf(node)));
+    if (currentPage) {
+      const nestedControl = [...currentPage.querySelectorAll("button, [role='button']")]
+        .filter(visible)
+        .find((node) => expectedLabel.test(labelOf(node)));
+      return nestedControl || currentPage;
+    }
+
+    return visibleControls.find((node) => /^(本页采集|采集成功|重复采集)$/.test(labelOf(node))) || null;
   }
 
   function feedbackNodes() {
@@ -164,12 +182,20 @@
         await finish("needs_confirmation", blocked);
         return;
       }
+      if (productIdFromUrl(location.href) !== expectedProductId) {
+        await finish("needs_confirmation", "商品页跳转后与队列目标商品不一致，请检查商品链接");
+        return;
+      }
       button = helperButton();
       if (button) break;
       await sleep(POLL_INTERVAL_MS);
     }
     if (!button) {
       await finish("needs_confirmation", "商品页没有出现店小秘助手的“本页采集”控件，请确认隔离工作窗口已安装并启用助手");
+      return;
+    }
+    if (productIdFromUrl(location.href) !== expectedProductId) {
+      await finish("needs_confirmation", "商品页跳转后与队列目标商品不一致，请检查商品链接");
       return;
     }
 

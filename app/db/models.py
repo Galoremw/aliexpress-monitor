@@ -637,6 +637,7 @@ class DianxiaomiQueueControl(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True, default=1)
+    selected_worker_id: Mapped[str | None] = mapped_column(String(128))
     is_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paused_reason: Mapped[str | None] = mapped_column(String(32))

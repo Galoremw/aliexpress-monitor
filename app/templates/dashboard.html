@@ -194,6 +194,10 @@
         <small id="dianxiaomi-last-heartbeat" class="muted-value">尚未收到扩展心跳</small>
       </div>
       <div class="dianxiaomi-run-actions">
+        <label class="dianxiaomi-worker-select-label" for="dianxiaomi-worker-select">店小秘采集电脑
+          <select id="dianxiaomi-worker-select"><option value="">正在读取采集电脑…</option></select>
+        </label>
+        <button id="dianxiaomi-worker-select-save" class="button secondary" type="button">保存采集电脑</button>
         <button id="dianxiaomi-queue-resume" class="button" type="button" hidden>继续店小秘队列</button>
         <button id="dianxiaomi-queue-pause" class="button" type="button" hidden>暂停店小秘队列</button>
         {% if is_admin %}<button id="dianxiaomi-delete-failed" class="button danger" type="button" hidden>批量清空失败任务</button>{% endif %}
@@ -247,13 +251,14 @@
           <thead><tr><th>商品链接</th><th>最近 IXSPY 日增量</th><th>近 7 天合计</th><th>历史 7 天日增量</th><th>采集状态</th><th></th></tr></thead>
           <tbody>
           {% for row in panel.rows %}
+            {% set dianxiaomi_succeeded = row.dianxiaomi_status == "SUCCEEDED" %}
             <tr data-product-id="{{ row.product.id }}">
               <td class="product-cell"><a class="product-link" href="/dashboard/products/{{ row.product.id }}">{% if row.main_image_url %}<img class="product-thumb" src="{{ row.main_image_url }}" alt="" loading="lazy" referrerpolicy="no-referrer">{% else %}<span class="product-thumb product-thumb-empty" aria-hidden="true"></span>{% endif %}<span class="product-link-title">{{ row.display_title }}</span></a></td>
               <td>{% if row.latest_metric and row.latest_metric.is_estimable %}<strong class="number">{{ row.latest_metric.estimated_sales }}</strong><small>{{ row.latest_metric.metric_date }}</small>{% else %}<span class="muted-value">无直接数据</span>{% endif %}</td>
               <td>{% if row.seven_day_total is not none %}<strong class="number">{{ row.seven_day_total }}</strong><small>完整窗口 {{ row.score_start_date }}–{{ row.score_end_date }}</small>{% else %}<span class="muted-value">待补齐 IXSPY</span><small>{{ row.coverage }} / 7 天有 IXSPY 日增量</small><small>窗口 {{ row.score_start_date }}–{{ row.score_end_date }}</small>{% endif %}</td>
               <td><div class="sales-strip" aria-label="最近 7 天 IXSPY 日增量">{% for item in row.history %}<span title="{{ item.date }} · {{ item.source_label }}"><small>{{ item.date.strftime("%m-%d") }}</small><b>{{ item.value if item.value is not none else "—" }}</b></span>{% endfor %}</div><small>IXSPY 日增量 {{ row.history_coverage }} / 7 天</small></td>
               <td><span class="status {{ row.collection_status_class }}" data-collection-status>{{ row.collection_status_label }}</span>{% if row.collection_captured_at %}<small data-collection-time>{{ row.collection_captured_at.strftime("%m-%d %H:%M") }}</small>{% endif %}<small>仅采用 IXSPY 页面可见日增量；缺失日期不估算</small></td>
-              <td class="row-actions"><a class="link-button" href="{{ row.product.url }}#monitor_product_id={{ row.product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品页</a><button class="link-button dianxiaomi-product" type="button" data-product-id="{{ row.product.id }}">采集到店小秘</button><button class="link-button collect-reviews" type="button" data-product-id="{{ row.product.id }}">采集评论</button><small class="review-task-state" data-product-id="{{ row.product.id }}">尚未采集评论</small>{% if is_admin %}<button class="link-button danger deactivate-product" type="button" data-product-id="{{ row.product.id }}" aria-label="删除 {{ row.display_title }} 的监控">删除监控</button>{% endif %}</td>
+              <td class="row-actions"><a class="link-button" href="{{ row.product.url }}#monitor_product_id={{ row.product.aliexpress_product_id }}" target="_blank" rel="noreferrer">打开商品页</a><button class="link-button dianxiaomi-product{% if dianxiaomi_succeeded %} is-collected{% endif %}" type="button" data-product-id="{{ row.product.id }}" data-dianxiaomi-status="{{ row.dianxiaomi_status or '' }}"{% if dianxiaomi_succeeded %} disabled title="店小秘已成功采集" aria-label="已采集到店小秘"{% endif %}>{{ "已采集到店小秘" if dianxiaomi_succeeded else "采集到店小秘" }}</button><button class="link-button collect-reviews" type="button" data-product-id="{{ row.product.id }}">采集评论</button><small class="review-task-state" data-product-id="{{ row.product.id }}">尚未采集评论</small>{% if is_admin %}<button class="link-button danger deactivate-product" type="button" data-product-id="{{ row.product.id }}" aria-label="删除 {{ row.display_title }} 的监控">删除监控</button>{% endif %}</td>
             </tr>
           {% else %}<tr><td colspan="6" class="empty">该店铺还没有监控商品。</td></tr>{% endfor %}
           </tbody>

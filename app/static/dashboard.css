@@ -223,6 +223,8 @@ tr:last-child td { border-bottom: 0; }
 .sales-strip b { font-size: 12px; font-variant-numeric: tabular-nums; }
 .empty { padding: 28px 14px; color: var(--muted); text-align: center; white-space: normal; }
 .link-button { border: 0; padding: 3px 6px; background: transparent; color: var(--accent-dark); font: inherit; font-weight: 650; cursor: pointer; }
+button.dianxiaomi-product.is-collected:disabled { opacity: 1; cursor: default; }
+.link-button.dianxiaomi-product.is-collected:disabled { color: var(--accent-strong); }
 .link-button.danger, .button.danger { color: var(--danger); }
 .button.danger { border-color: #e4b9b4; }
 .row-actions { white-space: nowrap; }
@@ -270,6 +272,8 @@ tr:last-child td { border-bottom: 0; }
 .dianxiaomi-run-state > .muted-value { grid-column: 1 / -1; font-size: 12px; overflow-wrap: anywhere; }
 .dianxiaomi-run-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 .dianxiaomi-run-actions .button { white-space: nowrap; }
+.dianxiaomi-worker-select-label { display: grid; gap: 4px; color: var(--muted); font-size: 11px; }
+.dianxiaomi-worker-select-label select { min-width: 210px; }
 .dianxiaomi-progress-grid { grid-template-columns: repeat(7, minmax(0, 1fr)); }
 .dianxiaomi-progress-grid > * { min-height: 68px; }
 .dianxiaomi-filter-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }

@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 
 from app.api.utils import canonical_product_url, extract_product_id, normalize_aliexpress_url
 from app.db.models import (
-    BrowserCollectionControl,
     BrowserCollectionWorker,
     DianxiaomiHandoff,
     DianxiaomiQueueControl,
@@ -83,11 +82,15 @@ def _approved_product_pages(db: Session, products: list[Product]) -> dict[int, d
     return approved
 
 
-def _product_page_identity_for_review(row: DianxiaomiHandoff) -> tuple[str, str, str]:
+def _require_product_page_identity_review(row: DianxiaomiHandoff) -> None:
     if row.status != "NEEDS_CONFIRMATION" or not _is_product_page_mismatch(
         row.error_type, row.error_message, row.detail_json
     ):
         raise ValueError("该任务不是待审核的商品页面 ID 不一致任务")
+
+
+def _product_page_identity_for_review(row: DianxiaomiHandoff) -> tuple[str, str, str]:
+    _require_product_page_identity_review(row)
     try:
         target_id = extract_product_id(row.target_url)
     except Exception as exc:
@@ -110,6 +113,22 @@ def _product_page_identity_for_review(row: DianxiaomiHandoff) -> tuple[str, str,
     if not target_is_known:
         raise ValueError("队列 URL 与监控商品及其已审核 URL 均不匹配，不能记录人工授权映射")
 
+    if isinstance(approved_page, dict):
+        approved_actual_id = str(approved_page.get("actual_product_id") or "")
+        try:
+            approved_url = normalize_aliexpress_url(str(approved_page.get("url") or ""), "product")
+            if (
+                str(approved_page.get("monitored_product_id") or "") == monitored_product_id
+                and approved_actual_id.isdigit()
+                and extract_product_id(approved_url) == approved_actual_id == target_id
+            ):
+                # This task already points at a manually approved page. Ignore
+                # mismatch evidence left by the earlier review when a later
+                # helper error is reviewed again.
+                return monitored_product_id, approved_actual_id, approved_url
+        except Exception:
+            pass
+
     mismatch = detail.get("product_page_mismatch")
     mismatch = mismatch if isinstance(mismatch, dict) else {}
     expected_id = str(mismatch.get("expected_product_id") or target_id)
@@ -122,10 +141,38 @@ def _product_page_identity_for_review(row: DianxiaomiHandoff) -> tuple[str, str,
         )
         if match:
             expected_id, actual_id = match.groups()
-    if expected_id != target_id or not actual_id.isdigit() or actual_id == expected_id:
-        raise ValueError("商品 ID 差异信息不完整或与队列 URL 不匹配，无法确认")
+    if expected_id != target_id:
+        raise ValueError("商品 ID 与队列 URL 不匹配，无法确认")
+    if not actual_id and actual_url:
+        try:
+            actual_id = extract_product_id(normalize_aliexpress_url(actual_url, "product"))
+        except Exception:
+            actual_id = ""
+    if not actual_id and isinstance(approved_page, dict):
+        # Reuse an approval only when the queued URL itself is the approved
+        # page. Never infer that the monitored product URL is the page that
+        # actually opened after an AliExpress redirect.
+        approved_actual_id = str(approved_page.get("actual_product_id") or "")
+        try:
+            approved_url = normalize_aliexpress_url(str(approved_page.get("url") or ""), "product")
+            if (
+                str(approved_page.get("monitored_product_id") or "") == monitored_product_id
+                and approved_actual_id.isdigit()
+                and extract_product_id(approved_url) == approved_actual_id == target_id
+            ):
+                actual_id = approved_actual_id
+                actual_url = row.target_url
+        except Exception:
+            pass
+    if not actual_id.isdigit():
+        raise ValueError("未记录实际商品 ID；请仅对已确认的商品 URL 执行人工确认")
 
     try:
+        # An already approved alternate URL can report the same URL ID as the
+        # page that was opened. The user is confirming that known URL, so keep
+        # it as the approved page instead of requiring a nonexistent mismatch.
+        if actual_id == expected_id and not actual_url:
+            actual_url = row.target_url
         actual_url = normalize_aliexpress_url(
             actual_url or canonical_product_url(actual_id), "product"
         )
@@ -154,27 +201,138 @@ def _aware(value: datetime | None) -> datetime | None:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
+def _worker_is_online(worker: BrowserCollectionWorker | None, now: datetime) -> bool:
+    heartbeat = _aware(worker.last_heartbeat_at) if worker else None
+    return heartbeat is not None and now - heartbeat <= timedelta(minutes=2)
+
+
+def _default_dianxiaomi_worker(db: Session) -> BrowserCollectionWorker | None:
+    workers = list(db.scalars(select(BrowserCollectionWorker)))
+    preferred = [
+        worker for worker in workers
+        if "第二台电脑" in worker.label
+        or "第二台电脑" in (worker.display_label_override or "")
+    ]
+    if not preferred:
+        return None
+    return max(
+        preferred,
+        key=lambda worker: (
+            _aware(worker.last_heartbeat_at)
+            or datetime.min.replace(tzinfo=timezone.utc),
+            worker.worker_id,
+        ),
+    )
+
+
+def dianxiaomi_worker_options(db: Session, selected_worker_id: str | None) -> list[dict]:
+    now = _now()
+    workers = list(
+        db.scalars(
+            select(BrowserCollectionWorker).order_by(
+                BrowserCollectionWorker.label,
+                BrowserCollectionWorker.worker_id,
+            )
+        )
+    )
+    labels: dict[str, int] = {}
+    for worker in workers:
+        label = worker.display_label_override or worker.label
+        labels[label] = labels.get(label, 0) + 1
+    return [
+        {
+            "worker_id": worker.worker_id,
+            "label": worker.display_label_override or worker.label,
+            "display_label": (
+                f"{worker.display_label_override or worker.label} · {worker.worker_id[:8]}"
+                if labels[worker.display_label_override or worker.label] > 1
+                else worker.display_label_override or worker.label
+            ),
+            "online": _worker_is_online(worker, now),
+            "last_heartbeat_at": worker.last_heartbeat_at,
+            "selected": worker.worker_id == selected_worker_id,
+        }
+        for worker in workers
+    ]
+
+
+def reconcile_dianxiaomi_queue_worker(db: Session) -> DianxiaomiQueueControl:
+    control = _queue_control(db, lock=True)
+    now = _now()
+    if not control.selected_worker_id:
+        default_worker = _default_dianxiaomi_worker(db)
+        if default_worker is not None:
+            control.selected_worker_id = default_worker.worker_id
+
+    worker = (
+        db.get(BrowserCollectionWorker, control.selected_worker_id)
+        if control.selected_worker_id else None
+    )
+    queued_work = db.scalar(
+        select(DianxiaomiHandoff.id)
+        .where(DianxiaomiHandoff.status.in_(LEASED_HANDOFF_STATUSES | {"QUEUED"}))
+        .limit(1)
+    )
+    online = _worker_is_online(worker, now)
+    if queued_work is not None and not online and not control.is_paused:
+        control.is_paused = True
+        control.paused_at = now
+        control.paused_reason = "selected_worker_offline"
+    elif online and control.is_paused and control.paused_reason == "selected_worker_offline":
+        control.is_paused = False
+        control.paused_at = None
+        control.paused_reason = None
+    db.commit()
+    db.refresh(control)
+    return control
+
+
+def select_dianxiaomi_worker(db: Session, worker_id: str) -> DianxiaomiQueueControl:
+    control = _queue_control(db, lock=True)
+    worker = db.get(BrowserCollectionWorker, worker_id)
+    if worker is None:
+        raise ValueError("所选采集电脑尚未连接监控台")
+    control.selected_worker_id = worker.worker_id
+    db.commit()
+    return reconcile_dianxiaomi_queue_worker(db)
+
+
 def _prepare_handoff_claim(
     db: Session, worker_id: str, *, resume_confirmed: bool = False
 ) -> tuple[DianxiaomiQueueControl, datetime] | None:
     now = _now()
-    browser_control = db.scalar(
-        select(BrowserCollectionControl)
-        .where(BrowserCollectionControl.id == 1)
-        .with_for_update()
+    control = _queue_control(db, lock=True)
+    if not control.selected_worker_id:
+        default_worker = _default_dianxiaomi_worker(db)
+        if default_worker is not None:
+            control.selected_worker_id = default_worker.worker_id
+    selected_worker_id = control.selected_worker_id
+    selected_worker = (
+        db.get(BrowserCollectionWorker, selected_worker_id)
+        if selected_worker_id else None
     )
-    selected_worker_id = browser_control.selected_worker_id if browser_control else None
+    selected_online = _worker_is_online(selected_worker, now)
     worker = db.get(BrowserCollectionWorker, worker_id)
-    heartbeat = _aware(worker.last_heartbeat_at) if worker else None
-    if (
-        not selected_worker_id
-        or selected_worker_id != worker_id
-        or heartbeat is None
-        or now - heartbeat > timedelta(minutes=2)
-    ):
+    if not selected_worker_id or not selected_online:
+        queued_work = db.scalar(
+            select(DianxiaomiHandoff.id)
+            .where(DianxiaomiHandoff.status == "QUEUED")
+            .limit(1)
+        )
+        if queued_work is not None and not control.is_paused:
+            control.is_paused = True
+            control.paused_at = now
+            control.paused_reason = "selected_worker_offline"
+        db.commit()
+        return None
+    if selected_worker_id != worker_id or not _worker_is_online(worker, now):
+        db.commit()
         return None
 
-    control = _queue_control(db, lock=True)
+    if control.is_paused and control.paused_reason == "selected_worker_offline":
+        control.is_paused = False
+        control.paused_at = None
+        control.paused_reason = None
     if control.is_paused and not (
         resume_confirmed and control.paused_reason == "needs_confirmation"
     ):
@@ -253,7 +411,17 @@ def pause_dianxiaomi_queue(
 
 
 def resume_dianxiaomi_queue(db: Session) -> DianxiaomiQueueControl:
-    control = _queue_control(db)
+    control = _queue_control(db, lock=True)
+    if not control.selected_worker_id:
+        default_worker = _default_dianxiaomi_worker(db)
+        if default_worker is not None:
+            control.selected_worker_id = default_worker.worker_id
+    worker = (
+        db.get(BrowserCollectionWorker, control.selected_worker_id)
+        if control.selected_worker_id else None
+    )
+    if not _worker_is_online(worker, _now()):
+        raise ValueError("店小秘指定采集电脑离线，队列会在它重新在线后自动继续")
     control.is_paused = False
     control.paused_at = None
     control.paused_reason = None
@@ -265,18 +433,26 @@ def resume_dianxiaomi_queue(db: Session) -> DianxiaomiQueueControl:
 def record_dianxiaomi_heartbeat(
     db: Session, worker_id: str
 ) -> DianxiaomiQueueControl:
-    control = _queue_control(db)
+    control = _queue_control(db, lock=True)
     now = _now()
-    control.last_heartbeat_at = now
-    control.worker_id = worker_id
-    # The Dianxiaomi poll is also proof that this registered Chrome profile is
-    # alive. Refresh only an existing collector; this never selects a machine.
+    if not control.selected_worker_id:
+        default_worker = _default_dianxiaomi_worker(db)
+        if default_worker is not None:
+            control.selected_worker_id = default_worker.worker_id
+    selected_worker_id = control.selected_worker_id
+    if selected_worker_id == worker_id:
+        control.last_heartbeat_at = now
+        control.worker_id = worker_id
+    # A queue poll also proves that its registered Chrome profile is alive.
+    # The dedicated queue target is only defaulted when it has not been set.
     browser_worker = db.get(BrowserCollectionWorker, worker_id)
     if browser_worker is not None:
         browser_worker.last_heartbeat_at = now
     # Worker liveness must not renew every handoff assigned to this extension.
     # A restarted worker can otherwise keep legacy OPENED rows leased forever.
     db.commit()
+    if selected_worker_id == worker_id:
+        return reconcile_dianxiaomi_queue_worker(db)
     db.refresh(control)
     return control
 
@@ -416,7 +592,12 @@ def update_handoff(
     row.error_type = error_type
     row.error_message = error_message
     if detail is not None:
-        row.detail_json = detail
+        previous_detail = row.detail_json if isinstance(row.detail_json, dict) else {}
+        merged_detail = dict(detail)
+        previous_approval = previous_detail.get("approved_product_page")
+        if "approved_product_page" not in merged_detail and isinstance(previous_approval, dict):
+            merged_detail["approved_product_page"] = previous_approval
+        row.detail_json = merged_detail
     if worker_id:
         row.worker_id = worker_id
     if status in LEASED_HANDOFF_STATUSES:
@@ -461,6 +642,7 @@ def confirm_product_page_identity(
 ) -> DianxiaomiHandoff:
     expected_id, actual_id, actual_url = _product_page_identity_for_review(row)
     detail = dict(row.detail_json) if isinstance(row.detail_json, dict) else {}
+    detail.pop("product_page_mismatch", None)
     detail["approved_product_page"] = {
         "monitored_product_id": expected_id,
         "actual_product_id": actual_id,
@@ -487,7 +669,7 @@ def confirm_product_page_identity(
 def reject_product_page_identity(
     db: Session, row: DianxiaomiHandoff
 ) -> DianxiaomiHandoff:
-    _product_page_identity_for_review(row)
+    _require_product_page_identity_review(row)
     row.status = "CANCELED"
     row.completed_at = _now()
     row.error_type = "product_page_identity_rejected"

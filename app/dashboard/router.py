@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import (
     CollectionAttempt,
+    DianxiaomiHandoff,
     ManualCollectionTask,
     Product,
     ProductDailyMetric,
@@ -56,6 +57,43 @@ def _format_store_added_at(value: datetime) -> str:
 def _is_admin(request: Request) -> bool:
     user = getattr(request.state, "user", None)
     return bool(user and user.role == "admin")
+
+
+def _latest_dianxiaomi_status_by_product(
+    db: Session, product_ids: list[int]
+) -> dict[int, str]:
+    unique_ids = sorted({int(product_id) for product_id in product_ids if product_id})
+    if not unique_ids:
+        return {}
+    ranked_handoffs = (
+        select(
+            DianxiaomiHandoff.product_id.label("product_id"),
+            DianxiaomiHandoff.status.label("status"),
+            func.row_number()
+            .over(
+                partition_by=DianxiaomiHandoff.product_id,
+                order_by=(
+                    func.coalesce(
+                        DianxiaomiHandoff.updated_at,
+                        DianxiaomiHandoff.requested_at,
+                    ).desc(),
+                    DianxiaomiHandoff.requested_at.desc(),
+                    DianxiaomiHandoff.id.desc(),
+                ),
+            )
+            .label("row_number"),
+        )
+        .where(DianxiaomiHandoff.product_id.in_(unique_ids))
+        .subquery()
+    )
+    return {
+        int(product_id): str(status)
+        for product_id, status in db.execute(
+            select(ranked_handoffs.c.product_id, ranked_handoffs.c.status).where(
+                ranked_handoffs.c.row_number == 1
+            )
+        )
+    }
 
 
 @router.get("/users", response_class=HTMLResponse)
@@ -352,6 +390,11 @@ def dashboard(request: Request, db: Session = Depends(get_db)) -> HTMLResponse:
     window_end = collection_window_end_date()
     score_dates = [window_end - timedelta(days=offset) for offset in range(7, 0, -1)]
     monitor_rows = _product_monitor_rows(db, products, history_dates, score_dates)
+    dianxiaomi_status_by_product = _latest_dianxiaomi_status_by_product(
+        db, [product.id for product in products]
+    )
+    for row in monitor_rows:
+        row["dianxiaomi_status"] = dianxiaomi_status_by_product.get(row["product"].id)
     monitor_row_by_product_id = {row["product"].id: row for row in monitor_rows}
     store_by_id = {store.id: store for store in stores}
     growth_metrics = []
@@ -526,6 +569,9 @@ def product_detail(
         .order_by(ReviewCollectionTask.created_at.desc())
         .limit(1)
     )
+    dianxiaomi_status = _latest_dianxiaomi_status_by_product(db, [product_id]).get(
+        product_id
+    )
     return templates.TemplateResponse(
         request,
         "product_detail.html",
@@ -533,6 +579,7 @@ def product_detail(
             "request": request,
             "is_admin": _is_admin(request),
             "product": product,
+            "dianxiaomi_status": dianxiaomi_status,
             "store": product.store,
             "snapshots": snapshots,
             "metrics": metrics,
@@ -670,6 +717,11 @@ def store_detail(
         .limit(1)
     )
     product_rows = _product_monitor_rows(db, products, history_dates, score_dates)
+    dianxiaomi_status_by_product = _latest_dianxiaomi_status_by_product(
+        db, [product.id for product in products]
+    )
+    for row in product_rows:
+        row["dianxiaomi_status"] = dianxiaomi_status_by_product.get(row["product"].id)
     return templates.TemplateResponse(
         request,
         "store_detail.html",

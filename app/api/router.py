@@ -35,6 +35,7 @@ from app.api.schemas import (
     DianxiaomiHandoffRead,
     DianxiaomiHandoffStatusRequest,
     DianxiaomiQueueHeartbeatRequest,
+    DianxiaomiWorkerSelectRequest,
     DianxiaomiWorkerHandoffRead,
     DianxiaomiWorkerStatusRequest,
     BrowserStoreDiscoveryRead,
@@ -172,8 +173,11 @@ from app.services.dianxiaomi import (
     pause_dianxiaomi_queue,
     record_dianxiaomi_heartbeat,
     reject_product_page_identity,
+    dianxiaomi_worker_options,
+    reconcile_dianxiaomi_queue_worker,
     resume_dianxiaomi_queue,
     retry_handoff,
+    select_dianxiaomi_worker,
     serialize_handoff,
     update_handoff,
 )
@@ -1014,12 +1018,7 @@ def reevaluate_selection_candidates(db: Session = Depends(get_db)) -> list[dict]
 def dianxiaomi_handoff_status(
     request: Request, db: Session = Depends(get_db)
 ) -> dict:
-    control = db.get(DianxiaomiQueueControl, 1)
-    if control is None:
-        control = DianxiaomiQueueControl(id=1)
-        db.add(control)
-        db.commit()
-        db.refresh(control)
+    control = reconcile_dianxiaomi_queue_worker(db)
     status_counts = dict(
         db.execute(
             select(DianxiaomiHandoff.status, func.count(DianxiaomiHandoff.id))
@@ -1033,7 +1032,14 @@ def dianxiaomi_handoff_status(
                 joinedload(DianxiaomiHandoff.product),
                 joinedload(DianxiaomiHandoff.store),
             )
-            .order_by(DianxiaomiHandoff.requested_at.desc(), DianxiaomiHandoff.id.desc())
+            .order_by(
+                func.coalesce(
+                    DianxiaomiHandoff.updated_at,
+                    DianxiaomiHandoff.requested_at,
+                ).desc(),
+                DianxiaomiHandoff.requested_at.desc(),
+                DianxiaomiHandoff.id.desc(),
+            )
             .limit(100)
         )
     )
@@ -1072,28 +1078,14 @@ def dianxiaomi_handoff_status(
             (row.claimed_at.replace(tzinfo=timezone.utc) if row.claimed_at.tzinfo is None else row.claimed_at) < stale_cutoff
             for row in active_rows
         )
-    browser_control = db.get(BrowserCollectionControl, 1)
-    selected_worker_id = browser_control.selected_worker_id if browser_control else None
-    selected_worker_row = (
-        db.get(BrowserCollectionWorker, selected_worker_id)
-        if selected_worker_id else None
+    workers = dianxiaomi_worker_options(db, control.selected_worker_id)
+    selected_worker = next(
+        (worker for worker in workers if worker["worker_id"] == control.selected_worker_id),
+        None,
     )
-    selected_heartbeat = selected_worker_row.last_heartbeat_at if selected_worker_row else None
-    if selected_heartbeat and selected_heartbeat.tzinfo is None:
-        selected_heartbeat = selected_heartbeat.replace(tzinfo=timezone.utc)
-    selected_worker_online = bool(
-        selected_heartbeat and now - selected_heartbeat <= timedelta(minutes=2)
-    )
-    selected_worker = (
-        {
-            "worker_id": selected_worker_id,
-            "label": selected_worker_row.label if selected_worker_row else (
-                browser_control.selected_worker_label if browser_control else selected_worker_id
-            ),
-            "online": selected_worker_online,
-        }
-        if selected_worker_id else None
-    )
+    selected_worker_id = control.selected_worker_id
+    selected_heartbeat = selected_worker["last_heartbeat_at"] if selected_worker else None
+    selected_worker_online = bool(selected_worker and selected_worker["online"])
     active_owner = None
     if latest_active and latest_active.worker_id:
         owner_worker = db.get(BrowserCollectionWorker, latest_active.worker_id)
@@ -1113,11 +1105,11 @@ def dianxiaomi_handoff_status(
         and latest_active_claimed_at >= stale_cutoff
     )
     waiting_reason = None
-    if queued_count and not control.is_paused:
+    if queued_count:
         if not selected_worker_id:
-            waiting_reason = "未选择采集电脑"
+            waiting_reason = "默认采集电脑尚未连接监控台"
         elif not selected_worker_online:
-            waiting_reason = "选中的采集电脑离线，任务仍保留在队列中"
+            waiting_reason = "店小秘指定采集电脑离线，任务保留在队列中等待它上线"
         elif active_owner_holds_lease:
             waiting_reason = "等待当前采集电脑完成在途任务后再交接"
     total_count = sum(status_counts.values())
@@ -1138,6 +1130,7 @@ def dianxiaomi_handoff_status(
         "last_heartbeat_at": selected_heartbeat,
         "worker_online": selected_worker_online,
         "selected_worker": selected_worker,
+        "workers": workers,
         "active_owner": active_owner,
         "waiting_for_owner": active_owner_holds_lease and bool(queued_count),
         "waiting_reason": waiting_reason,
@@ -1197,9 +1190,28 @@ def pause_dianxiaomi_handoff_queue(db: Session = Depends(get_db)) -> dict:
     }
 
 
+@router.post("/integrations/dianxiaomi/queue/worker")
+def select_dianxiaomi_queue_worker(
+    payload: DianxiaomiWorkerSelectRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        control = select_dianxiaomi_worker(db, payload.worker_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "selected_worker_id": control.selected_worker_id,
+        "paused": control.is_paused,
+        "paused_reason": control.paused_reason,
+    }
+
+
 @router.post("/integrations/dianxiaomi/queue/resume")
 def resume_dianxiaomi_handoff_queue(db: Session = Depends(get_db)) -> dict:
-    control = resume_dianxiaomi_queue(db)
+    try:
+        control = resume_dianxiaomi_queue(db)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     return {
         "paused": control.is_paused,
         "paused_at": control.paused_at,

@@ -198,6 +198,7 @@ async function submitDianxiaomi(productIds, button) {
   }
   const oldText = button.textContent;
   button.disabled = true;
+  button.dataset.dianxiaomiSubmitting = "true";
   button.textContent = "加入队列…";
   try {
     const result = await jsonRequest("/api/integrations/dianxiaomi/handoffs", {
@@ -211,8 +212,10 @@ async function submitDianxiaomi(productIds, button) {
   } catch (error) {
     notify(error.message, true);
   } finally {
-    button.disabled = false;
-    button.textContent = oldText;
+    delete button.dataset.dianxiaomiSubmitting;
+    const succeeded = button.dataset.dianxiaomiStatus === "SUCCEEDED";
+    button.disabled = succeeded;
+    button.textContent = succeeded ? "已采集到店小秘" : oldText;
   }
 }
 
@@ -236,6 +239,33 @@ let dianxiaomiItems = [];
 let dianxiaomiActiveFilter = "queued";
 let dianxiaomiCanDeleteFailed = false;
 let dianxiaomiFailedCount = 0;
+
+function updateDianxiaomiProductButtons(items) {
+  const latestStatusByProduct = new Map();
+  for (const item of items || []) {
+    const productId = Number(item.product_id);
+    if (productId && !latestStatusByProduct.has(productId)) {
+      latestStatusByProduct.set(productId, item.status);
+    }
+  }
+  document.querySelectorAll(".dianxiaomi-product").forEach((button) => {
+    const latestStatus = latestStatusByProduct.get(Number(button.dataset.productId));
+    if (!latestStatus) return;
+    const succeeded = latestStatus === "SUCCEEDED";
+    button.dataset.dianxiaomiStatus = latestStatus;
+    if (button.dataset.dianxiaomiSubmitting === "true") return;
+    button.textContent = succeeded ? "已采集到店小秘" : "采集到店小秘";
+    button.classList.toggle("is-collected", succeeded);
+    button.disabled = succeeded || button.dataset.dianxiaomiSubmitting === "true";
+    if (succeeded) {
+      button.title = "店小秘已成功采集";
+      button.setAttribute("aria-label", "已采集到店小秘");
+    } else {
+      button.removeAttribute("title");
+      button.removeAttribute("aria-label");
+    }
+  });
+}
 
 const dianxiaomiFilterStatuses = {
   queued: ["QUEUED"],
@@ -273,9 +303,12 @@ function updateDianxiaomiDeleteControls() {
 
 async function refreshDianxiaomiStatus() {
   const section = document.querySelector("#dianxiaomi-status");
-  if (!section) return;
+  const hasProductActions = document.querySelectorAll(".dianxiaomi-product").length > 0;
+  if (!section && !hasProductActions) return;
   try {
-    const status = await jsonRequest(section.dataset.statusEndpoint);
+    const status = await jsonRequest(section?.dataset.statusEndpoint || "/api/integrations/dianxiaomi/status");
+    updateDianxiaomiProductButtons(status.items || []);
+    if (!section) return status;
     Object.keys(status).forEach((key) => {
       const target = section.querySelector(`[data-dianxiaomi-value="${key}"]`);
       if (target) target.textContent = status[key];
@@ -300,16 +333,33 @@ function updateDianxiaomiQueue(status) {
   const heartbeat = document.querySelector("#dianxiaomi-last-heartbeat");
   const resume = document.querySelector("#dianxiaomi-queue-resume");
   const pause = document.querySelector("#dianxiaomi-queue-pause");
+  const workerSelect = document.querySelector("#dianxiaomi-worker-select");
+  const workerSave = document.querySelector("#dianxiaomi-worker-select-save");
+  if (workerSelect) {
+    const currentValue = workerSelect.value;
+    workerSelect.replaceChildren(new Option("请选择店小秘采集电脑", ""));
+    for (const worker of status.workers || []) {
+      workerSelect.add(new Option(
+        `${worker.label} · ${worker.worker_id.slice(0, 8)} · ${worker.online ? "在线" : "离线"}`,
+        worker.worker_id,
+      ));
+    }
+    workerSelect.value = status.selected_worker?.worker_id || currentValue || "";
+    workerSelect.disabled = !(status.workers || []).length;
+  }
+  if (workerSave) workerSave.disabled = !(status.workers || []).length;
   if (online) {
     const selected = status.selected_worker;
     online.className = `status ${selected?.online ? "success" : "pending"}`;
     online.textContent = selected
-      ? `当前采集电脑：${selected.label} · ${selected.online ? "在线" : "离线"}`
-      : "尚未选择采集电脑";
+      ? `店小秘采集电脑：${selected.display_label || selected.label} · ${selected.online ? "在线" : "离线"}`
+      : "默认第二台电脑尚未连接监控台";
   }
   if (state) {
     state.textContent = status.paused
-      ? status.paused_reason === "needs_confirmation" ? "等待人工确认，队列已暂停" : "店小秘队列已手动暂停"
+      ? status.paused_reason === "needs_confirmation" ? "等待人工确认，队列已暂停"
+        : status.paused_reason === "selected_worker_offline" ? "指定电脑离线，队列已暂停；上线后自动继续"
+        : "店小秘队列已手动暂停"
       : status.waiting_for_owner ? "等待上一台采集电脑的在途任务结束"
       : status.waiting_reason ? status.waiting_reason
       : status.needs_confirmation_count ? "有任务等待人工确认"
@@ -338,7 +388,9 @@ function updateDianxiaomiQueue(status) {
     resume.hidden = !status.paused && !status.queued_count;
     resume.textContent = status.paused_reason === "needs_confirmation"
       ? "验证完成，继续队列"
+      : status.paused_reason === "selected_worker_offline" ? "等待采集电脑上线"
       : status.paused ? "继续店小秘队列" : "启动店小秘队列";
+    resume.disabled = !status.selected_worker?.online;
   }
   if (pause) pause.hidden = Boolean(status.paused) || !(status.queued_count || status.processing_count || status.submitted_count);
 }
@@ -486,6 +538,30 @@ document.querySelector("#dianxiaomi-queue-resume")?.addEventListener("click", as
     window.dispatchEvent(new Event("aliexpress-monitor:dianxiaomi-queue-requested"));
     notify("店小秘队列已恢复，将从待处理位置继续");
     await refreshDianxiaomiStatus();
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+document.querySelector("#dianxiaomi-worker-select-save")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const workerId = document.querySelector("#dianxiaomi-worker-select")?.value;
+  if (!workerId) {
+    notify("请先选择店小秘采集电脑", true);
+    return;
+  }
+  button.disabled = true;
+  try {
+    const result = await jsonRequest("/api/integrations/dianxiaomi/queue/worker", {
+      method: "POST",
+      body: JSON.stringify({ worker_id: workerId }),
+    });
+    await refreshDianxiaomiStatus();
+    notify(result.paused
+      ? "采集电脑已保存；该电脑离线，队列已暂停并等待它上线"
+      : "店小秘采集电脑已保存；后续任务只由这台电脑领取");
   } catch (error) {
     notify(error.message, true);
   } finally {

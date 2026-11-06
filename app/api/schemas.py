@@ -668,6 +668,10 @@ class DianxiaomiQueueHeartbeatRequest(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
 
 
+class DianxiaomiWorkerSelectRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+
+
 class DianxiaomiHandoffStatusRequest(BaseModel):
     status: str = Field(
         pattern="^(OPENED|FILLED|COLLECTING|SUCCEEDED|FAILED|NEEDS_CONFIRMATION|CANCELED)$"

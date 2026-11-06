@@ -33,6 +33,17 @@ function productIdFromUrl(url) {
   }
 }
 
+function dianxiaomiProductPageMismatch(targetUrl, actualUrl) {
+  const expectedProductId = productIdFromUrl(targetUrl);
+  const actualProductId = productIdFromUrl(actualUrl);
+  if (!expectedProductId || !actualProductId || expectedProductId === actualProductId) return null;
+  return {
+    expected_product_id: expectedProductId,
+    actual_product_id: actualProductId,
+    actual_url: actualUrl,
+  };
+}
+
 function monitoredProductIdFromUrl(url) {
   try {
     const parsed = new URL(url);
@@ -374,12 +385,10 @@ async function groupAutomationTabs(tabIds, windowId) {
   }
 }
 
-async function ensureAutomationWindow({ ensureIdle = true, focus = null } = {}) {
+async function ensureAutomationWindow({ ensureIdle = true } = {}) {
   const state = await automationState();
-  const foregroundCollection = focus ?? state.browserCollectionWorkerMode === true;
-  const windowState = foregroundCollection
-    ? "maximized"
-    : state.browserCollectionIsolatedProfileAuthorized === true ? "normal" : "minimized";
+  const windowState = state.browserCollectionWorkerMode === true
+    || state.browserCollectionIsolatedProfileAuthorized === true ? "normal" : "minimized";
   const dashboardTab = state.automationDashboardTabId
     ? await chrome.tabs.get(state.automationDashboardTabId).catch(() => null)
     : null;
@@ -392,10 +401,12 @@ async function ensureAutomationWindow({ ensureIdle = true, focus = null } = {}) 
       : null;
   if (!reuseDashboardWindow && workerWindow?.id && workerWindow.id === dashboardTab?.windowId) workerWindow = null;
   if (workerWindow?.id) {
-    await chrome.windows.update(workerWindow.id, { focused: foregroundCollection, state: windowState }).catch(() => undefined);
+    if (!reuseDashboardWindow) {
+      await chrome.windows.update(workerWindow.id, { focused: false, state: windowState }).catch(() => undefined);
+    }
   } else if (!reuseDashboardWindow) {
     workerWindow = await chrome.windows.create({
-      focused: foregroundCollection,
+      focused: false,
       state: windowState,
       type: "normal",
       url: "about:blank",
@@ -454,9 +465,6 @@ async function migrateTrackedAutomationTabs(state) {
   if (Number.isInteger(state.automationTabId)) {
     await chrome.tabs.update(state.automationTabId, { active: true }).catch(() => undefined);
   }
-  if (state.browserCollectionWorkerMode === true) {
-    await chrome.windows.update(workerWindow.id, { focused: true, state: "maximized" }).catch(() => undefined);
-  }
   const migratedState = await automationState();
   if (!reuseDashboardWindow) await ensureIdleAutomationTab(workerWindow, migratedState);
   return automationState();
@@ -470,10 +478,13 @@ async function guardAutomationWindowFocus(windowId) {
     || Number.isInteger(state.foregroundSingleTestItemId)
     || !Number.isFinite(Number(state.automationWindowFocusGuardUntil))
     || Number(state.automationWindowFocusGuardUntil) < Date.now()) return;
-  const foregroundCollection = state.browserCollectionWorkerMode === true;
+  if (state.browserCollectionWorkerMode === true) {
+    await chrome.storage.local.remove("automationWindowFocusGuardUntil");
+    return;
+  }
   await chrome.windows.update(windowId, {
-    focused: foregroundCollection,
-    state: foregroundCollection ? "maximized" : state.browserCollectionIsolatedProfileAuthorized === true
+    focused: false,
+    state: state.browserCollectionIsolatedProfileAuthorized === true
       || state.automationItem?.target_type === "STORE" ? "normal" : "minimized",
   }).catch(() => undefined);
   await chrome.storage.local.remove("automationWindowFocusGuardUntil");
@@ -2020,8 +2031,6 @@ async function focusWindowForSingleProductTest(item, workerWindowId, prefetch, {
   }
   if (deferFocus) return;
 
-  await chrome.windows.update(workerWindowId, { state: "normal" }).catch(() => undefined);
-  await chrome.windows.update(workerWindowId, { focused: true }).catch(() => undefined);
   const workerWindow = await chrome.windows.get(workerWindowId).catch(() => null);
   await chrome.storage.local.set({ foregroundSingleTestFocusConfirmed: workerWindow?.focused === true });
 }
@@ -2071,16 +2080,6 @@ async function closeAutomationWindow() {
   const tabs = [state.automationTabId, state.prefetchedTabId, state.idleAutomationTabId]
     .filter((tabId) => tabId && tabId !== state.automationDashboardTabId);
   await Promise.all([...new Set(tabs)].map((tabId) => chrome.tabs.remove(tabId).catch(() => undefined)));
-}
-
-async function keepAutomationWindowForeground() {
-  const state = await automationState();
-  if (state.automationWindowBackground && state.automationWindowId && state.browserCollectionWorkerMode === true) {
-    await chrome.windows.update(state.automationWindowId, {
-      focused: true,
-      state: "maximized",
-    }).catch(() => undefined);
-  }
 }
 
 async function notifyChallenge(item, { provider = "ALIEXPRESS", message = null } = {}) {
@@ -2306,22 +2305,12 @@ async function processAutomationTabInternal(tabId, generation = null) {
       }),
     });
     await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
-    await keepAutomationWindowForeground();
     await closeItemTab(tabId);
     return;
   }
   if (state.automationTaskKind === "POOL_RESET") {
     await processPoolResetTab(tabId, state);
     return;
-  }
-  if (item.target_type === "STORE") {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab?.windowId) {
-      await chrome.windows.update(tab.windowId, {
-        focused: state.browserCollectionWorkerMode === true,
-        state: state.browserCollectionWorkerMode === true ? "maximized" : "normal",
-      }).catch(() => undefined);
-    }
   }
   const result = await withTimeout(
     item.target_type === "STORE"
@@ -2406,7 +2395,6 @@ async function processAutomationTabInternal(tabId, generation = null) {
   }
   await chrome.notifications.clear(NOTIFICATION_ID).catch(() => undefined);
   await chrome.notifications.clear(FIRST_PRODUCT_NOTIFICATION_ID).catch(() => undefined);
-  await keepAutomationWindowForeground();
   await closeItemTab(tabId);
 }
 
@@ -2487,10 +2475,8 @@ async function openAutomationItem(item, taskKind = "PRODUCT", knownKeys = [], { 
   if (prefetch && state.prefetchedItem) return;
   if (!prefetch && state.automationItem) return;
   const startUrl = item.target_type === "STORE" ? storeCollectionStartUrl(item) : item.target_url;
-  const singleProductCheck = !prefetch && item.target_key === `product:${item.product_id}:single`;
   const workerWindow = await ensureAutomationWindow({
     ensureIdle: !prefetch && state.browserCollectionRemoteProfileEnabled !== true,
-    focus: singleProductCheck ? false : null,
   });
   if (!workerWindow) {
     throw new Error(state.browserCollectionRemoteProfileEnabled === true
@@ -3032,17 +3018,34 @@ async function sendDianxiaomiProductMessage(tabId, message) {
 }
 
 async function waitForDianxiaomiProductTab(tabId, expectedProductId) {
+  const expectedId = String(expectedProductId);
+  let mismatchSince = 0;
   for (let attempt = 0; attempt < 120; attempt += 1) {
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) throw new Error("店小秘工作窗口的商品页已关闭");
-    if (tab.status === "complete" && productIdFromUrl(tab.url) === String(expectedProductId)) return tab;
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    const currentProductId = productIdFromUrl(tab.url);
+    if (currentProductId === expectedId && !tab.pendingUrl) return tab;
+    if (tab.pendingUrl) {
+      mismatchSince = 0;
+    } else if (currentProductId && currentProductId !== expectedId) {
+      if (!mismatchSince) mismatchSince = Date.now();
+      if (tab.status === "complete" || Date.now() - mismatchSince >= 1500) break;
+    } else {
+      mismatchSince = 0;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   const actualProductId = productIdFromUrl(tab?.url);
-  throw new Error(
+  const error = new Error(
     `店小秘工作窗口未加载队列商品（目标商品 ID ${expectedProductId}，当前商品 ID ${actualProductId || "未识别"}）`,
   );
+  const mismatch = dianxiaomiProductPageMismatch(
+    `https://www.aliexpress.com/item/${expectedProductId}.html`,
+    tab?.url,
+  );
+  if (mismatch) error.detail = { product_page_mismatch: mismatch };
+  throw error;
 }
 
 function isDianxiaomiWorkerDashboardUrl(value) {
@@ -3093,13 +3096,14 @@ async function ensureDianxiaomiProductTab(url, dashboardWindowId) {
     tab = await chrome.tabs.update(tab.id, { active: true });
   }
 
-  tab = await waitForDianxiaomiProductTab(tab.id, productIdFromUrl(url));
   await chrome.storage.local.set({
     dianxiaomiDashboardTabId: dashboard.tab.id,
     dianxiaomiDashboardWindowId: dashboardWindowId,
     dianxiaomiWindowId: dashboardWindowId,
     dianxiaomiTabId: tab.id,
+    dianxiaomiActiveTabId: tab.id,
   });
+  tab = await waitForDianxiaomiProductTab(tab.id, productIdFromUrl(url));
   return { tab, windowId: dashboardWindowId };
 }
 
@@ -3117,6 +3121,7 @@ function isNonBlockingDianxiaomiProductMismatch(itemOrMessage) {
     ? itemOrMessage
     : itemOrMessage?.error_message || itemOrMessage?.message || "";
   return errorType === "product_page_mismatch"
+    || Boolean(itemOrMessage?.detail?.product_page_mismatch)
     || message.includes("店小秘工作窗口未加载队列商品")
     || message.includes("工作商品页已切换，无法确认当前队列商品的采集结果");
 }
@@ -3133,6 +3138,7 @@ async function updateDianxiaomiHandoffs(baseUrl, handoffs, workerId, status, res
           ? result?.error_type || (isNonBlockingDianxiaomiProductMismatch(result) ? "product_page_mismatch" : "manual_confirmation_required")
           : null,
       error_message: ["FAILED", "NEEDS_CONFIRMATION"].includes(status) ? result?.message || null : null,
+      detail: result?.detail || undefined,
     }),
   }, baseUrl).catch(() => null)));
   return responses.every(Boolean);
@@ -3152,9 +3158,20 @@ async function finishDianxiaomiHandoff(baseUrl, handoff, workerId, result, tabId
       : ["waiting_helper", "not_started"].includes(result?.state)
         ? "OPENED"
         : "NEEDS_CONFIRMATION";
-  const resultForUpdate = status === "NEEDS_CONFIRMATION" && !result?.message
+  let resultForUpdate = status === "NEEDS_CONFIRMATION" && !result?.message
     ? { ...(result || {}), message: "店小秘助手未明确确认采集成功，请检查采集箱后再决定是否重新排队" }
     : result;
+  if (status === "NEEDS_CONFIRMATION" && !resultForUpdate?.detail?.product_page_mismatch && tabId) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    const mismatch = dianxiaomiProductPageMismatch(handoff.target_url, tab?.url);
+    if (mismatch) {
+      resultForUpdate = {
+        ...(resultForUpdate || {}),
+        error_type: "product_page_mismatch",
+        detail: { ...(resultForUpdate?.detail || {}), product_page_mismatch: mismatch },
+      };
+    }
+  }
   const classifiedResult = status === "NEEDS_CONFIRMATION" && !resultForUpdate?.error_type
     ? {
       ...(resultForUpdate || {}),
@@ -3185,12 +3202,18 @@ async function finishDianxiaomiHandoff(baseUrl, handoff, workerId, result, tabId
   setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 2000);
 }
 
-async function pauseDianxiaomiHandoff(baseUrl, handoff, workerId, message, tabId = null) {
+async function pauseDianxiaomiHandoff(baseUrl, handoff, workerId, message, tabId = null, detail = null) {
+  let mismatch = detail?.product_page_mismatch || null;
+  if (!mismatch && tabId && isNonBlockingDianxiaomiProductMismatch(message)) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    mismatch = dianxiaomiProductPageMismatch(handoff.target_url, tab?.url);
+  }
   const result = {
     message,
-    error_type: isNonBlockingDianxiaomiProductMismatch(message)
+    error_type: mismatch || isNonBlockingDianxiaomiProductMismatch(message)
       ? "product_page_mismatch"
       : "manual_confirmation_required",
+    ...(mismatch ? { detail: { product_page_mismatch: mismatch } } : {}),
   };
   const updated = await updateDianxiaomiHandoffs(baseUrl, [handoff], workerId, "NEEDS_CONFIRMATION", result);
   if (!updated) return;
@@ -3340,6 +3363,7 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
         workerId,
         `${error.message || "店小秘助手页面操作失败"}。请检查商品页和店小秘采集箱后再决定是否重新排队。`,
         (await chrome.storage.local.get("dianxiaomiActiveTabId")).dianxiaomiActiveTabId,
+        error.detail || null,
       );
     }
     // The dashboard may be offline; claimed tasks remain protected by the backend lease.

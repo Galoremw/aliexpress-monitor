@@ -5,7 +5,6 @@ import pytest
 
 from app.api.service_auth import require_dianxiaomi_service_token
 from app.db.models import (
-    BrowserCollectionControl,
     BrowserCollectionWorker,
     DianxiaomiHandoff,
     DianxiaomiQueueControl,
@@ -37,13 +36,12 @@ def register_dianxiaomi_worker(
             last_heartbeat_at=heartbeat,
         )
     )
-    control = db_session.get(BrowserCollectionControl, 1)
+    control = db_session.get(DianxiaomiQueueControl, 1)
     if control is None:
-        control = BrowserCollectionControl(id=1)
+        control = DianxiaomiQueueControl(id=1)
         db_session.add(control)
     if selected:
         control.selected_worker_id = worker_id
-        control.selected_worker_label = worker_id
     db_session.commit()
 
 
@@ -525,11 +523,9 @@ def test_dianxiaomi_status_reports_selected_worker_and_active_owner(client, db_s
 
     assert status.status_code == 200
     body = status.json()
-    assert body["selected_worker"] == {
-        "worker_id": selected_worker_id,
-        "label": selected_worker_id,
-        "online": True,
-    }
+    assert body["selected_worker"]["worker_id"] == selected_worker_id
+    assert body["selected_worker"]["label"] == selected_worker_id
+    assert body["selected_worker"]["online"] is True
     assert body["worker_online"] is True
     assert body["active_owner"] == {
         "worker_id": active_owner_id,
