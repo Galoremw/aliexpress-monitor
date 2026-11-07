@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 22245)
-Total output lines: 2463
-
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -782,7 +779,807 @@ def collect_from_manual_input(
     payload: ManualCollectionRequest,
     db: Session = Depends(get_db),
 ) -> ProductSnapshot:
-    return _sav…7245 tokens truncated…et(
+    return _save_channel_observation(db, payload, "MANUAL")
+
+
+@router.get("/collection/pending", response_model=list[CollectionPendingRead])
+def list_pending_manual_collection(db: Session = Depends(get_db)) -> list[dict]:
+    tasks = list(
+        db.scalars(
+            select(ManualCollectionTask)
+            .join(Product, Product.id == ManualCollectionTask.product_id)
+            .join(Store, Store.id == Product.store_id)
+            .where(ManualCollectionTask.status == "PENDING", Product.status == "active")
+            .order_by(ManualCollectionTask.created_at.desc())
+        )
+    )
+    rows: list[dict] = []
+    for task in tasks:
+        product = task.product
+        latest_success = db.scalar(
+            select(ProductSnapshot)
+            .where(
+                ProductSnapshot.product_id == product.id,
+                ProductSnapshot.status == "VALID",
+            )
+            .order_by(ProductSnapshot.captured_at.desc(), ProductSnapshot.id.desc())
+            .limit(1)
+        )
+        rows.append(
+            {
+                "product_id": product.id,
+                "platform_product_id": product.aliexpress_product_id,
+                "title": product.title,
+                "product_url": product.url,
+                "store_id": product.store_id,
+                "store_name": product.store.name,
+                "last_success_at": latest_success.captured_at if latest_success else None,
+                "failed_at": task.last_attempt.attempted_at if task.last_attempt else None,
+                "failure_reason": task.reason,
+            }
+        )
+    return rows
+
+
+@router.get("/collection/attempts", response_model=list[CollectionAttemptRead])
+def list_collection_attempts(
+    product_id: int | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[CollectionAttempt]:
+    statement = select(CollectionAttempt).order_by(CollectionAttempt.attempted_at.desc()).limit(limit)
+    if product_id is not None:
+        statement = statement.where(CollectionAttempt.product_id == product_id)
+    return list(db.scalars(statement))
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs",
+    response_model=DianxiaomiHandoffBatchRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_dianxiaomi_handoffs(
+    payload: DianxiaomiHandoffCreate,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch_id, rows = create_handoff_batch(db, payload.product_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    requested_count = len(dict.fromkeys(payload.product_ids))
+    return {
+        "batch_id": batch_id,
+        "total_count": requested_count,
+        "queued_count": len(rows),
+        "reused_count": requested_count - len(rows),
+        "items": [serialize_handoff(row) for row in rows],
+    }
+
+
+@router.get(
+    "/integrations/dianxiaomi/handoffs",
+    response_model=list[DianxiaomiHandoffRead],
+)
+def list_dianxiaomi_handoffs(
+    batch_id: str | None = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    statement = select(DianxiaomiHandoff).order_by(
+        DianxiaomiHandoff.requested_at.desc(), DianxiaomiHandoff.id.desc()
+    ).limit(limit)
+    if batch_id:
+        statement = statement.where(DianxiaomiHandoff.batch_id == batch_id)
+    return [serialize_handoff(row) for row in db.scalars(statement)]
+
+
+@router.post(
+    "/integrations/selection/candidates",
+    dependencies=[Depends(require_selection_service_token)],
+    status_code=status.HTTP_201_CREATED,
+)
+def import_workbench_candidates(
+    payload: SelectionCandidatesBatchImport,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        result = import_selection_candidates(db, payload.batch_id, payload.candidates)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result["created_count"] == 0:
+        response.status_code = status.HTTP_200_OK
+    current_run = get_today_run(db)
+    if current_run is not None:
+        ensure_browser_collection_run(db, current_run.target_date, trigger="MANUAL")
+    return result
+
+
+@router.get(
+    "/selection-qualification/rule",
+    response_model=SelectionQualificationRuleRead,
+)
+def get_selection_qualification_rule(db: Session = Depends(get_db)) -> dict:
+    rule = db.get(SelectionQualificationRule, 1)
+    minimum_total = rule.minimum_7d_increment_total if rule else None
+    minimum_positive_days = rule.minimum_positive_days if rule else None
+    return {
+        "minimum_7d_increment_total": minimum_total,
+        "minimum_positive_days": minimum_positive_days,
+        "configured": minimum_total is not None and minimum_positive_days is not None,
+        "timezone": "Asia/Shanghai",
+    }
+
+
+@router.put(
+    "/selection-qualification/rule",
+    response_model=SelectionQualificationRuleRead,
+)
+def update_selection_qualification_rule(
+    payload: SelectionQualificationRuleWrite,
+    db: Session = Depends(get_db),
+) -> dict:
+    rule = set_selection_rule(
+        db,
+        payload.minimum_7d_increment_total,
+        payload.minimum_positive_days,
+    )
+    evaluate_all_selection_candidates(db)
+    db.commit()
+    return {
+        "minimum_7d_increment_total": rule.minimum_7d_increment_total,
+        "minimum_positive_days": rule.minimum_positive_days,
+        "configured": (
+            rule.minimum_7d_increment_total is not None
+            and rule.minimum_positive_days is not None
+        ),
+        "timezone": "Asia/Shanghai",
+    }
+
+
+@router.get("/selection-qualification/candidates")
+def get_selection_candidates(db: Session = Depends(get_db)) -> list[dict]:
+    candidates = [
+        serialize_selection_candidate(candidate)
+        for candidate in list_selection_candidates(db)
+    ]
+    run = get_today_run(db)
+    collection_status_by_product = {
+        item.product_id: item.status
+        for item in (run.items if run else [])
+        if item.target_type == "PRODUCT" and item.product_id is not None
+    }
+    for candidate in candidates:
+        candidate["collection_status"] = collection_status_by_product.get(
+            candidate["product_id"]
+        )
+    return candidates
+
+
+@router.post("/selection-qualification/collect")
+def queue_selection_candidate_collection(db: Session = Depends(get_db)) -> dict:
+    existing_run = get_today_run(db)
+    existing_product_ids = {
+        item.product_id
+        for item in (existing_run.items if existing_run else [])
+        if item.target_type == "PRODUCT" and item.product_id is not None
+    }
+    run = ensure_browser_collection_run(db, trigger="MANUAL")
+    candidate_products = list(
+        db.scalars(
+            select(Product)
+            .join(SelectionCandidate, SelectionCandidate.product_id == Product.id)
+            .where(
+                Product.monitor_scope == "selection_candidate",
+                Product.status == "active",
+            )
+        )
+    )
+    candidate_items = [
+        item
+        for item in run.items
+        if item.target_type == "PRODUCT"
+        and item.product_id in {product.id for product in candidate_products}
+    ]
+    return {
+        "run_id": run.id,
+        "candidate_count": len(candidate_products),
+        "queued_count": sum(item.product_id not in existing_product_ids for item in candidate_items),
+        "items": [
+            {"product_id": item.product_id, "status": item.status, "target_url": item.target_url}
+            for item in candidate_items
+        ],
+    }
+
+
+@router.post("/selection-qualification/evaluate")
+def reevaluate_selection_candidates(db: Session = Depends(get_db)) -> list[dict]:
+    candidates = evaluate_all_selection_candidates(db)
+    db.commit()
+    candidates = [
+        serialize_selection_candidate(candidate)
+        for candidate in list_selection_candidates(db)
+    ]
+    run = get_today_run(db)
+    collection_status_by_product = {
+        item.product_id: item.status
+        for item in (run.items if run else [])
+        if item.target_type == "PRODUCT" and item.product_id is not None
+    }
+    for candidate in candidates:
+        candidate["collection_status"] = collection_status_by_product.get(
+            candidate["product_id"]
+        )
+    return candidates
+
+
+@router.get("/integrations/dianxiaomi/status")
+def dianxiaomi_handoff_status(
+    request: Request, db: Session = Depends(get_db)
+) -> dict:
+    control = reconcile_dianxiaomi_queue_worker(db)
+    status_counts = dict(
+        db.execute(
+            select(DianxiaomiHandoff.status, func.count(DianxiaomiHandoff.id))
+            .group_by(DianxiaomiHandoff.status)
+        ).all()
+    )
+    rows = list(
+        db.scalars(
+            select(DianxiaomiHandoff)
+            .options(
+                joinedload(DianxiaomiHandoff.product),
+                joinedload(DianxiaomiHandoff.store),
+            )
+            .order_by(
+                func.coalesce(
+                    DianxiaomiHandoff.updated_at,
+                    DianxiaomiHandoff.requested_at,
+                ).desc(),
+                DianxiaomiHandoff.requested_at.desc(),
+                DianxiaomiHandoff.id.desc(),
+            )
+            .limit(100)
+        )
+    )
+    latest_active = db.scalar(
+        select(DianxiaomiHandoff)
+        .where(
+            DianxiaomiHandoff.status.in_(
+                ACTIVE_HANDOFF_STATUSES - {"QUEUED"}
+            )
+        )
+        .order_by(DianxiaomiHandoff.requested_at, DianxiaomiHandoff.id)
+        .limit(1)
+    )
+    now = datetime.now(timezone.utc)
+    def count_for(status_value: str) -> int:
+        return int(status_counts.get(status_value, 0))
+
+    processing_count = sum(count_for(value) for value in ("CLAIMED", "OPENED", "FILLED"))
+    queued_count = count_for("QUEUED")
+    if control.active_run_started_at is None:
+        waiting_for_start_count = queued_count
+    else:
+        waiting_for_start_count = int(
+            db.scalar(
+                select(func.count(DianxiaomiHandoff.id)).where(
+                    DianxiaomiHandoff.status == "QUEUED",
+                    DianxiaomiHandoff.requested_at > control.active_run_started_at,
+                )
+            ) or 0
+        )
+    succeeded_count = count_for("SUCCEEDED")
+    failed_count = count_for("FAILED")
+    needs_confirmation_count = count_for("NEEDS_CONFIRMATION")
+    completed_count = succeeded_count + failed_count + count_for("CANCELED")
+    stale_cutoff = now - timedelta(minutes=10)
+    stalled_count = 0
+    if latest_active is not None:
+        active_rows = list(
+            db.scalars(
+                select(DianxiaomiHandoff).where(
+                    DianxiaomiHandoff.status.in_(ACTIVE_HANDOFF_STATUSES - {"QUEUED", "NEEDS_CONFIRMATION"}),
+                    DianxiaomiHandoff.claimed_at.is_not(None),
+                )
+            )
+        )
+        stalled_count = sum(
+            (row.claimed_at.replace(tzinfo=timezone.utc) if row.claimed_at.tzinfo is None else row.claimed_at) < stale_cutoff
+            for row in active_rows
+        )
+    workers = dianxiaomi_worker_options(db, control.selected_worker_id)
+    selected_worker = next(
+        (worker for worker in workers if worker["worker_id"] == control.selected_worker_id),
+        None,
+    )
+    selected_worker_id = control.selected_worker_id
+    selected_heartbeat = selected_worker["last_heartbeat_at"] if selected_worker else None
+    selected_worker_online = bool(selected_worker and selected_worker["online"])
+    active_owner = None
+    if latest_active and latest_active.worker_id:
+        owner_worker = db.get(BrowserCollectionWorker, latest_active.worker_id)
+        active_owner = {
+            "worker_id": latest_active.worker_id,
+            "label": owner_worker.label if owner_worker else latest_active.worker_id,
+        }
+    latest_active_claimed_at = latest_active.claimed_at if latest_active else None
+    if latest_active_claimed_at and latest_active_claimed_at.tzinfo is None:
+        latest_active_claimed_at = latest_active_claimed_at.replace(tzinfo=timezone.utc)
+    active_owner_holds_lease = bool(
+        latest_active
+        and latest_active.status in LEASED_HANDOFF_STATUSES
+        and latest_active.worker_id
+        and latest_active.worker_id != selected_worker_id
+        and latest_active_claimed_at
+        and latest_active_claimed_at >= stale_cutoff
+    )
+    waiting_reason = None
+    if queued_count:
+        if not selected_worker_id:
+            waiting_reason = "默认采集电脑尚未连接监控台"
+        elif not selected_worker_online:
+            waiting_reason = "店小秘指定采集电脑离线，任务保留在队列中等待它上线"
+        elif active_owner_holds_lease:
+            waiting_reason = "等待当前采集电脑完成在途任务后再交接"
+    total_count = sum(status_counts.values())
+    legacy_counts = {
+        "queued": queued_count,
+        "processing": processing_count + count_for("COLLECTING"),
+        "submitted": count_for("COLLECTING"),
+        "succeeded": succeeded_count,
+        "failed": failed_count,
+        "needs_confirmation": needs_confirmation_count,
+    }
+    return {
+        **legacy_counts,
+        "paused": control.is_paused,
+        "paused_at": control.paused_at,
+        "paused_reason": control.paused_reason,
+        "active_run_started_at": control.active_run_started_at,
+        "waiting_for_start_count": waiting_for_start_count,
+        "worker_id": control.worker_id,
+        "last_heartbeat_at": selected_heartbeat,
+        "worker_online": selected_worker_online,
+        "selected_worker": selected_worker,
+        "workers": workers,
+        "active_owner": active_owner,
+        "waiting_for_owner": active_owner_holds_lease and bool(queued_count),
+        "waiting_reason": waiting_reason,
+        "total_count": total_count,
+        "queued_count": queued_count,
+        "processing_count": processing_count,
+        "submitted_count": count_for("COLLECTING"),
+        "completed_count": completed_count,
+        "succeeded_count": succeeded_count,
+        "failed_count": failed_count,
+        "needs_confirmation_count": needs_confirmation_count,
+        "stalled_count": stalled_count,
+        "can_delete_failed": is_configured_admin_session(request, db),
+        "admin_delete_configured": bool(get_settings().auth_admin_username),
+        "current_item": serialize_handoff(latest_active) if latest_active else None,
+        "latest_at": rows[0].requested_at if rows else None,
+        "items": [serialize_handoff(row) for row in rows],
+        "latest": [serialize_handoff(row) for row in rows[:10]],
+    }
+
+
+@router.delete("/integrations/dianxiaomi/handoffs/failed")
+def delete_failed_dianxiaomi_handoffs(
+    db: Session = Depends(get_db),
+    _admin=Depends(require_dianxiaomi_admin),
+) -> dict:
+    return {"deleted_count": delete_failed_handoffs(db)}
+
+
+@router.delete("/integrations/dianxiaomi/handoffs/{handoff_id}")
+def delete_failed_dianxiaomi_handoff(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+    _admin=Depends(require_dianxiaomi_admin),
+) -> dict:
+    handoff = db.scalar(
+        select(DianxiaomiHandoff)
+        .where(DianxiaomiHandoff.id == handoff_id)
+        .with_for_update()
+    )
+    if handoff is None:
+        raise HTTPException(status_code=404, detail="店小秘任务不存在")
+    if handoff.status != "FAILED":
+        raise HTTPException(status_code=409, detail="只能删除采集失败的店小秘任务")
+    db.delete(handoff)
+    db.commit()
+    return {"deleted_count": 1}
+
+
+@router.post("/integrations/dianxiaomi/queue/pause")
+def pause_dianxiaomi_handoff_queue(db: Session = Depends(get_db)) -> dict:
+    control = pause_dianxiaomi_queue(db, "manual_pause")
+    return {
+        "paused": control.is_paused,
+        "paused_at": control.paused_at,
+        "paused_reason": control.paused_reason,
+    }
+
+
+@router.post("/integrations/dianxiaomi/queue/worker")
+def select_dianxiaomi_queue_worker(
+    payload: DianxiaomiWorkerSelectRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        control = select_dianxiaomi_worker(db, payload.worker_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "selected_worker_id": control.selected_worker_id,
+        "paused": control.is_paused,
+        "paused_reason": control.paused_reason,
+    }
+
+
+@router.post("/integrations/dianxiaomi/queue/resume")
+def resume_dianxiaomi_handoff_queue(db: Session = Depends(get_db)) -> dict:
+    try:
+        control = resume_dianxiaomi_queue(db)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return {
+        "paused": control.is_paused,
+        "paused_at": control.paused_at,
+        "paused_reason": control.paused_reason,
+    }
+
+
+@router.post("/integrations/dianxiaomi/queue/heartbeat")
+def dianxiaomi_worker_heartbeat(
+    payload: DianxiaomiQueueHeartbeatRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    control = record_dianxiaomi_heartbeat(db, payload.worker_id)
+    return {
+        "paused": control.is_paused,
+        "paused_reason": control.paused_reason,
+        "last_heartbeat_at": control.last_heartbeat_at,
+        "worker_id": control.worker_id,
+    }
+
+
+@router.post(
+    "/integrations/dianxiaomi/worker/heartbeat",
+    dependencies=[Depends(require_dianxiaomi_service_token)],
+)
+def dianxiaomi_docker_worker_heartbeat(
+    worker_id: str = Header(alias="X-Dianxiaomi-Worker-ID", min_length=1, max_length=128),
+    db: Session = Depends(get_db),
+) -> dict:
+    control = record_dianxiaomi_heartbeat(db, worker_id)
+    return {
+        "paused": control.is_paused,
+        "paused_reason": control.paused_reason,
+        "last_heartbeat_at": control.last_heartbeat_at,
+        "worker_id": control.worker_id,
+    }
+
+
+@router.post(
+    "/integrations/dianxiaomi/worker/handoffs/claim",
+    response_model=DianxiaomiWorkerHandoffRead | None,
+    dependencies=[Depends(require_dianxiaomi_service_token)],
+)
+def claim_dianxiaomi_docker_handoff(
+    worker_id: str = Header(alias="X-Dianxiaomi-Worker-ID", min_length=1, max_length=128),
+    db: Session = Depends(get_db),
+) -> dict | None:
+    row = claim_next_handoff(db, worker_id)
+    if row is None:
+        return None
+    return {
+        "handoff_id": row.id,
+        "batch_id": row.batch_id,
+        "aliexpress_product_id": row.product.aliexpress_product_id,
+        "url": row.target_url,
+        "attempt_count": row.attempt_count,
+        "status": row.status,
+        "detail": row.detail_json,
+    }
+
+
+@router.post(
+    "/integrations/dianxiaomi/worker/handoffs/{handoff_id}/status",
+    response_model=DianxiaomiWorkerHandoffRead,
+    dependencies=[Depends(require_dianxiaomi_service_token)],
+)
+def update_dianxiaomi_docker_handoff(
+    handoff_id: int,
+    payload: DianxiaomiWorkerStatusRequest,
+    worker_id: str = Header(alias="X-Dianxiaomi-Worker-ID", min_length=1, max_length=128),
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    if row.worker_id != worker_id:
+        raise HTTPException(status_code=409, detail="店小秘任务不属于当前服务实例")
+    if row.status not in ACTIVE_HANDOFF_STATUSES:
+        raise HTTPException(status_code=409, detail="该店小秘任务已结束")
+    detail = payload.detail
+    updated = update_handoff(
+        db,
+        row,
+        payload.status,
+        error_type=(
+            detail.get("error_type") if isinstance(detail.get("error_type"), str) else None
+        ),
+        error_message=(
+            detail.get("error_message")
+            if isinstance(detail.get("error_message"), str)
+            else None
+        ),
+        detail=detail,
+        worker_id=worker_id,
+    )
+    return {
+        "handoff_id": updated.id,
+        "batch_id": updated.batch_id,
+        "aliexpress_product_id": updated.product.aliexpress_product_id,
+        "url": updated.target_url,
+        "attempt_count": updated.attempt_count,
+        "status": updated.status,
+        "detail": updated.detail_json,
+    }
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/claim-next",
+    response_model=DianxiaomiHandoffRead | None,
+)
+def claim_next_dianxiaomi_handoff(
+    payload: DianxiaomiHandoffClaimRequest,
+    db: Session = Depends(get_db),
+) -> dict | None:
+    row = claim_next_handoff(db, payload.worker_id)
+    return serialize_handoff(row) if row else None
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/claim-batch",
+    response_model=list[DianxiaomiHandoffRead],
+)
+def claim_dianxiaomi_handoff_batch(
+    payload: DianxiaomiHandoffClaimRequest,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    rows = claim_handoff_batch(
+        db,
+        payload.worker_id,
+        limit=payload.limit,
+        resume_confirmed=payload.resume_confirmed,
+    )
+    return [serialize_handoff(row) for row in rows]
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/claim",
+    response_model=DianxiaomiHandoffRead,
+)
+def claim_dianxiaomi_handoff(
+    handoff_id: int,
+    payload: DianxiaomiHandoffClaimRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    _handoff_or_404(db, handoff_id)
+    row = claim_handoff(db, handoff_id, payload.worker_id)
+    if row is None:
+        raise HTTPException(
+            status_code=409,
+            detail="任务未领取：请确认当前采集电脑已选中且在线、队列未暂停，且没有其他电脑的有效任务",
+        )
+    return serialize_handoff(row)
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/status",
+    response_model=DianxiaomiHandoffRead,
+)
+def update_dianxiaomi_handoff_status(
+    handoff_id: int,
+    payload: DianxiaomiHandoffStatusRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    if row.status not in ACTIVE_HANDOFF_STATUSES and payload.status != "CANCELED":
+        raise HTTPException(status_code=409, detail="该店小秘任务已结束")
+    if not payload.worker_id or row.worker_id != payload.worker_id:
+        raise HTTPException(status_code=409, detail="店小秘任务不属于当前扩展实例")
+    return serialize_handoff(
+        update_handoff(
+            db,
+            row,
+            payload.status,
+            error_type=payload.error_type,
+            error_message=payload.error_message,
+            detail=payload.detail,
+            worker_id=payload.worker_id,
+        )
+    )
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/cancel",
+    response_model=DianxiaomiHandoffRead,
+)
+def cancel_dianxiaomi_handoff(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    if row.status in {"SUCCEEDED", "FAILED", "CANCELED"}:
+        raise HTTPException(status_code=409, detail="该店小秘任务已结束")
+    return serialize_handoff(update_handoff(db, row, "CANCELED"))
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/resume",
+    response_model=DianxiaomiHandoffRead,
+)
+def resume_dianxiaomi_handoff(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    try:
+        return serialize_handoff(retry_handoff(db, row))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/identity-review/confirm",
+    response_model=DianxiaomiHandoffRead,
+)
+def confirm_dianxiaomi_product_page_identity(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    try:
+        return serialize_handoff(confirm_product_page_identity(db, row))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post(
+    "/integrations/dianxiaomi/handoffs/{handoff_id}/identity-review/reject",
+    response_model=DianxiaomiHandoffRead,
+)
+def reject_dianxiaomi_product_page_identity(
+    handoff_id: int,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = _handoff_or_404(db, handoff_id)
+    try:
+        return serialize_handoff(reject_product_page_identity(db, row))
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/collection/status/today", response_model=CollectionStatusRead)
+def collection_status_today(db: Session = Depends(get_db)) -> dict:
+    today = datetime.now(ZoneInfo(get_settings().timezone)).date()
+    active_products = list(
+        db.scalars(
+            select(Product)
+            .join(Store, Store.id == Product.store_id)
+            .where(Product.status == "active", Store.status == "active")
+        )
+    )
+    attempts = list(db.scalars(select(CollectionAttempt).where(CollectionAttempt.attempted_at >= datetime.combine(today, datetime.min.time(), tzinfo=ZoneInfo(get_settings().timezone)))))
+    auto_success = {attempt.product_id for attempt in attempts if attempt.source == "AUTO" and attempt.status != "FAILED"}
+    auto_failed = {attempt.product_id for attempt in attempts if attempt.source == "AUTO" and attempt.status == "FAILED"}
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=ZoneInfo(get_settings().timezone))
+    manual_completed = manual_completed_product_ids(db, day_start)
+    manual_completed.update(
+        task.product_id
+        for task in db.scalars(
+            select(ManualCollectionTask).where(
+                ManualCollectionTask.status == "COMPLETED",
+                ManualCollectionTask.completed_at >= day_start,
+            )
+        )
+    )
+    pending_manual = db.scalar(
+        select(func.count())
+        .select_from(ManualCollectionTask)
+        .join(Product, Product.id == ManualCollectionTask.product_id)
+        .where(ManualCollectionTask.status == "PENDING", Product.status == "active")
+    ) or 0
+    total = len(active_products)
+    return {
+        "date": today,
+        "total_products": total,
+        "auto_success": len(auto_success),
+        "auto_failed": len(auto_failed),
+        "manual_completed": len(manual_completed),
+        "pending_manual": pending_manual,
+        "success_rate": round((len(auto_success) / total) * 100, 2) if total else 0.0,
+    }
+
+
+@router.get("/collection/progress", response_model=CollectionProgressRead)
+def collection_progress(db: Session = Depends(get_db)) -> dict:
+    return build_collection_progress(db)
+
+
+def _browser_collection_item(
+    db: Session, item_id: int, target_type: str | None = None
+) -> BrowserCollectionItem:
+    item = db.get(BrowserCollectionItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Browser collection item not found")
+    if target_type and item.target_type != target_type:
+        raise HTTPException(status_code=409, detail="Browser collection item type mismatch")
+    if item.status not in {"RUNNING", "NEEDS_VERIFICATION"}:
+        raise HTTPException(status_code=409, detail="Browser collection item is not active")
+    return item
+
+
+def _claimed_browser_collection_item(
+    db: Session,
+    item_id: int,
+    payload: BrowserExtensionCollectionRequest | BrowserStoreDiscoveryRequest
+    | BrowserCollectionFailureRequest | BrowserCollectionChallengeRequest
+    | BrowserCollectionIdentityReviewRequest,
+    target_type: str | None = None,
+) -> BrowserCollectionItem:
+    item = _browser_collection_item(db, item_id, target_type)
+    try:
+        return validate_browser_collection_claim(
+            db, item.id, payload.worker_id, payload.claim_token
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.get(
+    "/browser-collection/control",
+    response_model=BrowserCollectionControlRead,
+)
+def browser_collection_control(db: Session = Depends(get_db)) -> dict:
+    return browser_collection_control_status(db)
+
+
+@router.post(
+    "/browser-collection/pool-resets",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_create_pool_reset(
+    payload: StorePoolResetCreateRequest,
+    _admin=Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        batch = create_pool_reset_batch(db, confirm_replace=payload.confirm_replace)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_pool_reset_batch(batch)
+
+
+@router.get(
+    "/browser-collection/pool-resets/latest",
+    response_model=StorePoolResetBatchRead | None,
+)
+def browser_collection_latest_pool_reset(db: Session = Depends(get_db)) -> dict | None:
+    batch = get_latest_pool_reset_batch(db)
+    return serialize_pool_reset_batch(batch) if batch else None
+
+
+@router.post(
+    "/browser-collection/pool-resets/{batch_id}/start",
+    response_model=StorePoolResetBatchRead,
+)
+def browser_collection_start_pool_reset(
     batch_id: int,
     _admin=Depends(require_admin),
     db: Session = Depends(get_db),
