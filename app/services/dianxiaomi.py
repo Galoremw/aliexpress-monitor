@@ -195,6 +195,28 @@ def _queue_control(db: Session, *, lock: bool = False) -> DianxiaomiQueueControl
     return control
 
 
+def _pause_dianxiaomi_run_if_drained(
+    db: Session, control: DianxiaomiQueueControl, now: datetime
+) -> None:
+    started_at = _aware(control.active_run_started_at)
+    if control.is_paused or started_at is None:
+        return
+    pending_in_run = db.scalar(
+        select(DianxiaomiHandoff.id)
+        .where(
+            DianxiaomiHandoff.status.in_(LEASED_HANDOFF_STATUSES | {"QUEUED"}),
+            DianxiaomiHandoff.requested_at <= started_at,
+        )
+        .limit(1)
+    )
+    if pending_in_run is not None:
+        return
+    control.is_paused = True
+    control.paused_at = now
+    control.paused_reason = "awaiting_start"
+    control.active_run_started_at = None
+
+
 def _aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -274,14 +296,24 @@ def reconcile_dianxiaomi_queue_worker(db: Session) -> DianxiaomiQueueControl:
         .limit(1)
     )
     online = _worker_is_online(worker, now)
+    if control.is_paused and control.paused_reason == "needs_confirmation":
+        # Convert the previous global review pause into an explicit-start wait.
+        control.paused_at = control.paused_at or now
+        control.paused_reason = "awaiting_start"
+        control.active_run_started_at = None
     if queued_work is not None and not online and not control.is_paused:
         control.is_paused = True
         control.paused_at = now
         control.paused_reason = "selected_worker_offline"
     elif online and control.is_paused and control.paused_reason == "selected_worker_offline":
-        control.is_paused = False
-        control.paused_at = None
-        control.paused_reason = None
+        if control.active_run_started_at is None:
+            control.paused_at = now
+            control.paused_reason = "awaiting_start"
+        else:
+            control.is_paused = False
+            control.paused_at = None
+            control.paused_reason = None
+    _pause_dianxiaomi_run_if_drained(db, control, now)
     db.commit()
     db.refresh(control)
     return control
@@ -329,13 +361,34 @@ def _prepare_handoff_claim(
         db.commit()
         return None
 
+    if control.is_paused and control.paused_reason == "needs_confirmation":
+        control.paused_at = control.paused_at or now
+        control.paused_reason = "awaiting_start"
+        control.active_run_started_at = None
+
     if control.is_paused and control.paused_reason == "selected_worker_offline":
-        control.is_paused = False
-        control.paused_at = None
-        control.paused_reason = None
-    if control.is_paused and not (
-        resume_confirmed and control.paused_reason == "needs_confirmation"
-    ):
+        if control.active_run_started_at is None:
+            control.paused_at = now
+            control.paused_reason = "awaiting_start"
+        else:
+            control.is_paused = False
+            control.paused_at = None
+            control.paused_reason = None
+    if control.is_paused:
+        return None
+
+    if control.active_run_started_at is None:
+        queued_work = db.scalar(
+            select(DianxiaomiHandoff.id)
+            .where(DianxiaomiHandoff.status.in_(LEASED_HANDOFF_STATUSES | {"QUEUED"}))
+            .limit(1)
+        )
+        if queued_work is None:
+            return None
+        control.is_paused = True
+        control.paused_at = now
+        control.paused_reason = "awaiting_start"
+        db.commit()
         return None
 
     if resume_confirmed:
@@ -354,6 +407,7 @@ def _prepare_handoff_claim(
             row.error_type = None
             row.error_message = None
             row.completed_at = None
+            row.requested_at = now
         if paused:
             db.flush()
         if control.paused_reason == "needs_confirmation":
@@ -401,7 +455,7 @@ def _prepare_handoff_claim(
 def pause_dianxiaomi_queue(
     db: Session, reason: str = "manual_pause"
 ) -> DianxiaomiQueueControl:
-    control = _queue_control(db)
+    control = _queue_control(db, lock=True)
     control.is_paused = True
     control.paused_at = _now()
     control.paused_reason = reason
@@ -421,10 +475,27 @@ def resume_dianxiaomi_queue(db: Session) -> DianxiaomiQueueControl:
         if control.selected_worker_id else None
     )
     if not _worker_is_online(worker, _now()):
-        raise ValueError("店小秘指定采集电脑离线，队列会在它重新在线后自动继续")
-    control.is_paused = False
-    control.paused_at = None
-    control.paused_reason = None
+        raise ValueError("店小秘指定采集电脑离线，请等它重新在线后再手动启动队列")
+    now = _now()
+    if not control.is_paused and control.active_run_started_at is not None:
+        db.commit()
+        db.refresh(control)
+        return control
+    queued_work = db.scalar(
+        select(DianxiaomiHandoff.id)
+        .where(DianxiaomiHandoff.status.in_(LEASED_HANDOFF_STATUSES | {"QUEUED"}))
+        .limit(1)
+    )
+    if queued_work is None:
+        control.is_paused = True
+        control.paused_at = now
+        control.paused_reason = "awaiting_start"
+        control.active_run_started_at = None
+    else:
+        control.is_paused = False
+        control.paused_at = None
+        control.paused_reason = None
+        control.active_run_started_at = now
     db.commit()
     db.refresh(control)
     return control
@@ -476,6 +547,7 @@ def create_handoff_batch(db: Session, product_ids: list[int]) -> tuple[str, list
         raise ValueError(f"存在不可用的监控商品: {', '.join(map(str, missing))}")
 
     approved_pages = _approved_product_pages(db, products)
+    control = _queue_control(db, lock=True)
     batch_id = uuid4().hex
     existing = {
         handoff.product_id
@@ -503,6 +575,14 @@ def create_handoff_batch(db: Session, product_ids: list[int]) -> tuple[str, list
             )
         )
     db.add_all(rows)
+    if rows and control.is_paused and control.paused_reason == "needs_confirmation":
+        control.paused_at = control.paused_at or _now()
+        control.paused_reason = "awaiting_start"
+        control.active_run_started_at = None
+    elif rows and not control.is_paused and control.active_run_started_at is None:
+        control.is_paused = True
+        control.paused_at = _now()
+        control.paused_reason = "awaiting_start"
     db.commit()
     for row in rows:
         db.refresh(row)
@@ -528,12 +608,16 @@ def claim_handoff_batch(
     rows = list(
         db.scalars(
             select(DianxiaomiHandoff)
-            .where(DianxiaomiHandoff.status == "QUEUED")
+            .where(
+                DianxiaomiHandoff.status == "QUEUED",
+                DianxiaomiHandoff.requested_at <= control.active_run_started_at,
+            )
             .order_by(DianxiaomiHandoff.requested_at, DianxiaomiHandoff.id)
             .limit(limit)
         )
     )
     if not rows:
+        _pause_dianxiaomi_run_if_drained(db, control, now)
         db.commit()
         return []
     for row in rows:
@@ -557,7 +641,9 @@ def claim_handoff(
         return None
     control, now = prepared
     row = db.get(DianxiaomiHandoff, handoff_id)
-    if row is None or row.status != "QUEUED":
+    if (row is None or row.status != "QUEUED"
+        or control.active_run_started_at is None
+        or _aware(row.requested_at) > _aware(control.active_run_started_at)):
         db.commit()
         return None
     row.status = "CLAIMED"
@@ -602,22 +688,21 @@ def update_handoff(
         row.worker_id = worker_id
     if status in LEASED_HANDOFF_STATUSES:
         row.claimed_at = now
-    if status == "NEEDS_CONFIRMATION" and error_type != "product_page_mismatch":
-        control = _queue_control(db)
-        if not control.is_paused:
-            control.is_paused = True
-            control.paused_at = now
-            control.paused_reason = "needs_confirmation"
+
     if status == "OPENED":
         row.opened_at = row.opened_at or now
     if status in {"SUCCEEDED", "FAILED", "CANCELED"}:
         row.completed_at = now
+    if status in {"SUCCEEDED", "FAILED", "CANCELED", "NEEDS_CONFIRMATION"}:
+        control = _queue_control(db, lock=True)
+        _pause_dianxiaomi_run_if_drained(db, control, now)
     db.commit()
     db.refresh(row)
     return row
 
 
 def retry_handoff(db: Session, row: DianxiaomiHandoff) -> DianxiaomiHandoff:
+    _queue_control(db, lock=True)
     if row.status not in {"NEEDS_CONFIRMATION", "FAILED"}:
         raise ValueError("该店小秘任务当前不能重新排队")
     if _is_product_page_mismatch(row.error_type, row.error_message, row.detail_json):
@@ -632,6 +717,7 @@ def retry_handoff(db: Session, row: DianxiaomiHandoff) -> DianxiaomiHandoff:
     row.detail_json = {"approved_product_page": approved_page} if approved_page else None
     row.completed_at = None
     row.attempt_count += 1
+    row.requested_at = _now()
     db.commit()
     db.refresh(row)
     return row
@@ -640,6 +726,7 @@ def retry_handoff(db: Session, row: DianxiaomiHandoff) -> DianxiaomiHandoff:
 def confirm_product_page_identity(
     db: Session, row: DianxiaomiHandoff
 ) -> DianxiaomiHandoff:
+    _queue_control(db, lock=True)
     expected_id, actual_id, actual_url = _product_page_identity_for_review(row)
     detail = dict(row.detail_json) if isinstance(row.detail_json, dict) else {}
     detail.pop("product_page_mismatch", None)

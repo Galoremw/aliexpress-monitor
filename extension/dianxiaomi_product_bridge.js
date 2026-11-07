@@ -102,8 +102,11 @@
     if (/采集失败|链接无效|商品不存在|无法采集|不支持该平台/.test(text)) {
       return { state: "failed", message: text.slice(0, 180) || "店小秘助手报告采集失败" };
     }
-    if (/请先登录店小秘|登录店小秘后再采集|重复采集.*确认|是否重复采集/.test(text)) {
+    if (/请先登录店小秘|登录店小秘后再采集|(?:是否|确认).{0,20}重复采集|重复采集.{0,20}(?:确认|是否)/.test(text)) {
       return { state: "needs_confirmation", message: text.slice(0, 180) };
+    }
+    if (/重复采集/.test(text)) {
+      return { state: "succeeded", message: "店小秘助手标记该商品为重复采集，按已采集完成" };
     }
     if (/采集成功，共采集\s*\d+\s*个产品/.test(text)) {
       return { state: "succeeded", message: "店小秘助手已确认采集成功" };
@@ -149,7 +152,7 @@
       if (result) return finish(result.state, result.message);
 
       if (fresh.some((text) => /重复采集/.test(text))) {
-        return finish("needs_confirmation", "店小秘助手要求确认重复采集，请在商品页处理后重新排队");
+        return finish("succeeded", "店小秘助手标记该商品为重复采集，按已采集完成");
       }
       await sleep(POLL_INTERVAL_MS);
     }
@@ -205,7 +208,7 @@
       return;
     }
     if (/重复采集/.test(buttonText)) {
-      await finish("needs_confirmation", "店小秘助手标记该商品为重复采集，请在商品页确认后重新排队");
+      await finish("succeeded", "店小秘助手标记该商品为重复采集，按已采集完成");
       return;
     }
     if (button.disabled || button.getAttribute("aria-disabled") === "true") {

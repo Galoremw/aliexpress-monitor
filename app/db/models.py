@@ -641,6 +641,7 @@ class DianxiaomiQueueControl(Base):
     is_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     paused_reason: Mapped[str | None] = mapped_column(String(32))
+    active_run_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     worker_id: Mapped[str | None] = mapped_column(String(128))
     updated_at: Mapped[datetime] = mapped_column(
