@@ -3102,6 +3102,9 @@ async function ensureDianxiaomiProductTab(url, dashboardWindowId) {
     dianxiaomiWindowId: dashboardWindowId,
     dianxiaomiTabId: tab.id,
     dianxiaomiActiveTabId: tab.id,
+    dianxiaomiQueueHasWork: true,
+    dianxiaomiQueueProductTabId: tab.id,
+    dianxiaomiQueueProductId: productIdFromUrl(url),
   });
   tab = await waitForDianxiaomiProductTab(tab.id, productIdFromUrl(url));
   return { tab, windowId: dashboardWindowId };
@@ -3150,10 +3153,53 @@ async function clearDianxiaomiActiveHandoff(clearOperation = false) {
   await chrome.storage.local.remove(keys);
 }
 
+async function closeDianxiaomiProductTabAfterQueueDrained(baseUrl) {
+  let status;
+  try {
+    status = await api("/api/integrations/dianxiaomi/status", {}, baseUrl);
+  } catch {
+    return;
+  }
+  if (!status) return;
+  const waitingForNextStart = status.paused && status.paused_reason === "awaiting_start";
+  if (waitingForNextStart) {
+    if (status.processing_count || status.submitted_count) return;
+  } else if (status.paused || status.queued_count || status.processing_count || status.submitted_count) {
+    return;
+  }
+
+  const state = await chrome.storage.local.get([
+    "dianxiaomiQueueHasWork",
+    "dianxiaomiQueueProductTabId",
+    "dianxiaomiQueueProductId",
+    "dianxiaomiWindowId",
+    "dianxiaomiDashboardTabId",
+  ]);
+  if (state.dianxiaomiQueueHasWork !== true) return;
+
+  const tabId = state.dianxiaomiQueueProductTabId;
+  const tab = Number.isInteger(tabId) ? await chrome.tabs.get(tabId).catch(() => null) : null;
+  const expectedProductId = String(state.dianxiaomiQueueProductId || "");
+  if (tab
+    && tab.id !== state.dianxiaomiDashboardTabId
+    && tab.windowId === state.dianxiaomiWindowId
+    && expectedProductId
+    && productIdFromUrl(tab.url) === expectedProductId) {
+    await chrome.tabs.remove(tab.id).catch(() => undefined);
+  }
+  await chrome.storage.local.remove([
+    "dianxiaomiQueueHasWork",
+    "dianxiaomiQueueProductTabId",
+    "dianxiaomiQueueProductId",
+    "dianxiaomiTabId",
+    "dianxiaomiActiveTabId",
+  ]);
+}
+
 async function finishDianxiaomiHandoff(baseUrl, handoff, workerId, result, tabId) {
   const status = result?.state === "succeeded"
     ? "SUCCEEDED"
-    : result?.state === "collecting"
+    : ["collecting", "dispatching"].includes(result?.state)
       ? "COLLECTING"
       : ["waiting_helper", "not_started"].includes(result?.state)
         ? "OPENED"
@@ -3185,12 +3231,12 @@ async function finishDianxiaomiHandoff(baseUrl, handoff, workerId, result, tabId
 
   if (status === "NEEDS_CONFIRMATION") {
     await clearDianxiaomiActiveHandoff();
-    if (isNonBlockingDianxiaomiProductMismatch(classifiedResult)) {
-      setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
-      return;
+    if (!isNonBlockingDianxiaomiProductMismatch(classifiedResult)) {
+      await notifyDianxiaomiConfirmation(classifiedResult.message);
     }
-    await notifyDianxiaomiConfirmation(classifiedResult.message);
-    await focusDianxiaomiProductTab(tabId);
+    // Keep this handoff pending for later human review, but do not block the
+    // rest of the queue or pull its product page into the foreground.
+    setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
     return;
   }
   if (["SUCCEEDED", "FAILED"].includes(status)) {
@@ -3218,12 +3264,12 @@ async function pauseDianxiaomiHandoff(baseUrl, handoff, workerId, message, tabId
   const updated = await updateDianxiaomiHandoffs(baseUrl, [handoff], workerId, "NEEDS_CONFIRMATION", result);
   if (!updated) return;
   await clearDianxiaomiActiveHandoff();
-  if (isNonBlockingDianxiaomiProductMismatch(result)) {
-    setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
-    return;
+  if (!isNonBlockingDianxiaomiProductMismatch(result)) {
+    await notifyDianxiaomiConfirmation(message);
   }
-  await notifyDianxiaomiConfirmation(message);
-  if (tabId) await focusDianxiaomiProductTab(tabId);
+  // This item remains available in the dashboard for review; continue with
+  // the next queued product without waiting for a decision on this one.
+  setTimeout(() => void pollDianxiaomiHandoffs(baseUrl), 250);
 }
 
 async function processDianxiaomiHandoff(baseUrl, handoff, workerId, dashboardWindowId, justClaimed = false) {
@@ -3333,11 +3379,13 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
     } catch (error) {
       if (error.status !== 404) throw error;
     }
-    if (heartbeat?.paused) return;
+    if (heartbeat?.paused) {
+      if (heartbeat.paused_reason === "awaiting_start") {
+        await closeDianxiaomiProductTabAfterQueueDrained(baseUrl);
+      }
+      return;
+    }
     const existing = await api("/api/integrations/dianxiaomi/handoffs?limit=500", {}, baseUrl);
-    if (existing.some((item) => item.status === "NEEDS_CONFIRMATION"
-      && item.worker_id === workerId
-      && !isNonBlockingDianxiaomiProductMismatch(item))) return;
 
     const active = existing.find((item) => item.worker_id === workerId && ["CLAIMED", "OPENED", "FILLED", "COLLECTING"].includes(item.status));
     if (active) {
@@ -3352,7 +3400,10 @@ async function pollDianxiaomiHandoffs(requestedBaseUrl = null) {
       method: "POST",
       body: JSON.stringify({ worker_id: workerId, limit: 1 }),
     }, baseUrl);
-    if (!claimed?.length) return;
+    if (!claimed?.length) {
+      await closeDianxiaomiProductTabAfterQueueDrained(baseUrl);
+      return;
+    }
     handoff = claimed[0];
     await processDianxiaomiHandoff(baseUrl, handoff, workerId, dashboard.windowId, true);
   } catch (error) {

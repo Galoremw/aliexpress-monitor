@@ -1059,6 +1059,17 @@ def dianxiaomi_handoff_status(
 
     processing_count = sum(count_for(value) for value in ("CLAIMED", "OPENED", "FILLED"))
     queued_count = count_for("QUEUED")
+    if control.active_run_started_at is None:
+        waiting_for_start_count = queued_count
+    else:
+        waiting_for_start_count = int(
+            db.scalar(
+                select(func.count(DianxiaomiHandoff.id)).where(
+                    DianxiaomiHandoff.status == "QUEUED",
+                    DianxiaomiHandoff.requested_at > control.active_run_started_at,
+                )
+            ) or 0
+        )
     succeeded_count = count_for("SUCCEEDED")
     failed_count = count_for("FAILED")
     needs_confirmation_count = count_for("NEEDS_CONFIRMATION")
@@ -1126,6 +1137,8 @@ def dianxiaomi_handoff_status(
         "paused": control.is_paused,
         "paused_at": control.paused_at,
         "paused_reason": control.paused_reason,
+        "active_run_started_at": control.active_run_started_at,
+        "waiting_for_start_count": waiting_for_start_count,
         "worker_id": control.worker_id,
         "last_heartbeat_at": selected_heartbeat,
         "worker_online": selected_worker_online,

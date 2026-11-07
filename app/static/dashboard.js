@@ -206,8 +206,7 @@ async function submitDianxiaomi(productIds, button) {
       body: JSON.stringify({ product_ids: ids }),
     });
     const reused = result.reused_count ? `，${result.reused_count} 个已在队列中` : "";
-    notify(`已加入店小秘队列：${result.queued_count} 个${reused}`);
-    window.dispatchEvent(new Event("aliexpress-monitor:dianxiaomi-queue-requested"));
+    notify(`已加入待启动队列：${result.queued_count} 个${reused}；选完后点击“开始店小秘采集”`);
     await refreshDianxiaomiStatus();
   } catch (error) {
     notify(error.message, true);
@@ -356,16 +355,24 @@ function updateDianxiaomiQueue(status) {
       : "默认第二台电脑尚未连接监控台";
   }
   if (state) {
+    const waitingForStart = Number(status.waiting_for_start_count || 0);
+    const activeRun = Boolean(status.active_run_started_at) && !status.paused;
     state.textContent = status.paused
-      ? status.paused_reason === "needs_confirmation" ? "等待人工确认，队列已暂停"
-        : status.paused_reason === "selected_worker_offline" ? "指定电脑离线，队列已暂停；上线后自动继续"
+      ? status.paused_reason === "awaiting_start"
+        ? status.queued_count ? `已有 ${status.queued_count} 项待启动，等你选择开始`
+          : status.needs_confirmation_count ? `本轮已结束，有 ${status.needs_confirmation_count} 项待人工确认`
+          : "本轮店小秘采集已结束"
+        : status.paused_reason === "needs_confirmation" ? "旧队列状态待恢复；请手动启动后续任务"
+        : status.paused_reason === "selected_worker_offline" ? "指定电脑离线，队列已暂停；上线后可手动启动"
         : "店小秘队列已手动暂停"
       : status.waiting_for_owner ? "等待上一台采集电脑的在途任务结束"
       : status.waiting_reason ? status.waiting_reason
-      : status.needs_confirmation_count ? "有任务等待人工确认"
+      : activeRun && waitingForStart ? `本轮正在采集；另有 ${waitingForStart} 项待下一次启动`
+      : status.needs_confirmation_count ? "有商品待人工确认，队列继续处理后续商品"
       : status.stalled_count ? "任务响应超时，等待扩展恢复"
       : (status.processing_count || status.submitted_count) ? "店小秘队列正在处理"
-      : status.queued_count ? (status.worker_online ? "队列运行中，等待下一项" : "队列待运行，等待本机 Chrome")
+      : activeRun ? "店小秘队列正在处理"
+      : status.queued_count ? "队列待启动"
       : "当前没有待处理任务";
   }
   if (ownerWaiting) {
@@ -385,14 +392,17 @@ function updateDianxiaomiQueue(status) {
     ? `最近心跳：${formatDashboardDate(status.last_heartbeat_at)}`
     : "尚未收到扩展心跳";
   if (resume) {
-    resume.hidden = !status.paused && !status.queued_count;
-    resume.textContent = status.paused_reason === "needs_confirmation"
-      ? "验证完成，继续队列"
+    const activeRun = Boolean(status.active_run_started_at) && !status.paused;
+    resume.hidden = !status.queued_count || activeRun;
+    resume.textContent = status.paused_reason === "awaiting_start"
+      ? "开始店小秘采集"
+      : status.paused_reason === "needs_confirmation" ? "手动启动后续任务"
       : status.paused_reason === "selected_worker_offline" ? "等待采集电脑上线"
-      : status.paused ? "继续店小秘队列" : "启动店小秘队列";
+      : status.paused ? "继续店小秘队列" : "开始店小秘采集";
     resume.disabled = !status.selected_worker?.online;
   }
-  if (pause) pause.hidden = Boolean(status.paused) || !(status.queued_count || status.processing_count || status.submitted_count);
+  if (pause) pause.hidden = Boolean(status.paused) || !status.active_run_started_at
+    || !(status.queued_count || status.processing_count || status.submitted_count);
 }
 
 const dianxiaomiStatusLabels = {
@@ -536,7 +546,7 @@ document.querySelector("#dianxiaomi-queue-resume")?.addEventListener("click", as
   try {
     await jsonRequest("/api/integrations/dianxiaomi/queue/resume", { method: "POST" });
     window.dispatchEvent(new Event("aliexpress-monitor:dianxiaomi-queue-requested"));
-    notify("店小秘队列已恢复，将从待处理位置继续");
+    notify("已启动本轮店小秘采集；本轮之后新增的商品会留待下次启动");
     await refreshDianxiaomiStatus();
   } catch (error) {
     notify(error.message, true);
