@@ -59,7 +59,6 @@ html { scroll-behavior: smooth; }
 .stats strong { display: block; margin-top: 7px; font-size: 27px; line-height: 1; }
 .stats small { display: block; margin-top: 7px; color: var(--accent-dark); font-size: 11px; }
 .stats .warning { border-top: 3px solid var(--warning); }
-.collection-status-band { margin-bottom: 24px; }
 .browser-collection-band { margin-bottom: 24px; }
 .browser-run-layout { display: grid; grid-template-columns: minmax(250px, 1.1fr) minmax(400px, 1.8fr) minmax(230px, .9fr); align-items: stretch; }
 .browser-run-state { min-width: 0; padding: 14px 17px; border-right: 1px solid var(--line); }

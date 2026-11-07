@@ -37,6 +37,38 @@ def test_dashboard_renders_empty_state(client):
     assert '"/api/jobs/collect-now"' not in collect_all_handler
 
 
+def test_dashboard_omits_today_collection_status_band(client):
+    dashboard = client.get("/")
+    pending = client.get("/collection/pending")
+    status = client.get("/api/collection/status/today")
+
+    assert dashboard.status_code == 200
+    text = dashboard.text
+    assert text.index('id="dashboard-overview"') < text.index('id="browser-collection-status"')
+    assert 'id="collection-status"' not in text
+    assert "collection-status-band" not in text
+    assert "今日采集状态" not in text
+    assert "AUTO FIRST / MANUAL FALLBACK" not in text
+    for label in ("Total Products", "Auto Success", "Auto Failed", "Manual Completed", "Pending Manual", "Success Rate"):
+        assert label not in text
+    for label in ("活跃店铺", "活跃商品", "最近快照", "失败快照", "每日浏览器采集", "立即采集全部"):
+        assert label in text
+    assert 'id="browser-run-start"' in text
+    assert 'id="browser-collector-select"' in text
+    assert pending.status_code == 200
+    assert 'aria-label="今日采集状态"' in pending.text
+    assert status.status_code == 200
+    assert set(status.json()) == {
+        "date",
+        "total_products",
+        "auto_success",
+        "auto_failed",
+        "manual_completed",
+        "pending_manual",
+        "success_rate",
+    }
+
+
 def test_galore_collector_launch_button_is_local_only(client):
     local_dashboard = client.get("/", headers={"host": "127.0.0.1:3000"})
     lan_dashboard = client.get("/", headers={"host": "192.168.66.107:3000"})
