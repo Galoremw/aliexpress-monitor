@@ -39,18 +39,6 @@
   <article class="{% if failed_snapshot_count %}warning{% endif %}"><span>失败快照</span><strong>{{ failed_snapshot_count }}</strong></article>
 </section>
 
-<section id="collection-status" class="data-section collection-status-band">
-  <div class="section-heading"><h2>今日采集状态</h2><span>{{ collection_status.date }} · AUTO FIRST / MANUAL FALLBACK</span></div>
-  <div class="status-grid">
-    <span><small>Total Products</small><b>{{ collection_status.total_products }}</b></span>
-    <span><small>Auto Success</small><b>{{ collection_status.auto_success }}</b></span>
-    <span><small>Auto Failed</small><b>{{ collection_status.auto_failed }}</b></span>
-    <span><small>Manual Completed</small><b>{{ collection_status.manual_completed }}</b></span>
-    <a href="/collection/pending"><small>Pending Manual</small><b>{{ collection_status.pending_manual }}</b></a>
-    <span><small>Success Rate</small><b>{{ collection_status.success_rate }}%</b></span>
-  </div>
-</section>
-
 <section id="browser-collection-status" class="data-section browser-collection-band" data-status-endpoint="/api/browser-collection/runs/today">
   <div class="section-heading">
     <h2>每日浏览器采集</h2>
