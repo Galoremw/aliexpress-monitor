@@ -238,6 +238,9 @@ let dianxiaomiItems = [];
 let dianxiaomiActiveFilter = "queued";
 let dianxiaomiCanDeleteFailed = false;
 let dianxiaomiFailedCount = 0;
+let dianxiaomiIdentitySelection = new Set();
+let dianxiaomiIdentityBatchBusy = false;
+let dianxiaomiIdentityBatchResult = "";
 
 function updateDianxiaomiProductButtons(items) {
   const latestStatusByProduct = new Map();
@@ -281,13 +284,44 @@ function renderDianxiaomiFilter() {
   if (!list) return;
   const statuses = dianxiaomiFilterStatuses[dianxiaomiActiveFilter] || [];
   const filteredItems = dianxiaomiItems.filter((item) => statuses.includes(item.status));
+  const eligibleIds = new Set(dianxiaomiItems
+    .filter(isDianxiaomiIdentityReviewItem)
+    .map((item) => String(item.id)));
+  for (const id of dianxiaomiIdentitySelection) {
+    if (!eligibleIds.has(id)) dianxiaomiIdentitySelection.delete(id);
+  }
   const label = section.querySelector(`[data-dianxiaomi-filter="${dianxiaomiActiveFilter}"] small`)?.textContent || "该状态";
   const title = section.querySelector("#dianxiaomi-list-title");
   const caption = section.querySelector("#dianxiaomi-list-caption");
   if (title) title.textContent = `${label}商品 · ${filteredItems.length}`;
   if (caption) caption.textContent = `最近 100 项中显示${label}状态；上方汇总为全队列总数`;
   list.innerHTML = filteredItems.map(renderDianxiaomiItem).join("") || `<p class="muted-value">当前没有${escapeDianxiaomiHtml(label)}商品。</p>`;
+  updateDianxiaomiIdentityBulkControls(filteredItems);
   updateDianxiaomiDeleteControls();
+}
+
+function updateDianxiaomiIdentityBulkControls(visibleItems) {
+  const toolbar = document.querySelector("#dianxiaomi-identity-bulk");
+  const selectAll = document.querySelector("#dianxiaomi-identity-select-visible");
+  const confirmSelected = document.querySelector("#dianxiaomi-identity-confirm-selected");
+  const result = document.querySelector("#dianxiaomi-identity-bulk-result");
+  if (!toolbar || !selectAll || !confirmSelected) return;
+
+  const eligibleItems = visibleItems.filter(isDianxiaomiIdentityReviewItem);
+  const selectedCount = eligibleItems
+    .filter((item) => dianxiaomiIdentitySelection.has(String(item.id))).length;
+  const selectedVisibleCount = eligibleItems.length - eligibleItems.filter((item) =>
+    !dianxiaomiIdentitySelection.has(String(item.id))).length;
+
+  toolbar.hidden = dianxiaomiActiveFilter !== "needs_confirmation" || eligibleItems.length === 0;
+  selectAll.checked = eligibleItems.length > 0 && selectedVisibleCount === eligibleItems.length;
+  selectAll.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < eligibleItems.length;
+  selectAll.disabled = dianxiaomiIdentityBatchBusy || eligibleItems.length === 0;
+  confirmSelected.disabled = dianxiaomiIdentityBatchBusy || selectedCount === 0;
+  confirmSelected.textContent = dianxiaomiIdentityBatchBusy
+    ? `正在确认所选商品…（${selectedCount}）`
+    : `批量确认所选无误（${selectedCount}）`;
+  if (result) result.textContent = dianxiaomiIdentityBatchResult;
 }
 
 function updateDianxiaomiDeleteControls() {
@@ -432,6 +466,10 @@ function isDianxiaomiProductPageMismatch(item) {
   return Boolean(ids && ids[1] !== ids[2]);
 }
 
+function isDianxiaomiIdentityReviewItem(item) {
+  return item.status === "NEEDS_CONFIRMATION" && isDianxiaomiProductPageMismatch(item);
+}
+
 function dianxiaomiNextAction(item) {
   if (item.status === "NEEDS_CONFIRMATION") {
     if (isDianxiaomiProductPageMismatch(item)) {
@@ -451,6 +489,10 @@ function renderDianxiaomiItem(item) {
   const statusClass = item.status === "SUCCEEDED" ? "success" : ["FAILED", "NEEDS_CONFIRMATION"].includes(item.status) ? "error" : "";
   const productMismatchReview = item.status === "NEEDS_CONFIRMATION"
     && isDianxiaomiProductPageMismatch(item);
+  const identityActionDisabled = dianxiaomiIdentityBatchBusy ? "disabled" : "";
+  const identitySelection = productMismatchReview
+    ? `<label class="dianxiaomi-identity-select"><input type="checkbox" data-dianxiaomi-identity-select data-handoff-id="${item.id}" aria-label="选择商品 ID ${escapeDianxiaomiHtml(item.platform_product_id || item.product_id || "")} 进行批量确认"${dianxiaomiIdentitySelection.has(String(item.id)) ? " checked" : ""}${dianxiaomiIdentityBatchBusy ? " disabled" : ""}><span>选择</span></label>`
+    : "";
   const mismatchEvidence = item.detail?.product_page_mismatch || {};
   const actualId = mismatchEvidence.actual_product_id
     || String(item.error_message || "").match(/当前商品 ID\s*(\d+)/)?.[1]
@@ -461,7 +503,7 @@ function renderDianxiaomiItem(item) {
     ? `<span class="dianxiaomi-item-meta">实际打开页：ID ${escapeDianxiaomiHtml(actualId)} · <a href="${escapeDianxiaomiHtml(actualUrl)}" target="_blank" rel="noreferrer">查看实际商品</a></span>`
     : "";
   const action = productMismatchReview
-    ? `<div class="dianxiaomi-identity-actions"><button class="link-button identity-confirm" type="button" data-dianxiaomi-action="identity-confirm" data-handoff-id="${item.id}">确认商品无误</button><button class="link-button identity-reject" type="button" data-dianxiaomi-action="identity-reject" data-handoff-id="${item.id}">错误</button></div>`
+    ? `<div class="dianxiaomi-identity-actions"><button class="link-button identity-confirm" type="button" data-dianxiaomi-action="identity-confirm" data-handoff-id="${item.id}" ${identityActionDisabled}>确认商品无误</button><button class="link-button identity-reject" type="button" data-dianxiaomi-action="identity-reject" data-handoff-id="${item.id}" ${identityActionDisabled}>错误</button></div>`
     : ["NEEDS_CONFIRMATION", "FAILED"].includes(item.status)
     ? `<button class="link-button" type="button" data-dianxiaomi-action="resume" data-handoff-id="${item.id}">重新排队</button>`
     : ["QUEUED", "CLAIMED", "OPENED", "FILLED", "COLLECTING"].includes(item.status)
@@ -476,7 +518,7 @@ function renderDianxiaomiItem(item) {
   const url = escapeDianxiaomiHtml(item.target_url);
   const error = item.error_message ? ` · ${escapeDianxiaomiHtml(item.error_message)}` : "";
   const nextAction = dianxiaomiNextAction(item);
-  return `<article class="dianxiaomi-item"><div class="dianxiaomi-item-main"><strong class="dianxiaomi-item-title">${label}</strong><span class="dianxiaomi-item-meta">${store} · <a href="${url}" target="_blank" rel="noreferrer">${url}</a></span><span class="dianxiaomi-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(item.requested_at))}${error}</span>${actualPage}${nextAction ? `<span class="dianxiaomi-item-hint">${escapeDianxiaomiHtml(nextAction)}</span>` : ""}</div><div class="dianxiaomi-item-side">${deleteAction}<span class="dianxiaomi-status ${statusClass}">${status}</span><span class="dianxiaomi-item-actions">${action}</span></div></article>`;
+  return `<article class="dianxiaomi-item"><div class="dianxiaomi-item-main"><strong class="dianxiaomi-item-title">${label}</strong><span class="dianxiaomi-item-meta">${store} · <a href="${url}" target="_blank" rel="noreferrer">${url}</a></span><span class="dianxiaomi-item-meta">${escapeDianxiaomiHtml(formatDashboardDate(item.requested_at))}${error}</span>${actualPage}${nextAction ? `<span class="dianxiaomi-item-hint">${escapeDianxiaomiHtml(nextAction)}</span>` : ""}</div><div class="dianxiaomi-item-side">${identitySelection}${deleteAction}<span class="dianxiaomi-status ${statusClass}">${status}</span><span class="dianxiaomi-item-actions">${action}</span></div></article>`;
 }
 
 function formatDashboardDate(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—"; }
@@ -494,14 +536,95 @@ document.querySelector("#dianxiaomi-status")?.addEventListener("click", (event) 
   });
   renderDianxiaomiFilter();
 });
+document.querySelector("#dianxiaomi-items")?.addEventListener("change", (event) => {
+  const checkbox = event.target.closest("[data-dianxiaomi-identity-select]");
+  if (!checkbox || dianxiaomiIdentityBatchBusy) return;
+  const handoffId = String(checkbox.dataset.handoffId || "");
+  const item = dianxiaomiItems.find((candidate) => String(candidate.id) === handoffId);
+  if (!item || !isDianxiaomiIdentityReviewItem(item)) {
+    checkbox.checked = false;
+    dianxiaomiIdentitySelection.delete(handoffId);
+    return;
+  }
+  if (checkbox.checked) dianxiaomiIdentitySelection.add(handoffId);
+  else dianxiaomiIdentitySelection.delete(handoffId);
+  const statuses = dianxiaomiFilterStatuses[dianxiaomiActiveFilter] || [];
+  updateDianxiaomiIdentityBulkControls(
+    dianxiaomiItems.filter((candidate) => statuses.includes(candidate.status)),
+  );
+});
+document.querySelector("#dianxiaomi-identity-select-visible")?.addEventListener("change", (event) => {
+  if (dianxiaomiIdentityBatchBusy) return;
+  const statuses = dianxiaomiFilterStatuses[dianxiaomiActiveFilter] || [];
+  const visibleItems = dianxiaomiItems.filter((item) => statuses.includes(item.status));
+  const eligibleItems = visibleItems.filter(isDianxiaomiIdentityReviewItem);
+  for (const item of eligibleItems) {
+    const handoffId = String(item.id);
+    if (event.currentTarget.checked) dianxiaomiIdentitySelection.add(handoffId);
+    else dianxiaomiIdentitySelection.delete(handoffId);
+  }
+  document.querySelectorAll("[data-dianxiaomi-identity-select]").forEach((checkbox) => {
+    checkbox.checked = dianxiaomiIdentitySelection.has(String(checkbox.dataset.handoffId));
+  });
+  updateDianxiaomiIdentityBulkControls(visibleItems);
+});
+document.querySelector("#dianxiaomi-identity-confirm-selected")?.addEventListener("click", async (event) => {
+  if (dianxiaomiIdentityBatchBusy) return;
+  const statuses = dianxiaomiFilterStatuses[dianxiaomiActiveFilter] || [];
+  const selectedItems = dianxiaomiItems.filter((item) =>
+    statuses.includes(item.status)
+    && isDianxiaomiIdentityReviewItem(item)
+    && dianxiaomiIdentitySelection.has(String(item.id)));
+  if (!selectedItems.length) return;
+
+  dianxiaomiIdentityBatchBusy = true;
+  dianxiaomiIdentityBatchResult = "";
+  updateDianxiaomiIdentityBulkControls(
+    dianxiaomiItems.filter((item) => statuses.includes(item.status)),
+  );
+  renderDianxiaomiFilter();
+
+  let confirmedCount = 0;
+  const failures = [];
+  for (const item of selectedItems) {
+    const handoffId = String(item.id);
+    try {
+      await jsonRequest(
+        `/api/integrations/dianxiaomi/handoffs/${handoffId}/identity-review/confirm`,
+        { method: "POST" },
+      );
+      dianxiaomiIdentitySelection.delete(handoffId);
+      confirmedCount += 1;
+    } catch (error) {
+      failures.push({ id: handoffId, message: String(error.message || "请求失败") });
+    }
+    updateDianxiaomiIdentityBulkControls(
+      dianxiaomiItems.filter((candidate) => statuses.includes(candidate.status)),
+    );
+  }
+
+  dianxiaomiIdentityBatchBusy = false;
+  if (failures.length) {
+    const details = failures.slice(0, 5)
+      .map(({ id, message }) => `#${id}：${message.slice(0, 120)}`)
+      .join("；");
+    const more = failures.length > 5 ? `；另有 ${failures.length - 5} 项失败` : "";
+    dianxiaomiIdentityBatchResult = `批量结果：成功 ${confirmedCount} 项，失败 ${failures.length} 项。${details}${more}`;
+    notify(`批量确认结束：成功 ${confirmedCount} 项，失败 ${failures.length} 项；失败项仍待确认。`, true);
+  } else {
+    dianxiaomiIdentityBatchResult = `批量结果：${confirmedCount} 项已确认并重新排队。`;
+    notify(`已批量确认 ${confirmedCount} 项，URL 身份已记录并重新排队。`);
+  }
+  renderDianxiaomiFilter();
+  await refreshDianxiaomiStatus();
+});
 document.querySelector("#dianxiaomi-items")?.addEventListener("click", async (event) => {
   const button = event.target.closest("[data-dianxiaomi-action]");
   if (!button) return;
   const action = button.dataset.dianxiaomiAction;
+  if (dianxiaomiIdentityBatchBusy && ["identity-confirm", "identity-reject"].includes(action)) return;
   if (action === "delete" && !dianxiaomiCanDeleteFailed) return;
   if (action === "delete" && !window.confirm("确定永久删除这条采集失败的店小秘任务吗？此操作不可恢复。")) return;
-  if (action === "identity-confirm"
-    && !window.confirm("确认实际打开的商品与监控商品是同一商品吗？确认后会保存该商品的已审核 URL，并自动重新排队。")) return;
   if (action === "identity-reject"
     && !window.confirm("确认实际打开的商品与监控商品不一致吗？本条任务将取消，不影响其他队列任务。")) return;
   button.disabled = true;

@@ -288,6 +288,11 @@ button.dianxiaomi-product.is-collected:disabled { opacity: 1; cursor: default; }
 .dianxiaomi-list-heading-main [hidden] { display: none; }
 .dianxiaomi-list-heading strong { font-size: 14px; }
 .dianxiaomi-list-heading > span { color: var(--muted); font-size: 11px; }
+.dianxiaomi-identity-bulk { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin: 8px 12px 0; padding: 9px 11px; border: 1px solid var(--line); background: #f7faf8; }
+.dianxiaomi-identity-bulk[hidden] { display: none; }
+.dianxiaomi-identity-bulk label, .dianxiaomi-identity-select { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.dianxiaomi-identity-bulk input, .dianxiaomi-identity-select input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent-strong); }
+.dianxiaomi-identity-bulk-result { flex-basis: 100%; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .dianxiaomi-admin-dialog { width: min(420px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); color: var(--ink); box-shadow: 0 18px 48px #17221d33; }
 .dianxiaomi-admin-dialog::backdrop { background: #17201d66; }
 .dianxiaomi-admin-form { display: grid; gap: 14px; padding: 22px; }

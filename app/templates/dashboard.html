@@ -214,6 +214,11 @@
       </div>
       <span id="dianxiaomi-list-caption">队列按顺序串行处理，列表显示最近 100 项</span>
     </div>
+    <div id="dianxiaomi-identity-bulk" class="dianxiaomi-identity-bulk" hidden>
+      <label><input id="dianxiaomi-identity-select-visible" type="checkbox">全选当前可审核项</label>
+      <button id="dianxiaomi-identity-confirm-selected" class="button" type="button" disabled>批量确认所选无误（0）</button>
+      <span id="dianxiaomi-identity-bulk-result" class="dianxiaomi-identity-bulk-result" role="status" aria-live="polite"></span>
+    </div>
     <div id="dianxiaomi-items" class="dianxiaomi-items" role="tabpanel" aria-labelledby="dianxiaomi-list-title" aria-live="polite"><p class="muted-value">正在读取待发送商品…</p></div>
   </div>
 </details>
