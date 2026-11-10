@@ -276,6 +276,10 @@ class BrowserCollectionRunStartRequest(BaseModel):
     helper_worker_ids: list[str] | None = Field(default=None, max_length=32)
 
 
+class BrowserCollectionRunHelpersRequest(BaseModel):
+    helper_worker_ids: list[str] = Field(min_length=1, max_length=32)
+
+
 class BrowserCollectionRunResumeRequest(BaseModel):
     helper_worker_ids: list[str] | None = Field(default=None, max_length=32)
 

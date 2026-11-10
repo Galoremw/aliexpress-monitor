@@ -104,6 +104,21 @@
           {% endfor %}
         </div>
       </div>
+      <div id="browser-run-add-helper-controls" class="browser-run-add-helper-controls"{% if not browser_collection_run or not browser_collection_run.primary_worker_id or browser_collection_run.status != "RUNNING" or not browser_collection_run.dispatch_enabled %} hidden{% endif %}>
+        <label for="browser-run-add-helper-select">加入本轮辅助电脑
+          <select id="browser-run-add-helper-select" multiple size="2" aria-label="选择加入本轮的辅助采集电脑">
+            {% if browser_collection_run and browser_collection_run.primary_worker_id %}
+            {% for worker in browser_collection_control.workers %}
+            {% if worker.worker_id != browser_collection_run.primary_worker_id and worker.worker_id not in browser_collection_run.helper_worker_ids %}
+            <option value="{{ worker.worker_id }}"{% if not worker.online %} disabled{% endif %}>{{ worker.display_label }} · {{ "在线" if worker.online else "离线" }}</option>
+            {% endif %}
+            {% endfor %}
+            {% endif %}
+          </select>
+        </label>
+        <button id="browser-run-add-helper" class="button primary" type="button" disabled>加入本轮辅助机</button>
+        <p class="browser-run-add-helper-hint">新电脑只领取后续待处理任务；当前已领取任务和队列顺序不变。</p>
+      </div>
       <div class="browser-run-main-actions">
         <button id="browser-run-start" class="button primary" type="button"{% if not browser_collection_control.can_start or (browser_collection_control.dispatch_enabled and browser_collection_run and browser_collection_run.primary_worker_id) %} disabled{% endif %}>{% if browser_collection_control.dispatch_enabled and browser_collection_run and not browser_collection_run.primary_worker_id %}锁定本轮主辅电脑{% elif browser_collection_control.dispatch_enabled %}采集中{% elif browser_collection_control.run_status in ["NEEDS_VERIFICATION", "PAUSED"] %}继续采集{% elif browser_collection_run and browser_collection_run.status in ["COMPLETED", "PARTIAL", "FAILED"] and not browser_collection_control.can_start %}今日已完成{% else %}开始采集{% endif %}</button>
         <button id="browser-run-retry-failed" class="button" type="button" hidden>失败/已取消项重排</button>

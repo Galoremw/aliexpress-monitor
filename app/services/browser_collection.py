@@ -796,6 +796,63 @@ def _prepare_run_worker_roles(
     return None, None
 
 
+def add_helpers_to_running_browser_collection_run(
+    db: Session, run_id: int, helper_worker_ids: list[str]
+) -> BrowserCollectionRun:
+    if _pool_reset_owns_browser(db):
+        raise ValueError("监控池重建任务正在占用采集电脑")
+    run = db.scalar(
+        select(BrowserCollectionRun)
+        .where(BrowserCollectionRun.id == run_id)
+        .options(selectinload(BrowserCollectionRun.helper_workers))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if run is None:
+        raise ValueError("Browser collection run not found")
+    if (
+        run.status != "RUNNING"
+        or run.phase == "COMPLETED"
+        or not run.dispatch_enabled
+    ):
+        raise ValueError("只有正在采集的队列可以加入辅助电脑")
+    if _is_manually_cancelled(run):
+        raise ValueError("已取消的队列不能加入辅助电脑")
+    if not run.primary_worker_id:
+        raise ValueError("本轮尚未锁定主采集电脑")
+    if not helper_worker_ids:
+        raise ValueError("请先选择要加入本轮的辅助电脑")
+
+    existing_ids = {worker.worker_id for worker in run.helper_workers}
+    if len(helper_worker_ids) != len(set(helper_worker_ids)):
+        raise ValueError("辅助采集电脑不能重复")
+    new_ids = [worker_id for worker_id in helper_worker_ids if worker_id not in existing_ids]
+    if not new_ids:
+        raise ValueError("所选电脑已加入本轮辅助采集")
+
+    workers = _validated_run_helpers(db, run.primary_worker_id, new_ids)
+    now = utcnow()
+    if any(not _worker_is_online(worker, now) for worker in workers):
+        raise ValueError("所选辅助电脑当前离线，请让扩展保持在线后重试")
+    pending_item_id = db.scalar(
+        select(BrowserCollectionItem.id)
+        .where(
+            BrowserCollectionItem.run_id == run.id,
+            BrowserCollectionItem.status == "PENDING",
+        )
+        .limit(1)
+    )
+    if pending_item_id is None:
+        raise ValueError("本轮没有待领取任务可分配给辅助电脑")
+
+    # Adding a worker changes only future claims. Existing item leases remain owned
+    # by their current workers and are not released or reassigned.
+    run.helper_workers = [*run.helper_workers, *workers]
+    db.commit()
+    db.refresh(run)
+    return run
+
+
 def start_browser_collection_run(
     db: Session,
     run: BrowserCollectionRun | None = None,

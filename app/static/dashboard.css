@@ -109,6 +109,11 @@ html { scroll-behavior: smooth; }
 .browser-worker-load { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; font-size: 11px; }
 .browser-worker-load-name { min-width: 0; color: var(--ink); overflow-wrap: anywhere; }
 .browser-worker-load-state { flex: 0 0 auto; color: var(--muted); white-space: nowrap; }
+.browser-run-add-helper-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 5px 8px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; background: #f8fbf9; }
+.browser-run-add-helper-controls[hidden] { display: none; }
+.browser-run-add-helper-controls label { min-width: 0; }
+.browser-run-add-helper-controls select { width: 100%; }
+.browser-run-add-helper-hint { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.4; }
 .browser-run-main-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .browser-run-main-actions .button { flex: 1 1 130px; min-height: 34px; padding: 6px 9px; }
 .browser-run-secondary-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 8px; }
@@ -394,7 +399,7 @@ button.dianxiaomi-product.is-collected:disabled { opacity: 1; cursor: default; }
   .browser-progress-grid > *:nth-child(3n) { border-right: 1px solid var(--line); }
   .browser-progress-grid > *:nth-child(2n) { border-right: 0; }
   .browser-progress-grid > *:last-child { grid-column: 1 / -1; border-right: 0; }
-  .browser-collector-selectors, .browser-computer-state-grid { grid-template-columns: 1fr; }
+  .browser-collector-selectors, .browser-computer-state-grid, .browser-run-add-helper-controls { grid-template-columns: 1fr; }
   .browser-run-main-actions { flex-direction: column; }
   .browser-worker-load-state { white-space: normal; text-align: right; }
   .browser-filter-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

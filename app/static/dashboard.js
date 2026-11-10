@@ -1292,6 +1292,8 @@ function updateBrowserCollectionControl(control) {
     helperSelector.disabled = rolesLocked || !(control.workers || []).length;
   }
 
+  renderBrowserRunAddHelperOptions(control);
+
   if (selectedState) {
     selectedState.textContent = selected
       ? `${rolesLocked ? "下轮主采集电脑" : "手动启动主采集电脑"}：${selected.display_label || selected.label} · ${selected.online ? "在线" : "离线"}`
@@ -1356,6 +1358,50 @@ function renderBrowserRunLockedRoles() {
     : "尚未锁定";
 }
 
+function renderBrowserRunAddHelperOptions(control = browserCollectionControl) {
+  const controls = document.querySelector("#browser-run-add-helper-controls");
+  const selector = document.querySelector("#browser-run-add-helper-select");
+  const button = document.querySelector("#browser-run-add-helper");
+  if (!controls || !selector || !button) return;
+
+  const run = browserCollectionRun;
+  const active = Boolean(
+    run?.primary_worker_id && run.dispatch_enabled && run.status === "RUNNING",
+  );
+  controls.hidden = !active;
+  if (!active) {
+    button.disabled = true;
+    return;
+  }
+
+  const selectedIds = new Set(
+    Array.from(selector.selectedOptions || []).map((option) => option.value),
+  );
+  const assignedIds = new Set([
+    run.primary_worker_id,
+    ...(run.helper_worker_ids || []),
+  ]);
+  selector.replaceChildren();
+  const availableWorkers = (control?.workers || []).filter(
+    (worker) => !assignedIds.has(worker.worker_id),
+  );
+  if (!availableWorkers.length) {
+    selector.add(new Option("没有可加入的采集电脑", ""));
+  }
+  for (const worker of availableWorkers) {
+    const option = new Option(
+      `${worker.display_label || worker.label} · ${worker.online ? "在线" : "离线"}`,
+      worker.worker_id,
+    );
+    option.disabled = !worker.online;
+    option.selected = worker.online && selectedIds.has(worker.worker_id);
+    selector.add(option);
+  }
+  button.disabled = !Array.from(selector.selectedOptions || []).some(
+    (option) => option.value && !option.disabled,
+  );
+}
+
 async function refreshBrowserCollectionControl() {
   try {
     updateBrowserCollectionControl(await jsonRequest("/api/browser-collection/control"));
@@ -1398,6 +1444,36 @@ document.querySelector("#browser-collector-select")?.addEventListener("change", 
     await refreshBrowserCollectionControl();
   } finally {
     selector.disabled = !(browserCollectionControl?.workers || []).length;
+  }
+});
+
+document.querySelector("#browser-run-add-helper-select")?.addEventListener("change", () => {
+  renderBrowserRunAddHelperOptions();
+});
+
+document.querySelector("#browser-run-add-helper")?.addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const runId = browserCollectionRun?.id;
+  const helperWorkerIds = Array.from(
+    document.querySelector("#browser-run-add-helper-select")?.selectedOptions || [],
+  ).map((option) => option.value).filter(Boolean);
+  if (!runId || !helperWorkerIds.length) return;
+
+  button.disabled = true;
+  try {
+    const run = await jsonRequest(`/api/browser-collection/runs/${runId}/helpers`, {
+      method: "POST",
+      body: JSON.stringify({ helper_worker_ids: helperWorkerIds }),
+    });
+    updateBrowserCollection(run);
+    await refreshBrowserCollectionControl();
+    notify(`已将 ${helperWorkerIds.length} 台电脑加入本轮；它们只会领取后续待处理任务。`);
+  } catch (error) {
+    notify(error.message, true);
+    await refreshBrowserCollection();
+    await refreshBrowserCollectionControl();
+  } finally {
+    renderBrowserRunAddHelperOptions();
   }
 });
 

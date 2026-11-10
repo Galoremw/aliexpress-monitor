@@ -28,7 +28,7 @@
     </header>
     <main>{% block content %}{% endblock %}</main>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="/static/dashboard.js?v=identity-confirm-single-click-20261108" defer></script>
+    <script src="/static/dashboard.js?v=browser-run-add-helper-20261110" defer></script>
     <script>
       document.querySelector("#logout")?.addEventListener("click", async () => {
         await fetch("/api/auth/logout", { method: "POST", credentials: "include" });

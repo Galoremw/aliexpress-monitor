@@ -24,6 +24,7 @@ from app.api.schemas import (
     StorePoolResetPageRequest,
     StorePoolResetResumeRequest,
     BrowserCollectionRunEnsureRequest,
+    BrowserCollectionRunHelpersRequest,
     BrowserCollectionRunResumeRequest,
     BrowserCollectionRunRead,
     BrowserCollectionRunStartRequest,
@@ -121,6 +122,7 @@ from app.services.product_presentation import clean_product_title
 from app.services.store_discovery import discover_store_products, store_top_products
 from app.services.collection_progress import build_collection_progress, manual_completed_product_ids
 from app.services.browser_collection import (
+    add_helpers_to_running_browser_collection_run,
     browser_collection_control_status,
     cancel_run,
     claim_next_item,
@@ -1795,6 +1797,24 @@ def browser_collection_start_today(
         )
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+
+
+@router.post(
+    "/browser-collection/runs/{run_id}/helpers",
+    response_model=BrowserCollectionRunRead,
+)
+def browser_collection_add_helpers(
+    run_id: int,
+    payload: BrowserCollectionRunHelpersRequest,
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        run = add_helpers_to_running_browser_collection_run(
+            db, run_id, payload.helper_worker_ids
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    return serialize_run(run)
 
 
 @router.get(
