@@ -1366,7 +1366,9 @@ function renderBrowserRunAddHelperOptions(control = browserCollectionControl) {
 
   const run = browserCollectionRun;
   const active = Boolean(
-    run?.primary_worker_id && run.dispatch_enabled && run.status === "RUNNING",
+    run?.primary_worker_id
+      && ((run.dispatch_enabled && run.status === "RUNNING")
+        || (!run.dispatch_enabled && run.status === "PAUSED" && run.paused_reason === "manual_pause")),
   );
   controls.hidden = !active;
   if (!active) {
@@ -1467,7 +1469,9 @@ document.querySelector("#browser-run-add-helper")?.addEventListener("click", asy
     });
     updateBrowserCollection(run);
     await refreshBrowserCollectionControl();
-    notify(`已将 ${helperWorkerIds.length} 台电脑加入本轮；它们只会领取后续待处理任务。`);
+    notify(run.dispatch_enabled
+      ? `已将 ${helperWorkerIds.length} 台电脑加入本轮；它们只会领取后续待处理任务。`
+      : `已将 ${helperWorkerIds.length} 台电脑加入本轮；队列暂停中，恢复后会领取后续待处理任务。`);
   } catch (error) {
     notify(error.message, true);
     await refreshBrowserCollection();

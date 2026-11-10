@@ -810,12 +810,14 @@ def add_helpers_to_running_browser_collection_run(
     )
     if run is None:
         raise ValueError("Browser collection run not found")
-    if (
-        run.status != "RUNNING"
-        or run.phase == "COMPLETED"
-        or not run.dispatch_enabled
-    ):
-        raise ValueError("只有正在采集的队列可以加入辅助电脑")
+    running = run.status == "RUNNING" and run.dispatch_enabled
+    manually_paused = (
+        run.status == "PAUSED"
+        and not run.dispatch_enabled
+        and run.paused_reason == "manual_pause"
+    )
+    if run.phase == "COMPLETED" or not (running or manually_paused):
+        raise ValueError("只有正在采集或手动暂停的队列可以加入辅助电脑")
     if _is_manually_cancelled(run):
         raise ValueError("已取消的队列不能加入辅助电脑")
     if not run.primary_worker_id:

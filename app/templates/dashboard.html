@@ -104,7 +104,7 @@
           {% endfor %}
         </div>
       </div>
-      <div id="browser-run-add-helper-controls" class="browser-run-add-helper-controls"{% if not browser_collection_run or not browser_collection_run.primary_worker_id or browser_collection_run.status != "RUNNING" or not browser_collection_run.dispatch_enabled %} hidden{% endif %}>
+      <div id="browser-run-add-helper-controls" class="browser-run-add-helper-controls"{% if not browser_collection_run or not browser_collection_run.primary_worker_id or not ((browser_collection_run.status == "RUNNING" and browser_collection_run.dispatch_enabled) or (browser_collection_run.status == "PAUSED" and browser_collection_run.paused_reason == "manual_pause" and not browser_collection_run.dispatch_enabled)) %} hidden{% endif %}>
         <label for="browser-run-add-helper-select">加入本轮辅助电脑
           <select id="browser-run-add-helper-select" multiple size="2" aria-label="选择加入本轮的辅助采集电脑">
             {% if browser_collection_run and browser_collection_run.primary_worker_id %}
