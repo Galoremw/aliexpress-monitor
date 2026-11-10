@@ -967,7 +967,11 @@ def queue_selection_candidate_collection(db: Session = Depends(get_db)) -> dict:
         for item in (existing_run.items if existing_run else [])
         if item.target_type == "PRODUCT" and item.product_id is not None
     }
-    run = ensure_browser_collection_run(db, trigger="MANUAL")
+    run = ensure_browser_collection_run(
+        db,
+        trigger="MANUAL",
+        include_selection_candidates=True,
+    )
     candidate_products = list(
         db.scalars(
             select(Product)

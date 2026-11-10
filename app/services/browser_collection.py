@@ -333,7 +333,10 @@ def ensure_browser_collection_run(
     db: Session,
     target_date: date | None = None,
     trigger: str = "SCHEDULED",
+    *,
+    include_selection_candidates: bool = False,
 ) -> BrowserCollectionRun:
+    """Ensure the monitored-store run; workbench product URLs are opt-in."""
     selected_date = _target_date(target_date)
     run = db.scalar(
         select(BrowserCollectionRun).where(BrowserCollectionRun.target_date == selected_date)
@@ -341,7 +344,11 @@ def ensure_browser_collection_run(
     if run is not None:
         if trigger == "SCHEDULED":
             _reconcile_scheduled_store_items(db, run)
-        added_candidates = _queue_selection_candidate_products(db, run)
+        added_candidates = (
+            _queue_selection_candidate_products(db, run)
+            if include_selection_candidates
+            else 0
+        )
         if added_candidates:
             _advance_run(db, run)
             db.commit()
@@ -370,7 +377,8 @@ def ensure_browser_collection_run(
                 position=position,
             )
         )
-    _queue_selection_candidate_products(db, run)
+    if include_selection_candidates:
+        _queue_selection_candidate_products(db, run)
     db.flush()
     _advance_run(db, run)
     db.commit()
@@ -433,7 +441,7 @@ def _reconcile_scheduled_store_items(db: Session, run: BrowserCollectionRun) -> 
 def _queue_selection_candidate_products(
     db: Session, run: BrowserCollectionRun
 ) -> int:
-    """Append active workbench candidates to the daily product phase, once per run."""
+    """Append active workbench candidates only for explicit candidate collection."""
     candidates = list(
         db.scalars(
             select(Product)
